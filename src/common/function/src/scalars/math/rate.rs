@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,15 +14,16 @@
 
 use std::fmt;
 
-use arrow::array::Array;
-use common_query::error::{FromArrowArraySnafu, Result, TypeCastSnafu};
+use common_query::error::{self, Result};
 use common_query::prelude::{Signature, Volatility};
-use datatypes::arrow;
+use datafusion::arrow::compute::kernels::numeric;
+use datatypes::arrow::compute::kernels::cast;
+use datatypes::arrow::datatypes::DataType;
 use datatypes::prelude::*;
 use datatypes::vectors::{Helper, VectorRef};
 use snafu::ResultExt;
 
-use crate::scalars::function::{Function, FunctionContext};
+use crate::function::{Function, FunctionContext};
 
 /// generates rates from a sequence of adjacent data points.
 #[derive(Clone, Debug, Default)]
@@ -51,28 +52,21 @@ impl Function for RateFunction {
         let val = &columns[0].to_arrow_array();
         let val_0 = val.slice(0, val.len() - 1);
         let val_1 = val.slice(1, val.len() - 1);
-        let dv = arrow::compute::arithmetics::sub(&*val_1, &*val_0);
+        let dv = numeric::sub(&val_1, &val_0).context(error::ArrowComputeSnafu)?;
         let ts = &columns[1].to_arrow_array();
         let ts_0 = ts.slice(0, ts.len() - 1);
         let ts_1 = ts.slice(1, ts.len() - 1);
-        let dt = arrow::compute::arithmetics::sub(&*ts_1, &*ts_0);
-        fn all_to_f64(array: &dyn Array) -> Result<Box<dyn Array>> {
-            Ok(arrow::compute::cast::cast(
-                array,
-                &arrow::datatypes::DataType::Float64,
-                arrow::compute::cast::CastOptions {
-                    wrapped: true,
-                    partial: true,
-                },
-            )
-            .context(TypeCastSnafu {
-                typ: arrow::datatypes::DataType::Float64,
-            })?)
-        }
-        let dv = all_to_f64(&*dv)?;
-        let dt = all_to_f64(&*dt)?;
-        let rate = arrow::compute::arithmetics::div(&*dv, &*dt);
-        let v = Helper::try_into_vector(&rate).context(FromArrowArraySnafu)?;
+        let dt = numeric::sub(&ts_1, &ts_0).context(error::ArrowComputeSnafu)?;
+
+        let dv = cast::cast(&dv, &DataType::Float64).context(error::TypeCastSnafu {
+            typ: DataType::Float64,
+        })?;
+        let dt = cast::cast(&dt, &DataType::Float64).context(error::TypeCastSnafu {
+            typ: DataType::Float64,
+        })?;
+        let rate = numeric::div(&dv, &dt).context(error::ArrowComputeSnafu)?;
+        let v = Helper::try_into_vector(&rate).context(error::FromArrowArraySnafu)?;
+
         Ok(v)
     }
 }
@@ -81,14 +75,13 @@ impl Function for RateFunction {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::Float64Array;
     use common_query::prelude::TypeSignature;
-    use datatypes::vectors::{Float32Vector, Int64Vector};
+    use datatypes::vectors::{Float32Vector, Float64Vector, Int64Vector};
 
     use super::*;
     #[test]
     fn test_rate_function() {
-        let rate = RateFunction::default();
+        let rate = RateFunction;
         assert_eq!("prom_rate", rate.name());
         assert_eq!(
             ConcreteDataType::float64_datatype(),
@@ -108,9 +101,7 @@ mod tests {
             Arc::new(Int64Vector::from_vec(ts)),
         ];
         let vector = rate.eval(FunctionContext::default(), &args).unwrap();
-        let arr = vector.to_arrow_array();
-        let expect = Arc::new(Float64Array::from_vec(vec![2.0, 3.0]));
-        let res = arrow::compute::comparison::eq(&*arr, &*expect);
-        res.iter().for_each(|x| assert!(matches!(x, Some(true))));
+        let expect: VectorRef = Arc::new(Float64Vector::from_vec(vec![2.0, 3.0]));
+        assert_eq!(expect, vector);
     }
 }

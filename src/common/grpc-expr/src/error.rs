@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,36 +14,22 @@
 
 use std::any::Any;
 
-use api::DecodeError;
 use common_error::ext::ErrorExt;
-use common_error::prelude::{Snafu, StatusCode};
-use snafu::{Backtrace, ErrorCompat};
+use common_error::status_code::StatusCode;
+use common_macro::stack_trace_debug;
+use snafu::{Location, Snafu};
 
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub))]
+#[stack_trace_debug]
 pub enum Error {
-    #[snafu(display("Column `{}` not found in table `{}`", column_name, table_name))]
-    ColumnNotFound {
-        column_name: String,
-        table_name: String,
-    },
+    #[snafu(display("Illegal delete request, reason: {reason}"))]
+    IllegalDeleteRequest { reason: String, location: Location },
 
-    #[snafu(display("Failed to convert bytes to insert batch, source: {}", source))]
-    DecodeInsert { source: DecodeError },
-
-    #[snafu(display("Illegal insert data"))]
-    IllegalInsertData,
-
-    #[snafu(display("Column datatype error, source: {}", source))]
+    #[snafu(display("Column datatype error"))]
     ColumnDataType {
-        #[snafu(backtrace)]
+        location: Location,
         source: api::error::Error,
-    },
-
-    #[snafu(display("Failed to create schema when creating table, source: {}", source))]
-    CreateSchema {
-        #[snafu(backtrace)]
-        source: datatypes::error::Error,
     },
 
     #[snafu(display(
@@ -54,41 +40,40 @@ pub enum Error {
     DuplicatedTimestampColumn {
         exists: String,
         duplicated: String,
-        backtrace: Backtrace,
+        location: Location,
     },
+
+    #[snafu(display("Duplicated column name in gRPC requests, name: {}", name,))]
+    DuplicatedColumnName { name: String, location: Location },
 
     #[snafu(display("Missing timestamp column, msg: {}", msg))]
-    MissingTimestampColumn { msg: String, backtrace: Backtrace },
+    MissingTimestampColumn { msg: String, location: Location },
 
     #[snafu(display("Invalid column proto: {}", err_msg))]
-    InvalidColumnProto {
-        err_msg: String,
-        backtrace: Backtrace,
-    },
-    #[snafu(display("Failed to create vector, source: {}", source))]
+    InvalidColumnProto { err_msg: String, location: Location },
+    #[snafu(display("Failed to create vector"))]
     CreateVector {
-        #[snafu(backtrace)]
+        location: Location,
         source: datatypes::error::Error,
     },
 
     #[snafu(display("Missing required field in protobuf, field: {}", field))]
-    MissingField { field: String, backtrace: Backtrace },
+    MissingField { field: String, location: Location },
 
-    #[snafu(display("Invalid column default constraint, source: {}", source))]
-    ColumnDefaultConstraint {
-        #[snafu(backtrace)]
-        source: datatypes::error::Error,
-    },
-
-    #[snafu(display(
-        "Invalid column proto definition, column: {}, source: {}",
-        column,
-        source
-    ))]
+    #[snafu(display("Invalid column proto definition, column: {}", column))]
     InvalidColumnDef {
         column: String,
-        #[snafu(backtrace)]
+        location: Location,
         source: api::error::Error,
+    },
+
+    #[snafu(display("Unexpected values length, reason: {}", reason))]
+    UnexpectedValuesLength { reason: String, location: Location },
+
+    #[snafu(display("Unknown location type: {}", location_type))]
+    UnknownLocationType {
+        location_type: i32,
+        location: Location,
     },
 }
 
@@ -97,23 +82,20 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         match self {
-            Error::ColumnNotFound { .. } => StatusCode::TableColumnNotFound,
-            Error::DecodeInsert { .. } | Error::IllegalInsertData { .. } => {
-                StatusCode::InvalidArguments
-            }
+            Error::IllegalDeleteRequest { .. } => StatusCode::InvalidArguments,
+
             Error::ColumnDataType { .. } => StatusCode::Internal,
-            Error::CreateSchema { .. }
-            | Error::DuplicatedTimestampColumn { .. }
+            Error::DuplicatedTimestampColumn { .. }
+            | Error::DuplicatedColumnName { .. }
             | Error::MissingTimestampColumn { .. } => StatusCode::InvalidArguments,
             Error::InvalidColumnProto { .. } => StatusCode::InvalidArguments,
             Error::CreateVector { .. } => StatusCode::InvalidArguments,
             Error::MissingField { .. } => StatusCode::InvalidArguments,
-            Error::ColumnDefaultConstraint { source, .. } => source.status_code(),
             Error::InvalidColumnDef { source, .. } => source.status_code(),
+            Error::UnexpectedValuesLength { .. } | Error::UnknownLocationType { .. } => {
+                StatusCode::InvalidArguments
+            }
         }
-    }
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
     }
 
     fn as_any(&self) -> &dyn Any {

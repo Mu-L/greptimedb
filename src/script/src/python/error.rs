@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_error::prelude::{ErrorCompat, ErrorExt, StatusCode};
+use common_error::ext::ErrorExt;
+use common_error::status_code::StatusCode;
+use common_macro::stack_trace_debug;
 use console::{style, Style};
 use datafusion::error::DataFusionError;
 use datatypes::arrow::error::ArrowError;
@@ -20,57 +22,65 @@ use datatypes::error::Error as DataTypeError;
 use query::error::Error as QueryError;
 use rustpython_codegen::error::CodegenError;
 use rustpython_parser::ast::Location;
-use rustpython_parser::error::ParseError;
+use rustpython_parser::ParseError;
 pub use snafu::ensure;
 use snafu::prelude::Snafu;
-use snafu::Backtrace;
+use snafu::Location as SnafuLocation;
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub(crate) fn ret_other_error_with(reason: String) -> OtherSnafu<String> {
     OtherSnafu { reason }
 }
 
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub(crate)))]
+#[stack_trace_debug]
 pub enum Error {
-    #[snafu(display("Datatype error: {}", source))]
+    #[snafu(display("Datatype error"))]
     TypeCast {
-        #[snafu(backtrace)]
+        location: SnafuLocation,
         source: DataTypeError,
     },
 
-    #[snafu(display("Failed to query, source: {}", source))]
+    #[snafu(display("Failed to query"))]
     DatabaseQuery {
-        #[snafu(backtrace)]
+        location: SnafuLocation,
         source: QueryError,
     },
 
-    #[snafu(display("Failed to parse script, source: {}", source))]
+    #[snafu(display("Failed to parse script"))]
     PyParse {
-        backtrace: Backtrace,
-        source: ParseError,
+        location: SnafuLocation,
+        #[snafu(source)]
+        error: ParseError,
     },
 
-    #[snafu(display("Failed to compile script, source: {}", source))]
+    #[snafu(display("Failed to compile script"))]
     PyCompile {
-        backtrace: Backtrace,
-        source: CodegenError,
+        location: SnafuLocation,
+        #[snafu(source)]
+        error: CodegenError,
     },
 
     /// rustpython problem, using python virtual machines' backtrace instead
     #[snafu(display("Python Runtime error, error: {}", msg))]
-    PyRuntime { msg: String, backtrace: Backtrace },
-
-    #[snafu(display("Arrow error: {}", source))]
-    Arrow {
-        backtrace: Backtrace,
-        source: ArrowError,
+    PyRuntime {
+        msg: String,
+        location: SnafuLocation,
     },
 
-    #[snafu(display("DataFusion error: {}", source))]
+    #[snafu(display("Arrow error"))]
+    Arrow {
+        location: SnafuLocation,
+        #[snafu(source)]
+        error: ArrowError,
+    },
+
+    #[snafu(display("DataFusion error"))]
     DataFusion {
-        backtrace: Backtrace,
-        source: DataFusionError,
+        location: SnafuLocation,
+        #[snafu(source)]
+        error: DataFusionError,
     },
 
     /// errors in coprocessors' parse check for types and etc.
@@ -81,7 +91,7 @@ pub enum Error {
                         "".into()
                     }))]
     CoprParse {
-        backtrace: Backtrace,
+        location: SnafuLocation,
         reason: String,
         // location is option because maybe errors can't give a clear location?
         loc: Option<Location>,
@@ -90,27 +100,32 @@ pub enum Error {
     /// Other types of error that isn't any of above
     #[snafu(display("Coprocessor's Internal error: {}", reason))]
     Other {
-        backtrace: Backtrace,
+        location: SnafuLocation,
         reason: String,
     },
 
     #[snafu(display("Unsupported sql in coprocessor: {}", sql))]
-    UnsupportedSql { sql: String, backtrace: Backtrace },
+    UnsupportedSql {
+        sql: String,
+        location: SnafuLocation,
+    },
 
-    #[snafu(display("Missing sql in coprocessor"))]
-    MissingSql { backtrace: Backtrace },
-
-    #[snafu(display("Failed to retrieve record batches, source: {}", source))]
+    #[snafu(display("Failed to retrieve record batches"))]
     RecordBatch {
-        #[snafu(backtrace)]
+        location: SnafuLocation,
         source: common_recordbatch::error::Error,
     },
-}
 
-impl From<QueryError> for Error {
-    fn from(source: QueryError) -> Self {
-        Self::DatabaseQuery { source }
-    }
+    #[snafu(display("Failed to create record batch"))]
+    NewRecordBatch {
+        location: SnafuLocation,
+        source: common_recordbatch::error::Error,
+    },
+    #[snafu(display("Failed to create tokio task"))]
+    TokioJoin {
+        #[snafu(source)]
+        error: tokio::task::JoinError,
+    },
 }
 
 impl ErrorExt for Error {
@@ -119,31 +134,24 @@ impl ErrorExt for Error {
             Error::DataFusion { .. }
             | Error::Arrow { .. }
             | Error::PyRuntime { .. }
+            | Error::TokioJoin { .. }
             | Error::Other { .. } => StatusCode::Internal,
 
-            Error::RecordBatch { source } => source.status_code(),
-            Error::DatabaseQuery { source } => source.status_code(),
-            Error::TypeCast { source } => source.status_code(),
+            Error::RecordBatch { source, .. } | Error::NewRecordBatch { source, .. } => {
+                source.status_code()
+            }
+            Error::DatabaseQuery { source, .. } => source.status_code(),
+            Error::TypeCast { source, .. } => source.status_code(),
 
             Error::PyParse { .. }
             | Error::PyCompile { .. }
             | Error::CoprParse { .. }
-            | Error::UnsupportedSql { .. }
-            | Error::MissingSql { .. } => StatusCode::InvalidArguments,
+            | Error::UnsupportedSql { .. } => StatusCode::InvalidArguments,
         }
-    }
-    fn backtrace_opt(&self) -> Option<&common_error::snafu::Backtrace> {
-        ErrorCompat::backtrace(self)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-}
-// impl from for those error so one can use question mark and implicitly cast into `CoprError`
-impl From<DataTypeError> for Error {
-    fn from(e: DataTypeError) -> Self {
-        Self::TypeCast { source: e }
     }
 }
 
@@ -208,31 +216,11 @@ pub fn visualize_loc(
 /// extract a reason for [`Error`] in string format, also return a location if possible
 pub fn get_error_reason_loc(err: &Error) -> (String, Option<Location>) {
     match err {
-        Error::CoprParse { reason, loc, .. } => (reason.clone(), loc.to_owned()),
+        Error::CoprParse { reason, loc, .. } => (reason.clone(), *loc),
         Error::Other { reason, .. } => (reason.clone(), None),
         Error::PyRuntime { msg, .. } => (msg.clone(), None),
-        Error::PyParse { source, .. } => (source.error.to_string(), Some(source.location)),
-        Error::PyCompile { source, .. } => (source.error.to_string(), Some(source.location)),
-        _ => (format!("Unknown error: {:?}", err), None),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use common_error::mock::MockError;
-    use snafu::ResultExt;
-
-    use super::*;
-
-    fn throw_query_error() -> query::error::Result<()> {
-        let mock_err = MockError::with_backtrace(StatusCode::TableColumnNotFound);
-        Err(query::error::Error::new(mock_err))
-    }
-
-    #[test]
-    fn test_error() {
-        let err = throw_query_error().context(DatabaseQuerySnafu).unwrap_err();
-        assert_eq!(StatusCode::TableColumnNotFound, err.status_code());
-        assert!(err.backtrace_opt().is_some());
+        Error::PyParse { error, .. } => (error.error.to_string(), Some(error.location)),
+        Error::PyCompile { error, .. } => (error.error.to_string(), Some(error.location)),
+        _ => (format!("Unknown error: {err:?}"), None),
     }
 }

@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -26,8 +26,8 @@ async fn do_bench_channel_manager() {
         let join = tokio::spawn(async move {
             for _ in 0..10000 {
                 let idx = rand::random::<usize>() % 100;
-                let ret = m_clone.get(format!("{}", idx));
-                assert!(ret.is_ok());
+                let ret = m_clone.get(format!("{idx}"));
+                let _ = ret.unwrap();
             }
         });
         joins.push(join);
@@ -39,7 +39,7 @@ async fn do_bench_channel_manager() {
 }
 
 fn bench_channel_manager(c: &mut Criterion) {
-    c.bench_function("bench channel manager", |b| {
+    let _ = c.bench_function("bench channel manager", |b| {
         b.iter(do_bench_channel_manager);
     });
 }

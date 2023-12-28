@@ -1,30 +1,35 @@
 [package]
 name = "substrait"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-bytes = "1.1"
-catalog = { path = "../../catalog" }
-common-catalog = { path = "../catalog" }
-common-error = { path = "../error" }
-common-telemetry = { path = "../telemetry" }
-datafusion = { git = "https://github.com/apache/arrow-datafusion.git", branch = "arrow2", features = [
-    "simd",
-] }
-datafusion-expr = { git = "https://github.com/apache/arrow-datafusion.git", branch = "arrow2" }
-datatypes = { path = "../../datatypes" }
+async-recursion = "1.0"
+async-trait.workspace = true
+bytes.workspace = true
+catalog.workspace = true
+common-catalog.workspace = true
+common-error.workspace = true
+common-macro.workspace = true
+common-telemetry.workspace = true
+datafusion-common.workspace = true
+datafusion-expr.workspace = true
+datafusion-substrait.workspace = true
+datafusion.workspace = true
+datatypes.workspace = true
 futures = "0.3"
-prost = "0.9"
-snafu = { version = "0.7", features = ["backtraces"] }
-table = { path = "../../table" }
+promql.workspace = true
+prost.workspace = true
+session.workspace = true
+snafu.workspace = true
+table.workspace = true
 
 [dependencies.substrait_proto]
 package = "substrait"
-version = "0.2"
+version = "0.17"
 
 [dev-dependencies]
-datatypes = { path = "../../datatypes" }
-table = { path = "../../table" }
-tokio = { version = "1.0", features = ["full"] }
+datatypes.workspace = true
+table.workspace = true
+tokio.workspace = true

@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,8 +17,14 @@ use std::ops::Deref;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Bytes buffer.
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
 pub struct Bytes(bytes::Bytes);
+
+impl From<Bytes> for bytes::Bytes {
+    fn from(value: Bytes) -> Self {
+        value.0
+    }
+}
 
 impl From<bytes::Bytes> for Bytes {
     fn from(bytes: bytes::Bytes) -> Bytes {
@@ -74,7 +80,7 @@ impl PartialEq<Bytes> for [u8] {
 ///
 /// Now this buffer is restricted to only hold valid UTF-8 string (only allow constructing `StringBytes`
 /// from String or str). We may support other encoding in the future.
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StringBytes(bytes::Bytes);
 
 impl StringBytes {
@@ -85,6 +91,14 @@ impl StringBytes {
     /// buffer must holds valid UTF-8.
     pub fn as_utf8(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -173,6 +187,17 @@ mod tests {
     }
 
     #[test]
+    fn test_bytes_len() {
+        let hello = b"hello".to_vec();
+        let bytes = Bytes::from(hello.clone());
+        assert_eq!(bytes.len(), hello.len());
+
+        let zero = b"".to_vec();
+        let bytes = Bytes::from(zero);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
     fn test_string_bytes_from() {
         let hello = "hello".to_string();
         let bytes = StringBytes::from(hello.clone());
@@ -183,6 +208,17 @@ mod tests {
         let bytes = StringBytes::from(world);
         assert_eq!(world, &bytes);
         assert_eq!(&bytes, world);
+    }
+
+    #[test]
+    fn test_string_bytes_len() {
+        let hello = "hello".to_string();
+        let bytes = StringBytes::from(hello.clone());
+        assert_eq!(bytes.len(), hello.len());
+
+        let zero = "".to_string();
+        let bytes = StringBytes::from(zero);
+        assert!(bytes.is_empty());
     }
 
     fn check_str(expect: &str, given: &str) {

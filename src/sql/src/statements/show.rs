@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,10 +14,12 @@
 
 use std::fmt;
 
-use crate::ast::{Expr, Ident};
+use sqlparser_derive::{Visit, VisitMut};
+
+use crate::ast::{Expr, Ident, ObjectName};
 
 /// Show kind for SQL expressions like `SHOW DATABASE` or `SHOW TABLE`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut)]
 pub enum ShowKind {
     All,
     Like(Ident),
@@ -28,14 +30,14 @@ impl fmt::Display for ShowKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ShowKind::All => write!(f, "ALL"),
-            ShowKind::Like(ident) => write!(f, "LIKE {}", ident),
-            ShowKind::Where(expr) => write!(f, "WHERE {}", expr),
+            ShowKind::Like(ident) => write!(f, "LIKE {ident}"),
+            ShowKind::Where(expr) => write!(f, "WHERE {expr}"),
         }
     }
 }
 
 /// SQL structure for `SHOW DATABASES`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut)]
 pub struct ShowDatabases {
     pub kind: ShowKind,
 }
@@ -48,16 +50,17 @@ impl ShowDatabases {
 }
 
 /// SQL structure for `SHOW TABLES`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut)]
 pub struct ShowTables {
     pub kind: ShowKind,
     pub database: Option<String>,
+    pub full: bool,
 }
 
 /// SQL structure for `SHOW CREATE TABLE`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut)]
 pub struct ShowCreateTable {
-    pub table_name: String,
+    pub table_name: ObjectName,
 }
 
 #[cfg(test)]
@@ -65,9 +68,9 @@ mod tests {
     use std::assert_matches::assert_matches;
 
     use sqlparser::ast::UnaryOperator;
-    use sqlparser::dialect::GenericDialect;
 
     use super::*;
+    use crate::dialect::GreptimeDbDialect;
     use crate::parser::ParserContext;
     use crate::statements::statement::Statement;
 
@@ -102,7 +105,7 @@ mod tests {
     #[test]
     pub fn test_show_database() {
         let sql = "SHOW DATABASES";
-        let stmts = ParserContext::create_with_dialect(sql, &GenericDialect {}).unwrap();
+        let stmts = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).unwrap();
         assert_eq!(1, stmts.len());
         assert_matches!(&stmts[0], Statement::ShowDatabases { .. });
         match &stmts[0] {
@@ -119,12 +122,12 @@ mod tests {
     pub fn test_show_create_table() {
         let sql = "SHOW CREATE TABLE test";
         let stmts: Vec<Statement> =
-            ParserContext::create_with_dialect(sql, &GenericDialect {}).unwrap();
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).unwrap();
         assert_eq!(1, stmts.len());
         assert_matches!(&stmts[0], Statement::ShowCreateTable { .. });
         match &stmts[0] {
             Statement::ShowCreateTable(show) => {
-                let table_name = show.table_name.as_str();
+                let table_name = show.table_name.to_string();
                 assert_eq!(table_name, "test");
             }
             _ => {
@@ -135,6 +138,6 @@ mod tests {
     #[test]
     pub fn test_show_create_missing_table_name() {
         let sql = "SHOW CREATE TABLE";
-        ParserContext::create_with_dialect(sql, &GenericDialect {}).unwrap_err();
+        assert!(ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).is_err());
     }
 }

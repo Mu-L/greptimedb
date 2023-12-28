@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,28 +14,34 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use common_query::physical_plan::PhysicalPlanRef;
-use common_recordbatch::EmptyRecordBatchStream;
+use common_error::ext::BoxedError;
+use common_recordbatch::{EmptyRecordBatchStream, SendableRecordBatchStream};
+use datatypes::schema::SchemaRef;
+use store_api::data_source::DataSource;
+use store_api::storage::ScanRequest;
 
-use crate::metadata::{TableInfoBuilder, TableInfoRef, TableMetaBuilder, TableType};
-use crate::requests::{CreateTableRequest, InsertRequest};
-use crate::table::scan::SimpleTableScan;
-use crate::{Result, Table};
+use crate::metadata::{
+    FilterPushDownType, TableInfo, TableInfoBuilder, TableMetaBuilder, TableType,
+};
+use crate::requests::CreateTableRequest;
+use crate::thin_table::{ThinTable, ThinTableAdapter};
+use crate::TableRef;
 
-pub struct EmptyTable {
-    info: TableInfoRef,
-}
+pub struct EmptyTable;
 
 impl EmptyTable {
-    pub fn new(req: CreateTableRequest) -> Self {
+    pub fn table(req: CreateTableRequest) -> TableRef {
+        let schema = Arc::new(req.schema.try_into().unwrap());
         let table_meta = TableMetaBuilder::default()
-            .schema(req.schema)
+            .schema(schema)
             .primary_key_indices(req.primary_key_indices)
             .next_column_id(0)
             .options(req.table_options)
+            .region_numbers(req.region_numbers)
+            .engine(req.engine)
             .build();
         let table_info = TableInfoBuilder::default()
+            .table_id(req.id)
             .catalog_name(req.catalog_name)
             .schema_name(req.schema_name)
             .name(req.table_name)
@@ -45,37 +51,27 @@ impl EmptyTable {
             .build()
             .unwrap();
 
-        Self {
-            info: Arc::new(table_info),
-        }
+        Self::from_table_info(&table_info)
+    }
+
+    pub fn from_table_info(info: &TableInfo) -> TableRef {
+        let thin_table = ThinTable::new(Arc::new(info.clone()), FilterPushDownType::Unsupported);
+        let data_source = Arc::new(EmptyDataSource {
+            schema: info.meta.schema.clone(),
+        });
+        Arc::new(ThinTableAdapter::new(thin_table, data_source))
     }
 }
 
-#[async_trait]
-impl Table for EmptyTable {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self as _
-    }
+struct EmptyDataSource {
+    schema: SchemaRef,
+}
 
-    fn schema(&self) -> datatypes::schema::SchemaRef {
-        self.info.meta.schema.clone()
-    }
-
-    fn table_info(&self) -> TableInfoRef {
-        self.info.clone()
-    }
-
-    async fn insert(&self, _request: InsertRequest) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn scan(
+impl DataSource for EmptyDataSource {
+    fn get_stream(
         &self,
-        _projection: &Option<Vec<usize>>,
-        _filters: &[common_query::prelude::Expr],
-        _limit: Option<usize>,
-    ) -> Result<PhysicalPlanRef> {
-        let scan = SimpleTableScan::new(Box::pin(EmptyRecordBatchStream::new(self.schema())));
-        Ok(Arc::new(scan))
+        _request: ScanRequest,
+    ) -> std::result::Result<SendableRecordBatchStream, BoxedError> {
+        Ok(Box::pin(EmptyRecordBatchStream::new(self.schema.clone())))
     }
 }

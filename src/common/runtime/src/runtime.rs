@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,22 +13,25 @@
 // limitations under the License.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use metrics::{decrement_gauge, increment_gauge};
 use snafu::ResultExt;
 use tokio::runtime::{Builder as RuntimeBuilder, Handle};
 use tokio::sync::oneshot;
 pub use tokio::task::{JoinError, JoinHandle};
 
 use crate::error::*;
-use crate::metric::*;
+use crate::metrics::*;
+
+static RUNTIME_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// A runtime to run future tasks
 #[derive(Clone, Debug)]
 pub struct Runtime {
+    name: String,
     handle: Handle,
     // Used to receive a drop signal when dropper is dropped, inspired by databend
     _dropper: Arc<Dropper>,
@@ -43,11 +46,15 @@ pub struct Dropper {
 impl Drop for Dropper {
     fn drop(&mut self) {
         // Send a signal to say i am dropping.
-        self.close.take().map(|v| v.send(()));
+        let _ = self.close.take().map(|v| v.send(()));
     }
 }
 
 impl Runtime {
+    pub fn builder() -> Builder {
+        Builder::default()
+    }
+
     /// Spawn a future and execute it in this thread pool
     ///
     /// Similar to tokio::runtime::Runtime::spawn()
@@ -73,9 +80,14 @@ impl Runtime {
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         self.handle.block_on(future)
     }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 pub struct Builder {
+    runtime_name: String,
     thread_name: String,
     builder: RuntimeBuilder,
 }
@@ -83,6 +95,7 @@ pub struct Builder {
 impl Default for Builder {
     fn default() -> Self {
         Self {
+            runtime_name: format!("runtime-{}", RUNTIME_ID.fetch_add(1, Ordering::Relaxed)),
             thread_name: "default-worker".to_string(),
             builder: RuntimeBuilder::new_multi_thread(),
         }
@@ -94,7 +107,7 @@ impl Builder {
     ///
     /// This can be any number above 0. The default value is the number of cores available to the system.
     pub fn worker_threads(&mut self, val: usize) -> &mut Self {
-        self.builder.worker_threads(val);
+        let _ = self.builder.worker_threads(val);
         self
     }
 
@@ -104,7 +117,7 @@ impl Builder {
     /// they are not always active and will exit if left idle for too long, You can change this timeout duration
     /// with thread_keep_alive. The default value is 512.
     pub fn max_blocking_threads(&mut self, val: usize) -> &mut Self {
-        self.builder.max_blocking_threads(val);
+        let _ = self.builder.max_blocking_threads(val);
         self
     }
 
@@ -112,7 +125,12 @@ impl Builder {
     ///
     /// By default, the timeout for a thread is set to 10 seconds.
     pub fn thread_keep_alive(&mut self, duration: Duration) -> &mut Self {
-        self.builder.thread_keep_alive(duration);
+        let _ = self.builder.thread_keep_alive(duration);
+        self
+    }
+
+    pub fn runtime_name(&mut self, val: impl Into<String>) -> &mut Self {
+        self.runtime_name = val.into();
         self
     }
 
@@ -134,6 +152,7 @@ impl Builder {
             .build()
             .context(BuildRuntimeSnafu)?;
 
+        let name = self.runtime_name.clone();
         let handle = runtime.handle().clone();
         let (send_stop, recv_stop) = oneshot::channel();
         // Block the runtime to shutdown.
@@ -141,7 +160,11 @@ impl Builder {
             .name(format!("{}-blocker", self.thread_name))
             .spawn(move || runtime.block_on(recv_stop));
 
+        #[cfg(tokio_unstable)]
+        register_collector(name.clone(), &handle);
+
         Ok(Runtime {
+            name,
             handle,
             _dropper: Arc::new(Dropper {
                 close: Some(send_stop),
@@ -150,31 +173,43 @@ impl Builder {
     }
 }
 
+#[cfg(tokio_unstable)]
+pub fn register_collector(name: String, handle: &Handle) {
+    let name = name.replace("-", "_");
+    let monitor = tokio_metrics::RuntimeMonitor::new(handle);
+    let collector = tokio_metrics_collector::RuntimeCollector::new(monitor, name);
+    let _ = prometheus::register(Box::new(collector));
+}
+
 fn on_thread_start(thread_name: String) -> impl Fn() + 'static {
     move || {
-        let labels = [(THREAD_NAME_LABEL, thread_name.clone())];
-        increment_gauge!(METRIC_RUNTIME_THREADS_ALIVE, 1.0, &labels);
+        METRIC_RUNTIME_THREADS_ALIVE
+            .with_label_values(&[thread_name.as_str()])
+            .inc();
     }
 }
 
 fn on_thread_stop(thread_name: String) -> impl Fn() + 'static {
     move || {
-        let labels = [(THREAD_NAME_LABEL, thread_name.clone())];
-        decrement_gauge!(METRIC_RUNTIME_THREADS_ALIVE, 1.0, &labels);
+        METRIC_RUNTIME_THREADS_ALIVE
+            .with_label_values(&[thread_name.as_str()])
+            .dec();
     }
 }
 
 fn on_thread_park(thread_name: String) -> impl Fn() + 'static {
     move || {
-        let labels = [(THREAD_NAME_LABEL, thread_name.clone())];
-        increment_gauge!(METRIC_RUNTIME_THREADS_IDLE, 1.0, &labels);
+        METRIC_RUNTIME_THREADS_IDLE
+            .with_label_values(&[thread_name.as_str()])
+            .inc();
     }
 }
 
 fn on_thread_unpark(thread_name: String) -> impl Fn() + 'static {
     move || {
-        let labels = [(THREAD_NAME_LABEL, thread_name.clone())];
-        decrement_gauge!(METRIC_RUNTIME_THREADS_IDLE, 1.0, &labels);
+        METRIC_RUNTIME_THREADS_IDLE
+            .with_label_values(&[thread_name.as_str()])
+            .dec();
     }
 }
 
@@ -184,25 +219,22 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use common_telemetry::metric;
+    use common_telemetry::dump_metrics;
     use tokio::sync::oneshot;
     use tokio_test::assert_ok;
 
     use super::*;
 
     fn runtime() -> Arc<Runtime> {
-        common_telemetry::init_default_metrics_recorder();
         let runtime = Builder::default()
             .worker_threads(2)
             .thread_name("test_spawn_join")
             .build();
-        assert!(runtime.is_ok());
         Arc::new(runtime.unwrap())
     }
 
     #[test]
     fn test_metric() {
-        common_telemetry::init_default_metrics_recorder();
         let runtime = Builder::default()
             .worker_threads(5)
             .thread_name("test_runtime_metric")
@@ -211,17 +243,23 @@ mod tests {
         // wait threads created
         thread::sleep(Duration::from_millis(50));
 
-        runtime.spawn(async {
+        let _handle = runtime.spawn(async {
             thread::sleep(Duration::from_millis(50));
         });
 
         thread::sleep(Duration::from_millis(10));
 
-        let handle = metric::try_handle().unwrap();
-        let metric_text = handle.render();
+        let metric_text = dump_metrics().unwrap();
 
         assert!(metric_text.contains("runtime_threads_idle{thread_name=\"test_runtime_metric\"}"));
         assert!(metric_text.contains("runtime_threads_alive{thread_name=\"test_runtime_metric\"}"));
+
+        #[cfg(tokio_unstable)]
+        {
+            assert!(metric_text.contains("runtime_0_tokio_budget_forced_yield_count 0"));
+            assert!(metric_text.contains("runtime_0_tokio_injection_queue_depth 0"));
+            assert!(metric_text.contains("runtime_0_tokio_workers_count 5"));
+        }
     }
 
     #[test]
@@ -231,7 +269,7 @@ mod tests {
         let out = runtime.block_on(async {
             let (tx, rx) = oneshot::channel();
 
-            thread::spawn(move || {
+            let _ = thread::spawn(move || {
                 thread::sleep(Duration::from_millis(50));
                 tx.send("ZOMG").unwrap();
             });

@@ -1,11 +1,10 @@
-#![feature(assert_matches)]
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,11 +13,10 @@
 // limitations under the License.
 
 mod alter;
+pub mod delete;
 pub mod error;
-mod insert;
+pub mod insert;
+pub mod util;
 
-pub use alter::{alter_expr_to_request, create_expr_to_request, create_table_schema};
-pub use insert::{
-    build_alter_table_request, build_create_expr_from_insertion, column_to_vector,
-    find_new_columns, insertion_expr_to_request,
-};
+pub use alter::{alter_expr_to_request, create_table_schema};
+pub use insert::{build_create_expr_from_insertion, find_new_columns};

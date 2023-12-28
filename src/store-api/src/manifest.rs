@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -28,6 +28,7 @@ pub type ManifestVersion = u64;
 pub const MIN_VERSION: u64 = 0;
 pub const MAX_VERSION: u64 = u64::MAX;
 
+/// The action to alter metadata
 pub trait MetaAction: Serialize + DeserializeOwned + Send + Sync + Clone + std::fmt::Debug {
     type Error: ErrorExt + Send + Sync;
 
@@ -47,6 +48,23 @@ pub trait MetaAction: Serialize + DeserializeOwned + Send + Sync + Clone + std::
         reader_version: ProtocolVersion,
     ) -> Result<(Self, Option<ProtocolAction>), Self::Error>;
 }
+/// The checkpoint by checkpoint
+pub trait Checkpoint: Send + Sync + Clone + std::fmt::Debug {
+    type Error: ErrorExt + Send + Sync;
+
+    /// Set a protocol action into checkpoint
+    fn set_protocol(&mut self, action: ProtocolAction);
+
+    /// The last compacted action's version of checkpoint
+    fn last_version(&self) -> ManifestVersion;
+
+    /// Encode this checkpoint into a byte vector
+    fn encode(&self) -> Result<Vec<u8>, Self::Error>;
+
+    /// Decode self from byte slice with reader protocol version,
+    /// return error when reader version is not supported.
+    fn decode(bs: &[u8], reader_version: ProtocolVersion) -> Result<Self, Self::Error>;
+}
 
 #[async_trait]
 pub trait MetaActionIterator {
@@ -64,6 +82,7 @@ pub trait Manifest: Send + Sync + Clone + 'static {
     type Error: ErrorExt + Send + Sync;
     type MetaAction: MetaAction;
     type MetaActionIterator: MetaActionIterator<Error = Self::Error, MetaAction = Self::MetaAction>;
+    type Checkpoint: Checkpoint;
 
     /// Update metadata by the action
     async fn update(&self, action: Self::MetaAction) -> Result<ManifestVersion, Self::Error>;
@@ -75,7 +94,21 @@ pub trait Manifest: Send + Sync + Clone + 'static {
         end: ManifestVersion,
     ) -> Result<Self::MetaActionIterator, Self::Error>;
 
-    async fn checkpoint(&self) -> Result<ManifestVersion, Self::Error>;
+    /// Do a checkpoint, it will create a checkpoint and compact actions.
+    async fn do_checkpoint(&self) -> Result<Option<Self::Checkpoint>, Self::Error>;
 
+    /// Returns the last success checkpoint
+    async fn last_checkpoint(&self) -> Result<Option<Self::Checkpoint>, Self::Error>;
+
+    /// Returns the last(or latest) manifest version.
     fn last_version(&self) -> ManifestVersion;
+
+    /// Start the service
+    async fn start(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    /// Stop the service
+    async fn stop(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }

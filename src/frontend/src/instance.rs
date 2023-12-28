@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,945 +12,601 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod distributed;
+pub mod builder;
+mod grpc;
 mod influxdb;
 mod opentsdb;
-mod prometheus;
+mod otlp;
+mod prom_store;
+mod region_query;
+mod script;
+pub mod standalone;
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use api::result::{ObjectResultBuilder, PROTOCOL_VERSION};
-use api::v1::alter_expr::Kind;
-use api::v1::object_expr::Expr;
-use api::v1::{
-    admin_expr, AddColumns, AdminExpr, AdminResult, AlterExpr, Column, CreateDatabaseExpr,
-    CreateExpr, DropTableExpr, ExprHeader, InsertExpr, ObjectExpr,
-    ObjectResult as GrpcObjectResult,
-};
+use api::v1::meta::Role;
 use async_trait::async_trait;
-use catalog::remote::MetaKvBackend;
-use catalog::{CatalogManagerRef, CatalogProviderRef, SchemaProviderRef};
-use client::admin::admin_result_to_output;
-use client::ObjectResult;
-use common_catalog::consts::DEFAULT_CATALOG_NAME;
-use common_error::prelude::BoxedError;
+use auth::{PermissionChecker, PermissionCheckerRef, PermissionReq};
+use catalog::CatalogManagerRef;
+use common_base::Plugins;
+use common_config::KvBackendConfig;
+use common_error::ext::BoxedError;
 use common_grpc::channel_manager::{ChannelConfig, ChannelManager};
+use common_meta::kv_backend::KvBackendRef;
+use common_meta::state_store::KvStateStore;
+use common_procedure::local::{LocalManager, ManagerConfig};
+use common_procedure::options::ProcedureConfig;
+use common_procedure::ProcedureManagerRef;
 use common_query::Output;
-use common_recordbatch::RecordBatches;
-use common_telemetry::{debug, info};
-use datanode::instance::InstanceRef as DnInstanceRef;
-use distributed::DistInstance;
+use common_telemetry::error;
+use common_telemetry::logging::info;
+use log_store::raft_engine::RaftEngineBackend;
 use meta_client::client::{MetaClient, MetaClientBuilder};
-use meta_client::MetaClientOpts;
-use servers::query_handler::{
-    GrpcAdminHandler, GrpcAdminHandlerRef, GrpcQueryHandler, GrpcQueryHandlerRef,
-    InfluxdbLineProtocolHandler, OpentsdbProtocolHandler, PrometheusProtocolHandler, ScriptHandler,
-    ScriptHandlerRef, SqlQueryHandler, SqlQueryHandlerRef,
+use meta_client::MetaClientOptions;
+use operator::delete::DeleterRef;
+use operator::insert::InserterRef;
+use operator::statement::StatementExecutor;
+use operator::table::table_idents_to_full_name;
+use query::parser::{PromQuery, QueryLanguageParser, QueryStatement};
+use query::plan::LogicalPlan;
+use query::query_engine::options::{validate_catalog_and_schema, QueryOptions};
+use query::query_engine::DescribeResult;
+use query::QueryEngineRef;
+use raft_engine::{Config, ReadableSize, RecoveryMode};
+use servers::error as server_error;
+use servers::error::{AuthSnafu, ExecuteQuerySnafu, ParsePromQLSnafu};
+use servers::export_metrics::{ExportMetricsOption, ExportMetricsTask};
+use servers::interceptor::{
+    PromQueryInterceptor, PromQueryInterceptorRef, SqlQueryInterceptor, SqlQueryInterceptorRef,
 };
-use servers::{error as server_error, Mode};
+use servers::prometheus_handler::PrometheusHandler;
+use servers::query_handler::grpc::GrpcQueryHandler;
+use servers::query_handler::sql::SqlQueryHandler;
+use servers::query_handler::{
+    InfluxdbLineProtocolHandler, OpenTelemetryProtocolHandler, OpentsdbProtocolHandler,
+    PromStoreProtocolHandler, ScriptHandler,
+};
+use servers::server::{start_server, ServerHandlers};
 use session::context::QueryContextRef;
 use snafu::prelude::*;
-use sql::dialect::GenericDialect;
+use sql::dialect::Dialect;
 use sql::parser::ParserContext;
-use sql::statements::create::Partitions;
-use sql::statements::insert::Insert;
+use sql::statements::copy::CopyTable;
 use sql::statements::statement::Statement;
+use sqlparser::ast::ObjectName;
+pub use standalone::StandaloneDatanodeManager;
 
-use crate::catalog::FrontendCatalogManager;
-use crate::datanode::DatanodeClients;
 use crate::error::{
-    self, AlterTableOnInsertionSnafu, CatalogNotFoundSnafu, CatalogSnafu, CreateDatabaseSnafu,
-    CreateTableSnafu, FindNewColumnsOnInsertionSnafu, InsertSnafu, MissingMetasrvOptsSnafu, Result,
-    SchemaNotFoundSnafu,
+    self, Error, ExecLogicalPlanSnafu, ExecutePromqlSnafu, ExternalSnafu, ParseSqlSnafu,
+    PermissionSnafu, PlanStatementSnafu, Result, SqlExecInterceptedSnafu, StartServerSnafu,
+    TableOperationSnafu,
 };
-use crate::expr_factory::{CreateExprFactoryRef, DefaultCreateExprFactory};
-use crate::frontend::FrontendOptions;
-use crate::sql::insert_to_request;
-use crate::table::insert::insert_request_to_insert_batch;
-use crate::table::route::TableRoutes;
+use crate::frontend::{FrontendOptions, TomlSerializable};
+use crate::heartbeat::HeartbeatTask;
+use crate::metrics;
+use crate::script::ScriptExecutor;
+use crate::server::Services;
 
 #[async_trait]
 pub trait FrontendInstance:
-    GrpcAdminHandler
-    + GrpcQueryHandler
-    + SqlQueryHandler
+    GrpcQueryHandler<Error = Error>
+    + SqlQueryHandler<Error = Error>
     + OpentsdbProtocolHandler
     + InfluxdbLineProtocolHandler
-    + PrometheusProtocolHandler
+    + PromStoreProtocolHandler
+    + OpenTelemetryProtocolHandler
     + ScriptHandler
+    + PrometheusHandler
     + Send
     + Sync
     + 'static
 {
-    async fn start(&mut self) -> Result<()>;
+    async fn start(&self) -> Result<()>;
 }
 
 pub type FrontendInstanceRef = Arc<dyn FrontendInstance>;
+pub type StatementExecutorRef = Arc<StatementExecutor>;
 
 #[derive(Clone)]
 pub struct Instance {
-    /// catalog manager is None in standalone mode, datanode will keep their own
-    catalog_manager: Option<CatalogManagerRef>,
-    /// Script handler is None in distributed mode, only works on standalone mode.
-    script_handler: Option<ScriptHandlerRef>,
-    create_expr_factory: CreateExprFactoryRef,
-    // TODO(fys): it should be a trait that corresponds to two implementations:
-    // Standalone and Distributed, then the code behind it doesn't need to use so
-    // many match statements.
-    mode: Mode,
-
-    // TODO(LFC): Remove `dist_instance` together with Arrow Flight adoption refactor.
-    dist_instance: Option<DistInstance>,
-
-    sql_handler: SqlQueryHandlerRef,
-    grpc_query_handler: GrpcQueryHandlerRef,
-    grpc_admin_handler: GrpcAdminHandlerRef,
+    catalog_manager: CatalogManagerRef,
+    script_executor: Arc<ScriptExecutor>,
+    statement_executor: Arc<StatementExecutor>,
+    query_engine: QueryEngineRef,
+    plugins: Plugins,
+    servers: Arc<ServerHandlers>,
+    heartbeat_task: Option<HeartbeatTask>,
+    inserter: InserterRef,
+    deleter: DeleterRef,
+    export_metrics_task: Option<ExportMetricsTask>,
 }
 
 impl Instance {
-    pub async fn try_new_distributed(opts: &FrontendOptions) -> Result<Self> {
-        let meta_client = Self::create_meta_client(opts).await?;
-
-        let meta_backend = Arc::new(MetaKvBackend {
-            client: meta_client.clone(),
-        });
-        let table_routes = Arc::new(TableRoutes::new(meta_client.clone()));
-        let datanode_clients = Arc::new(DatanodeClients::new());
-        let catalog_manager = Arc::new(FrontendCatalogManager::new(
-            meta_backend,
-            table_routes,
-            datanode_clients.clone(),
-        ));
-
-        let dist_instance =
-            DistInstance::new(meta_client, catalog_manager.clone(), datanode_clients);
-        let dist_instance_ref = Arc::new(dist_instance.clone());
-
-        Ok(Instance {
-            catalog_manager: Some(catalog_manager),
-            script_handler: None,
-            create_expr_factory: Arc::new(DefaultCreateExprFactory),
-            mode: Mode::Distributed,
-            dist_instance: Some(dist_instance),
-            sql_handler: dist_instance_ref.clone(),
-            grpc_query_handler: dist_instance_ref.clone(),
-            grpc_admin_handler: dist_instance_ref,
-        })
-    }
-
-    async fn create_meta_client(opts: &FrontendOptions) -> Result<Arc<MetaClient>> {
-        let metasrv_addr = &opts
-            .meta_client_opts
-            .as_ref()
-            .context(MissingMetasrvOptsSnafu)?
-            .metasrv_addrs;
+    pub async fn create_meta_client(
+        meta_client_options: &MetaClientOptions,
+    ) -> Result<Arc<MetaClient>> {
         info!(
             "Creating Frontend instance in distributed mode with Meta server addr {:?}",
-            metasrv_addr
+            meta_client_options.metasrv_addrs
         );
 
-        let meta_config = MetaClientOpts::default();
         let channel_config = ChannelConfig::new()
-            .timeout(Duration::from_millis(meta_config.timeout_millis))
-            .connect_timeout(Duration::from_millis(meta_config.connect_timeout_millis))
-            .tcp_nodelay(meta_config.tcp_nodelay);
+            .timeout(meta_client_options.timeout)
+            .connect_timeout(meta_client_options.connect_timeout)
+            .tcp_nodelay(meta_client_options.tcp_nodelay);
+        let ddl_channel_config = channel_config
+            .clone()
+            .timeout(meta_client_options.ddl_timeout);
         let channel_manager = ChannelManager::with_config(channel_config);
+        let ddl_channel_manager = ChannelManager::with_config(ddl_channel_config);
 
-        let mut meta_client = MetaClientBuilder::new(0, 0)
+        let cluster_id = 0; // TODO(jeremy): read from config
+        let mut meta_client = MetaClientBuilder::new(cluster_id, 0, Role::Frontend)
             .enable_router()
             .enable_store()
+            .enable_heartbeat()
+            .enable_ddl()
             .channel_manager(channel_manager)
+            .ddl_channel_manager(ddl_channel_manager)
             .build();
         meta_client
-            .start(metasrv_addr)
+            .start(&meta_client_options.metasrv_addrs)
             .await
             .context(error::StartMetaClientSnafu)?;
         Ok(Arc::new(meta_client))
     }
 
-    pub fn new_standalone(dn_instance: DnInstanceRef) -> Self {
-        Instance {
-            catalog_manager: None,
-            script_handler: None,
-            create_expr_factory: Arc::new(DefaultCreateExprFactory),
-            mode: Mode::Standalone,
-            dist_instance: None,
-            sql_handler: dn_instance.clone(),
-            grpc_query_handler: dn_instance.clone(),
-            grpc_admin_handler: dn_instance,
-        }
-    }
-
-    pub fn catalog_manager(&self) -> &Option<CatalogManagerRef> {
-        &self.catalog_manager
-    }
-
-    pub fn set_catalog_manager(&mut self, catalog_manager: CatalogManagerRef) {
-        debug_assert!(
-            self.catalog_manager.is_none(),
-            "Catalog manager can be set only once!"
+    pub async fn try_build_standalone_components(
+        dir: String,
+        kv_backend_config: KvBackendConfig,
+        procedure_config: ProcedureConfig,
+    ) -> Result<(KvBackendRef, ProcedureManagerRef)> {
+        let kv_backend = Arc::new(
+            RaftEngineBackend::try_open_with_cfg(Config {
+                dir,
+                purge_threshold: ReadableSize(kv_backend_config.purge_threshold.0),
+                recovery_mode: RecoveryMode::TolerateTailCorruption,
+                batch_compression_threshold: ReadableSize::kb(8),
+                target_file_size: ReadableSize(kv_backend_config.file_size.0),
+                ..Default::default()
+            })
+            .map_err(BoxedError::new)
+            .context(error::OpenRaftEngineBackendSnafu)?,
         );
-        self.catalog_manager = Some(catalog_manager);
-    }
 
-    pub fn set_script_handler(&mut self, handler: ScriptHandlerRef) {
-        debug_assert!(
-            self.script_handler.is_none(),
-            "Script handler can be set only once!"
-        );
-        self.script_handler = Some(handler);
-    }
+        let state_store = Arc::new(KvStateStore::new(kv_backend.clone()));
 
-    /// Handle create expr.
-    pub async fn handle_create_table(
-        &self,
-        mut expr: CreateExpr,
-        partitions: Option<Partitions>,
-    ) -> Result<Output> {
-        if let Some(v) = &self.dist_instance {
-            v.create_table(&mut expr, partitions).await
-        } else {
-            let expr = AdminExpr {
-                header: Some(ExprHeader {
-                    version: PROTOCOL_VERSION,
-                }),
-                expr: Some(admin_expr::Expr::Create(expr)),
-            };
-            let result = self
-                .grpc_admin_handler
-                .exec_admin_request(expr)
-                .await
-                .context(error::InvokeGrpcServerSnafu)?;
-            admin_result_to_output(result).context(CreateTableSnafu)
-        }
-    }
-
-    /// Handle create database expr.
-    pub async fn handle_create_database(&self, expr: CreateDatabaseExpr) -> Result<Output> {
-        let database_name = expr.database_name.clone();
-        let expr = AdminExpr {
-            header: Some(ExprHeader {
-                version: PROTOCOL_VERSION,
-            }),
-            expr: Some(admin_expr::Expr::CreateDatabase(expr)),
+        let manager_config = ManagerConfig {
+            max_retry_times: procedure_config.max_retry_times,
+            retry_delay: procedure_config.retry_delay,
+            ..Default::default()
         };
-        let result = self
-            .grpc_admin_handler
-            .exec_admin_request(expr)
-            .await
-            .context(error::InvokeGrpcServerSnafu)?;
-        admin_result_to_output(result).context(CreateDatabaseSnafu {
-            name: database_name,
-        })
+        let procedure_manager = Arc::new(LocalManager::new(manager_config, state_store));
+
+        Ok((kv_backend, procedure_manager))
     }
 
-    /// Handle batch inserts
-    pub async fn handle_inserts(&self, insert_expr: Vec<InsertExpr>) -> Result<Output> {
-        let mut success = 0;
-        for expr in insert_expr {
-            match self.handle_insert(expr).await? {
-                Output::AffectedRows(rows) => success += rows,
-                _ => unreachable!("Insert should not yield output other than AffectedRows"),
-            }
-        }
-        Ok(Output::AffectedRows(success))
-    }
-
-    /// Handle insert. for 'values' insertion, create/alter the destination table on demand.
-    async fn handle_insert(&self, mut insert_expr: InsertExpr) -> Result<Output> {
-        let table_name = &insert_expr.table_name;
-        let catalog_name = DEFAULT_CATALOG_NAME;
-        let schema_name = &insert_expr.schema_name;
-
-        let columns = &insert_expr.columns;
-
-        self.create_or_alter_table_on_demand(catalog_name, schema_name, table_name, columns)
-            .await?;
-
-        insert_expr.region_number = 0;
-
-        let query = ObjectExpr {
-            header: Some(ExprHeader {
-                version: PROTOCOL_VERSION,
-            }),
-            expr: Some(Expr::Insert(insert_expr)),
-        };
-        let result = GrpcQueryHandler::do_query(&*self.grpc_query_handler, query)
-            .await
-            .context(error::InvokeGrpcServerSnafu)?;
-        let result: ObjectResult = result.try_into().context(InsertSnafu)?;
-        result.try_into().context(InsertSnafu)
-    }
-
-    // check if table already exist:
-    // - if table does not exist, create table by inferred CreateExpr
-    // - if table exist, check if schema matches. If any new column found, alter table by inferred `AlterExpr`
-    async fn create_or_alter_table_on_demand(
-        &self,
-        catalog_name: &str,
-        schema_name: &str,
-        table_name: &str,
-        columns: &[Column],
+    pub async fn build_servers(
+        &mut self,
+        opts: impl Into<FrontendOptions> + TomlSerializable,
     ) -> Result<()> {
-        match self
-            .catalog_manager
-            .as_ref()
-            .expect("catalog manager cannot be None")
-            .catalog(catalog_name)
-            .context(CatalogSnafu)?
-            .context(CatalogNotFoundSnafu { catalog_name })?
-            .schema(schema_name)
-            .context(CatalogSnafu)?
-            .context(SchemaNotFoundSnafu {
-                schema_info: schema_name,
-            })?
-            .table(table_name)
-            .context(CatalogSnafu)?
-        {
-            None => {
-                info!(
-                    "Table {}.{}.{} does not exist, try create table",
-                    catalog_name, schema_name, table_name,
-                );
-                self.create_table_by_columns(catalog_name, schema_name, table_name, columns)
-                    .await?;
-                info!(
-                    "Successfully created table on insertion: {}.{}.{}",
-                    catalog_name, schema_name, table_name
-                );
-            }
-            Some(table) => {
-                let schema = table.schema();
+        let servers = Services::build(opts, Arc::new(self.clone()), self.plugins.clone()).await?;
+        self.servers = Arc::new(servers);
 
-                if let Some(add_columns) = common_grpc_expr::find_new_columns(&schema, columns)
-                    .context(FindNewColumnsOnInsertionSnafu)?
-                {
-                    info!(
-                        "Find new columns {:?} on insertion, try to alter table: {}.{}.{}",
-                        add_columns, catalog_name, schema_name, table_name
-                    );
-                    self.add_new_columns_to_table(
-                        catalog_name,
-                        schema_name,
-                        table_name,
-                        add_columns,
-                    )
-                    .await?;
-                    info!(
-                        "Successfully altered table on insertion: {}.{}.{}",
-                        catalog_name, schema_name, table_name
-                    );
-                }
-            }
-        };
         Ok(())
     }
 
-    /// Infer create table expr from inserting data
-    async fn create_table_by_columns(
-        &self,
-        catalog_name: &str,
-        schema_name: &str,
-        table_name: &str,
-        columns: &[Column],
-    ) -> Result<Output> {
-        // Create table automatically, build schema from data.
-        let create_expr = self
-            .create_expr_factory
-            .create_expr_by_columns(catalog_name, schema_name, table_name, columns)
-            .await?;
-
-        info!(
-            "Try to create table: {} automatically with request: {:?}",
-            table_name, create_expr,
-        );
-        // Create-on-insert does support partition by other columns now
-        self.handle_create_table(create_expr, None).await
+    pub fn build_export_metrics_task(&mut self, opts: &ExportMetricsOption) -> Result<()> {
+        self.export_metrics_task =
+            ExportMetricsTask::try_new(opts, Some(&self.plugins)).context(StartServerSnafu)?;
+        Ok(())
     }
 
-    async fn add_new_columns_to_table(
-        &self,
-        catalog_name: &str,
-        schema_name: &str,
-        table_name: &str,
-        add_columns: AddColumns,
-    ) -> Result<Output> {
-        debug!(
-            "Adding new columns: {:?} to table: {}",
-            add_columns, table_name
-        );
-        let expr = AlterExpr {
-            table_name: table_name.to_string(),
-            schema_name: Some(schema_name.to_string()),
-            catalog_name: Some(catalog_name.to_string()),
-            kind: Some(Kind::AddColumns(add_columns)),
-        };
+    pub fn catalog_manager(&self) -> &CatalogManagerRef {
+        &self.catalog_manager
+    }
 
-        let expr = AdminExpr {
-            header: Some(ExprHeader {
-                version: PROTOCOL_VERSION,
-            }),
-            expr: Some(admin_expr::Expr::Alter(expr)),
-        };
-        let result = self
-            .grpc_admin_handler
-            .exec_admin_request(expr)
+    pub fn plugins(&self) -> Plugins {
+        self.plugins.clone()
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        futures::future::try_join_all(self.servers.values().map(|server| server.0.shutdown()))
             .await
-            .context(error::InvokeGrpcServerSnafu)?;
-        admin_result_to_output(result).context(AlterTableOnInsertionSnafu)
+            .context(error::ShutdownServerSnafu)
+            .map(|_| ())
     }
 
-    fn get_catalog(&self, catalog_name: &str) -> Result<CatalogProviderRef> {
-        self.catalog_manager
-            .as_ref()
-            .context(error::CatalogManagerSnafu)?
-            .catalog(catalog_name)
-            .context(error::CatalogSnafu)?
-            .context(error::CatalogNotFoundSnafu { catalog_name })
-    }
-
-    fn get_schema(provider: CatalogProviderRef, schema_name: &str) -> Result<SchemaProviderRef> {
-        provider
-            .schema(schema_name)
-            .context(error::CatalogSnafu)?
-            .context(error::SchemaNotFoundSnafu {
-                schema_info: schema_name,
-            })
-    }
-
-    async fn sql_dist_insert(&self, insert: Box<Insert>) -> Result<usize> {
-        let (catalog, schema, table) = insert.full_table_name().context(error::ParseSqlSnafu)?;
-
-        let catalog_provider = self.get_catalog(&catalog)?;
-        let schema_provider = Self::get_schema(catalog_provider, &schema)?;
-
-        let insert_request = insert_to_request(&schema_provider, *insert)?;
-
-        let (columns, _row_count) =
-            crate::table::insert::insert_request_to_insert_batch(&insert_request)?;
-
-        self.create_or_alter_table_on_demand(&catalog, &schema, &table, &columns)
-            .await?;
-
-        let table = schema_provider
-            .table(&table)
-            .context(error::CatalogSnafu)?
-            .context(error::TableNotFoundSnafu { table_name: &table })?;
-
-        table
-            .insert(insert_request)
-            .await
-            .context(error::TableSnafu)
-    }
-
-    fn stmt_to_insert_batch(
-        &self,
-        catalog: &str,
-        schema: &str,
-        insert: Box<Insert>,
-    ) -> Result<(Vec<Column>, u32)> {
-        let catalog_provider = self.get_catalog(catalog)?;
-        let schema_provider = Self::get_schema(catalog_provider, schema)?;
-
-        let insert_request = insert_to_request(&schema_provider, *insert)?;
-        insert_request_to_insert_batch(&insert_request)
-    }
-
-    fn handle_use(&self, db: String, query_ctx: QueryContextRef) -> Result<Output> {
-        let catalog_manager = &self.catalog_manager;
-        if let Some(catalog_manager) = catalog_manager {
-            ensure!(
-                catalog_manager
-                    .schema(DEFAULT_CATALOG_NAME, &db)
-                    .context(error::CatalogSnafu)?
-                    .is_some(),
-                error::SchemaNotFoundSnafu { schema_info: &db }
-            );
-
-            query_ctx.set_current_schema(&db);
-
-            Ok(Output::RecordBatches(RecordBatches::empty()))
-        } else {
-            // TODO(LFC): Handle "use" stmt here.
-            unimplemented!()
-        }
+    pub fn statement_executor(&self) -> Arc<StatementExecutor> {
+        self.statement_executor.clone()
     }
 }
 
 #[async_trait]
 impl FrontendInstance for Instance {
-    async fn start(&mut self) -> Result<()> {
-        // TODO(hl): Frontend init should move to here
-        Ok(())
+    async fn start(&self) -> Result<()> {
+        if let Some(heartbeat_task) = &self.heartbeat_task {
+            heartbeat_task.start().await?;
+        }
+
+        self.script_executor.start(self)?;
+
+        if let Some(t) = self.export_metrics_task.as_ref() {
+            t.start()
+        }
+
+        futures::future::try_join_all(self.servers.iter().map(|(name, handler)| async move {
+            info!("Starting service: {name}");
+            start_server(handler).await
+        }))
+        .await
+        .context(error::StartServerSnafu)
+        .map(|_| ())
     }
 }
 
-fn parse_stmt(sql: &str) -> Result<Statement> {
-    let mut stmt = ParserContext::create_with_dialect(sql, &GenericDialect {})
-        .context(error::ParseSqlSnafu)?;
-    // TODO(LFC): Support executing multiple SQL queries,
-    // which seems to be a major change to our whole server framework?
-    ensure!(
-        stmt.len() == 1,
-        error::InvalidSqlSnafu {
-            err_msg: "Currently executing multiple SQL queries are not supported."
-        }
-    );
-    Ok(stmt.remove(0))
+fn parse_stmt(sql: &str, dialect: &(dyn Dialect + Send + Sync)) -> Result<Vec<Statement>> {
+    ParserContext::create_with_dialect(sql, dialect).context(ParseSqlSnafu)
+}
+
+impl Instance {
+    async fn query_statement(&self, stmt: Statement, query_ctx: QueryContextRef) -> Result<Output> {
+        check_permission(self.plugins.clone(), &stmt, &query_ctx)?;
+
+        let stmt = QueryStatement::Sql(stmt);
+        self.statement_executor
+            .execute_stmt(stmt, query_ctx)
+            .await
+            .context(TableOperationSnafu)
+    }
 }
 
 #[async_trait]
 impl SqlQueryHandler for Instance {
+    type Error = Error;
+
+    async fn do_query(&self, query: &str, query_ctx: QueryContextRef) -> Vec<Result<Output>> {
+        let _timer = metrics::METRIC_HANDLE_SQL_ELAPSED.start_timer();
+        let query_interceptor_opt = self.plugins.get::<SqlQueryInterceptorRef<Error>>();
+        let query_interceptor = query_interceptor_opt.as_ref();
+        let query = match query_interceptor.pre_parsing(query, query_ctx.clone()) {
+            Ok(q) => q,
+            Err(e) => return vec![Err(e)],
+        };
+
+        let checker_ref = self.plugins.get::<PermissionCheckerRef>();
+        let checker = checker_ref.as_ref();
+
+        match parse_stmt(query.as_ref(), query_ctx.sql_dialect())
+            .and_then(|stmts| query_interceptor.post_parsing(stmts, query_ctx.clone()))
+        {
+            Ok(stmts) => {
+                let mut results = Vec::with_capacity(stmts.len());
+                for stmt in stmts {
+                    // TODO(sunng87): figure out at which stage we can call
+                    // this hook after ArrowFlight adoption. We need to provide
+                    // LogicalPlan as to this hook.
+                    if let Err(e) = query_interceptor.pre_execute(&stmt, None, query_ctx.clone()) {
+                        results.push(Err(e));
+                        break;
+                    }
+
+                    if let Err(e) = checker
+                        .check_permission(
+                            query_ctx.current_user(),
+                            PermissionReq::SqlStatement(&stmt),
+                        )
+                        .context(PermissionSnafu)
+                    {
+                        results.push(Err(e));
+                        break;
+                    }
+
+                    match self.query_statement(stmt, query_ctx.clone()).await {
+                        Ok(output) => {
+                            let output_result =
+                                query_interceptor.post_execute(output, query_ctx.clone());
+                            results.push(output_result);
+                        }
+                        Err(e) => {
+                            let redacted = sql::util::redact_sql_secrets(query.as_ref());
+                            error!(e; "Failed to execute query: {redacted}");
+
+                            results.push(Err(e));
+                            break;
+                        }
+                    }
+                }
+                results
+            }
+            Err(e) => {
+                vec![Err(e)]
+            }
+        }
+    }
+
+    async fn do_exec_plan(&self, plan: LogicalPlan, query_ctx: QueryContextRef) -> Result<Output> {
+        let _timer = metrics::METRIC_EXEC_PLAN_ELAPSED.start_timer();
+        // plan should be prepared before exec
+        // we'll do check there
+        self.query_engine
+            .execute(plan, query_ctx)
+            .await
+            .context(ExecLogicalPlanSnafu)
+    }
+
+    async fn do_promql_query(
+        &self,
+        query: &PromQuery,
+        query_ctx: QueryContextRef,
+    ) -> Vec<Result<Output>> {
+        // check will be done in prometheus handler's do_query
+        let result = PrometheusHandler::do_query(self, query, query_ctx)
+            .await
+            .with_context(|_| ExecutePromqlSnafu {
+                query: format!("{query:?}"),
+            });
+        vec![result]
+    }
+
+    async fn do_describe(
+        &self,
+        stmt: Statement,
+        query_ctx: QueryContextRef,
+    ) -> Result<Option<DescribeResult>> {
+        if matches!(
+            stmt,
+            Statement::Insert(_) | Statement::Query(_) | Statement::Delete(_)
+        ) {
+            self.plugins
+                .get::<PermissionCheckerRef>()
+                .as_ref()
+                .check_permission(query_ctx.current_user(), PermissionReq::SqlStatement(&stmt))
+                .context(PermissionSnafu)?;
+
+            let plan = self
+                .query_engine
+                .planner()
+                .plan(QueryStatement::Sql(stmt), query_ctx)
+                .await
+                .context(PlanStatementSnafu)?;
+            self.query_engine
+                .describe(plan)
+                .await
+                .map(Some)
+                .context(error::DescribeStatementSnafu)
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn is_valid_schema(&self, catalog: &str, schema: &str) -> Result<bool> {
+        self.catalog_manager
+            .schema_exists(catalog, schema)
+            .await
+            .context(error::CatalogSnafu)
+    }
+}
+
+#[async_trait]
+impl PrometheusHandler for Instance {
     async fn do_query(
         &self,
-        query: &str,
+        query: &PromQuery,
         query_ctx: QueryContextRef,
     ) -> server_error::Result<Output> {
-        let stmt = parse_stmt(query)
+        let _timer = metrics::METRIC_HANDLE_PROMQL_ELAPSED.start_timer();
+        let interceptor = self
+            .plugins
+            .get::<PromQueryInterceptorRef<server_error::Error>>();
+        interceptor.pre_execute(query, query_ctx.clone())?;
+
+        self.plugins
+            .get::<PermissionCheckerRef>()
+            .as_ref()
+            .check_permission(query_ctx.current_user(), PermissionReq::PromQuery)
+            .context(AuthSnafu)?;
+
+        let stmt = QueryLanguageParser::parse_promql(query).with_context(|_| ParsePromQLSnafu {
+            query: query.clone(),
+        })?;
+
+        let output = self
+            .statement_executor
+            .execute_stmt(stmt, query_ctx.clone())
+            .await
             .map_err(BoxedError::new)
-            .context(server_error::ExecuteQuerySnafu { query })?;
-
-        match stmt {
-            Statement::CreateDatabase(_)
-            | Statement::ShowDatabases(_)
-            | Statement::CreateTable(_)
-            | Statement::ShowTables(_)
-            | Statement::DescribeTable(_)
-            | Statement::Explain(_)
-            | Statement::Query(_) => {
-                return self.sql_handler.do_query(query, query_ctx).await;
-            }
-            Statement::Insert(insert) => match self.mode {
-                Mode::Standalone => {
-                    let (catalog_name, schema_name, table_name) = insert
-                        .full_table_name()
-                        .context(error::ParseSqlSnafu)
-                        .map_err(BoxedError::new)
-                        .context(server_error::ExecuteInsertSnafu {
-                            msg: "Failed to get table name",
-                        })?;
-
-                    let (columns, row_count) = self
-                        .stmt_to_insert_batch(&catalog_name, &schema_name, insert)
-                        .map_err(BoxedError::new)
-                        .context(server_error::ExecuteQuerySnafu { query })?;
-
-                    let expr = InsertExpr {
-                        schema_name,
-                        table_name,
-                        region_number: 0,
-                        columns,
-                        row_count,
-                    };
-                    self.handle_insert(expr).await
-                }
-                Mode::Distributed => {
-                    let affected = self
-                        .sql_dist_insert(insert)
-                        .await
-                        .map_err(BoxedError::new)
-                        .context(server_error::ExecuteInsertSnafu {
-                            msg: "execute insert failed",
-                        })?;
-                    Ok(Output::AffectedRows(affected))
-                }
-            },
-            Statement::Alter(alter_stmt) => {
-                let expr = AlterExpr::try_from(alter_stmt)
-                    .map_err(BoxedError::new)
-                    .context(server_error::ExecuteAlterSnafu { query })?;
-                let expr = AdminExpr {
-                    header: Some(ExprHeader {
-                        version: PROTOCOL_VERSION,
-                    }),
-                    expr: Some(admin_expr::Expr::Alter(expr)),
-                };
-                let result = self.grpc_admin_handler.exec_admin_request(expr).await?;
-                admin_result_to_output(result).context(error::InvalidAdminResultSnafu)
-            }
-            Statement::DropTable(drop_stmt) => {
-                let expr = DropTableExpr {
-                    catalog_name: drop_stmt.catalog_name,
-                    schema_name: drop_stmt.schema_name,
-                    table_name: drop_stmt.table_name,
-                };
-                let expr = AdminExpr {
-                    header: Some(ExprHeader {
-                        version: PROTOCOL_VERSION,
-                    }),
-                    expr: Some(admin_expr::Expr::DropTable(expr)),
-                };
-                let result = self.grpc_admin_handler.exec_admin_request(expr).await?;
-                admin_result_to_output(result).context(error::InvalidAdminResultSnafu)
-            }
-            Statement::ShowCreateTable(_) => {
-                return server_error::NotSupportedSnafu { feat: query }.fail();
-            }
-            Statement::Use(db) => self.handle_use(db, query_ctx),
-        }
-        .map_err(BoxedError::new)
-        .context(server_error::ExecuteQuerySnafu { query })
-    }
-}
-
-#[async_trait]
-impl ScriptHandler for Instance {
-    async fn insert_script(&self, name: &str, script: &str) -> server_error::Result<()> {
-        if let Some(handler) = &self.script_handler {
-            handler.insert_script(name, script).await
-        } else {
-            server_error::NotSupportedSnafu {
-                feat: "Script execution in Frontend",
-            }
-            .fail()
-        }
-    }
-
-    async fn execute_script(&self, script: &str) -> server_error::Result<Output> {
-        if let Some(handler) = &self.script_handler {
-            handler.execute_script(script).await
-        } else {
-            server_error::NotSupportedSnafu {
-                feat: "Script execution in Frontend",
-            }
-            .fail()
-        }
-    }
-}
-
-#[async_trait]
-impl GrpcQueryHandler for Instance {
-    async fn do_query(&self, query: ObjectExpr) -> server_error::Result<GrpcObjectResult> {
-        let expr = query
-            .clone()
-            .expr
-            .context(server_error::InvalidQuerySnafu {
-                reason: "empty expr",
+            .with_context(|_| ExecuteQuerySnafu {
+                query: format!("{query:?}"),
             })?;
-        match expr {
-            Expr::Insert(insert_expr) => {
-                let output = self
-                    .handle_insert(insert_expr.clone())
-                    .await
-                    .map_err(BoxedError::new)
-                    .with_context(|_| server_error::ExecuteQuerySnafu {
-                        query: format!("{:?}", insert_expr),
-                    })?;
-                let object_result = match output {
-                    Output::AffectedRows(rows) => ObjectResultBuilder::default()
-                        .mutate_result(rows as _, 0)
-                        .build(),
-                    _ => unreachable!(),
-                };
-                Ok(object_result)
-            }
-            _ => GrpcQueryHandler::do_query(&*self.grpc_query_handler, query).await,
-        }
+
+        Ok(interceptor.post_execute(output, query_ctx)?)
+    }
+
+    fn catalog_manager(&self) -> CatalogManagerRef {
+        self.catalog_manager.clone()
     }
 }
 
-#[async_trait]
-impl GrpcAdminHandler for Instance {
-    async fn exec_admin_request(&self, mut expr: AdminExpr) -> server_error::Result<AdminResult> {
-        // Force the default to be `None` rather than `Some(0)` comes from gRPC decode.
-        // Related issue: #480
-        if let Some(api::v1::admin_expr::Expr::Create(create)) = &mut expr.expr {
-            create.table_id = None;
-        }
-        self.grpc_admin_handler.exec_admin_request(expr).await
+pub fn check_permission(
+    plugins: Plugins,
+    stmt: &Statement,
+    query_ctx: &QueryContextRef,
+) -> Result<()> {
+    let need_validate = plugins
+        .get::<QueryOptions>()
+        .map(|opts| opts.disallow_cross_schema_query)
+        .unwrap_or_default();
+
+    if !need_validate {
+        return Ok(());
     }
+
+    match stmt {
+        // These are executed by query engine, and will be checked there.
+        Statement::Query(_) | Statement::Explain(_) | Statement::Tql(_) | Statement::Delete(_) => {}
+        // database ops won't be checked
+        Statement::CreateDatabase(_) | Statement::ShowDatabases(_) => {}
+        // show create table and alter are not supported yet
+        Statement::ShowCreateTable(_) | Statement::CreateExternalTable(_) | Statement::Alter(_) => {
+        }
+
+        Statement::Insert(insert) => {
+            validate_param(insert.table_name(), query_ctx)?;
+        }
+        Statement::CreateTable(stmt) => {
+            validate_param(&stmt.name, query_ctx)?;
+        }
+        Statement::DropTable(drop_stmt) => {
+            validate_param(drop_stmt.table_name(), query_ctx)?;
+        }
+        Statement::ShowTables(stmt) => {
+            if let Some(database) = &stmt.database {
+                validate_catalog_and_schema(query_ctx.current_catalog(), database, query_ctx)
+                    .map_err(BoxedError::new)
+                    .context(SqlExecInterceptedSnafu)?;
+            }
+        }
+        Statement::DescribeTable(stmt) => {
+            validate_param(stmt.name(), query_ctx)?;
+        }
+        Statement::Copy(sql::statements::copy::Copy::CopyTable(stmt)) => match stmt {
+            CopyTable::To(copy_table_to) => validate_param(&copy_table_to.table_name, query_ctx)?,
+            CopyTable::From(copy_table_from) => {
+                validate_param(&copy_table_from.table_name, query_ctx)?
+            }
+        },
+        Statement::Copy(sql::statements::copy::Copy::CopyDatabase(stmt)) => {
+            validate_param(&stmt.database_name, query_ctx)?
+        }
+        Statement::TruncateTable(stmt) => {
+            validate_param(stmt.table_name(), query_ctx)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_param(name: &ObjectName, query_ctx: &QueryContextRef) -> Result<()> {
+    let (catalog, schema, _) = table_idents_to_full_name(name, query_ctx.clone())
+        .map_err(BoxedError::new)
+        .context(ExternalSnafu)?;
+
+    validate_catalog_and_schema(&catalog, &schema, query_ctx)
+        .map_err(BoxedError::new)
+        .context(SqlExecInterceptedSnafu)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches::assert_matches;
+    use std::collections::HashMap;
 
-    use api::v1::codec::SelectResult;
-    use api::v1::column::SemanticType;
-    use api::v1::{
-        admin_expr, admin_result, column, object_expr, object_result, select_expr, Column,
-        ColumnDataType, ColumnDef as GrpcColumnDef, ExprHeader, MutateResult, SelectExpr,
-    };
-    use datatypes::schema::ColumnDefaultConstraint;
-    use datatypes::value::Value;
+    use common_base::Plugins;
+    use query::query_engine::options::QueryOptions;
     use session::context::QueryContext;
+    use sql::dialect::GreptimeDbDialect;
+    use strfmt::Format;
 
     use super::*;
-    use crate::tests;
 
-    #[tokio::test]
-    async fn test_execute_sql() {
-        let query_ctx = Arc::new(QueryContext::new());
+    #[test]
+    fn test_exec_validation() {
+        let query_ctx = QueryContext::arc();
+        let plugins: Plugins = Plugins::new();
+        plugins.insert(QueryOptions {
+            disallow_cross_schema_query: true,
+        });
 
-        let instance = tests::create_frontend_instance().await;
+        let sql = r#"
+        SELECT * FROM demo;
+        EXPLAIN SELECT * FROM demo;
+        CREATE DATABASE test_database;
+        SHOW DATABASES;
+        "#;
+        let stmts = parse_stmt(sql, &GreptimeDbDialect {}).unwrap();
+        assert_eq!(stmts.len(), 4);
+        for stmt in stmts {
+            let re = check_permission(plugins.clone(), &stmt, &query_ctx);
+            re.unwrap();
+        }
 
-        let sql = r#"CREATE TABLE demo(
+        let sql = r#"
+        SHOW CREATE TABLE demo;
+        ALTER TABLE demo ADD COLUMN new_col INT;
+        "#;
+        let stmts = parse_stmt(sql, &GreptimeDbDialect {}).unwrap();
+        assert_eq!(stmts.len(), 2);
+        for stmt in stmts {
+            let re = check_permission(plugins.clone(), &stmt, &query_ctx);
+            re.unwrap();
+        }
+
+        fn replace_test(template_sql: &str, plugins: Plugins, query_ctx: &QueryContextRef) {
+            // test right
+            let right = vec![("", ""), ("", "public."), ("greptime.", "public.")];
+            for (catalog, schema) in right {
+                let sql = do_fmt(template_sql, catalog, schema);
+                do_test(&sql, plugins.clone(), query_ctx, true);
+            }
+
+            let wrong = vec![
+                ("", "wrongschema."),
+                ("greptime.", "wrongschema."),
+                ("wrongcatalog.", "public."),
+                ("wrongcatalog.", "wrongschema."),
+            ];
+            for (catalog, schema) in wrong {
+                let sql = do_fmt(template_sql, catalog, schema);
+                do_test(&sql, plugins.clone(), query_ctx, false);
+            }
+        }
+
+        fn do_fmt(template: &str, catalog: &str, schema: &str) -> String {
+            let vars = HashMap::from([
+                ("catalog".to_string(), catalog),
+                ("schema".to_string(), schema),
+            ]);
+            template.format(&vars).unwrap()
+        }
+
+        fn do_test(sql: &str, plugins: Plugins, query_ctx: &QueryContextRef, is_ok: bool) {
+            let stmt = &parse_stmt(sql, &GreptimeDbDialect {}).unwrap()[0];
+            let re = check_permission(plugins, stmt, query_ctx);
+            if is_ok {
+                re.unwrap();
+            } else {
+                assert!(re.is_err());
+            }
+        }
+
+        // test insert
+        let sql = "INSERT INTO {catalog}{schema}monitor(host) VALUES ('host1');";
+        replace_test(sql, plugins.clone(), &query_ctx);
+
+        // test create table
+        let sql = r#"CREATE TABLE {catalog}{schema}demo(
                             host STRING,
                             ts TIMESTAMP,
-                            cpu DOUBLE NULL,
-                            memory DOUBLE NULL,
-                            disk_util DOUBLE DEFAULT 9.9,
                             TIME INDEX (ts),
                             PRIMARY KEY(host)
                         ) engine=mito with(regions=1);"#;
-        let output = SqlQueryHandler::do_query(&*instance, sql, query_ctx.clone())
-            .await
-            .unwrap();
-        match output {
-            Output::AffectedRows(rows) => assert_eq!(rows, 1),
-            _ => unreachable!(),
-        }
+        replace_test(sql, plugins.clone(), &query_ctx);
 
-        let sql = r#"insert into demo(host, cpu, memory, ts) values
-                                ('frontend.host1', 1.1, 100, 1000),
-                                ('frontend.host2', null, null, 2000),
-                                ('frontend.host3', 3.3, 300, 3000)
-                                "#;
-        let output = SqlQueryHandler::do_query(&*instance, sql, query_ctx.clone())
-            .await
-            .unwrap();
-        match output {
-            Output::AffectedRows(rows) => assert_eq!(rows, 3),
-            _ => unreachable!(),
-        }
+        // test drop table
+        let sql = "DROP TABLE {catalog}{schema}demo;";
+        replace_test(sql, plugins.clone(), &query_ctx);
 
-        let sql = "select * from demo";
-        let output = SqlQueryHandler::do_query(&*instance, sql, query_ctx.clone())
-            .await
-            .unwrap();
-        match output {
-            Output::Stream(stream) => {
-                let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
-                let pretty_print = recordbatches.pretty_print();
-                let pretty_print = pretty_print.lines().collect::<Vec<&str>>();
-                let expected = vec![
-                    "+----------------+---------------------+-----+--------+-----------+",
-                    "| host           | ts                  | cpu | memory | disk_util |",
-                    "+----------------+---------------------+-----+--------+-----------+",
-                    "| frontend.host1 | 1970-01-01 00:00:01 | 1.1 | 100    | 9.9       |",
-                    "| frontend.host2 | 1970-01-01 00:00:02 |     |        | 9.9       |",
-                    "| frontend.host3 | 1970-01-01 00:00:03 | 3.3 | 300    | 9.9       |",
-                    "+----------------+---------------------+-----+--------+-----------+",
-                ];
-                assert_eq!(pretty_print, expected);
-            }
-            _ => unreachable!(),
-        };
+        // test show tables
+        let sql = "SHOW TABLES FROM public";
+        let stmt = parse_stmt(sql, &GreptimeDbDialect {}).unwrap();
+        check_permission(plugins.clone(), &stmt[0], &query_ctx).unwrap();
 
-        let sql = "select * from demo where ts>cast(1000000000 as timestamp)"; // use nanoseconds as where condition
-        let output = SqlQueryHandler::do_query(&*instance, sql, query_ctx.clone())
-            .await
-            .unwrap();
-        match output {
-            Output::Stream(stream) => {
-                let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
-                let pretty_print = recordbatches.pretty_print();
-                let pretty_print = pretty_print.lines().collect::<Vec<&str>>();
-                let expected = vec![
-                    "+----------------+---------------------+-----+--------+-----------+",
-                    "| host           | ts                  | cpu | memory | disk_util |",
-                    "+----------------+---------------------+-----+--------+-----------+",
-                    "| frontend.host2 | 1970-01-01 00:00:02 |     |        | 9.9       |",
-                    "| frontend.host3 | 1970-01-01 00:00:03 | 3.3 | 300    | 9.9       |",
-                    "+----------------+---------------------+-----+--------+-----------+",
-                ];
-                assert_eq!(pretty_print, expected);
-            }
-            _ => unreachable!(),
-        };
-    }
+        let sql = "SHOW TABLES FROM wrongschema";
+        let stmt = parse_stmt(sql, &GreptimeDbDialect {}).unwrap();
+        let re = check_permission(plugins.clone(), &stmt[0], &query_ctx);
+        assert!(re.is_err());
 
-    #[tokio::test]
-    async fn test_execute_grpc() {
-        let instance = tests::create_frontend_instance().await;
-
-        // testing data:
-        let expected_host_col = Column {
-            column_name: "host".to_string(),
-            values: Some(column::Values {
-                string_values: vec!["fe.host.a", "fe.host.b", "fe.host.c", "fe.host.d"]
-                    .into_iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-                ..Default::default()
-            }),
-            semantic_type: SemanticType::Field as i32,
-            datatype: ColumnDataType::String as i32,
-            ..Default::default()
-        };
-        let expected_cpu_col = Column {
-            column_name: "cpu".to_string(),
-            values: Some(column::Values {
-                f64_values: vec![1.0, 3.0, 4.0],
-                ..Default::default()
-            }),
-            null_mask: vec![2],
-            semantic_type: SemanticType::Field as i32,
-            datatype: ColumnDataType::Float64 as i32,
-        };
-        let expected_mem_col = Column {
-            column_name: "memory".to_string(),
-            values: Some(column::Values {
-                f64_values: vec![100.0, 200.0, 400.0],
-                ..Default::default()
-            }),
-            null_mask: vec![4],
-            semantic_type: SemanticType::Field as i32,
-            datatype: ColumnDataType::Float64 as i32,
-        };
-        let expected_disk_col = Column {
-            column_name: "disk_util".to_string(),
-            values: Some(column::Values {
-                f64_values: vec![9.9, 9.9, 9.9, 9.9],
-                ..Default::default()
-            }),
-            semantic_type: SemanticType::Field as i32,
-            datatype: ColumnDataType::Float64 as i32,
-            ..Default::default()
-        };
-        let expected_ts_col = Column {
-            column_name: "ts".to_string(),
-            values: Some(column::Values {
-                ts_millis_values: vec![1000, 2000, 3000, 4000],
-                ..Default::default()
-            }),
-            semantic_type: SemanticType::Timestamp as i32,
-            datatype: ColumnDataType::Timestamp as i32,
-            ..Default::default()
-        };
-
-        // create
-        let create_expr = create_expr();
-        let admin_expr = AdminExpr {
-            header: Some(ExprHeader::default()),
-            expr: Some(admin_expr::Expr::Create(create_expr)),
-        };
-        let result = GrpcAdminHandler::exec_admin_request(&*instance, admin_expr)
-            .await
-            .unwrap();
-        assert_matches!(
-            result.result,
-            Some(admin_result::Result::Mutate(MutateResult {
-                success: 1,
-                failure: 0
-            }))
-        );
-
-        // insert
-        let columns = vec![
-            expected_host_col.clone(),
-            expected_cpu_col.clone(),
-            expected_mem_col.clone(),
-            expected_ts_col.clone(),
-        ];
-        let row_count = 4;
-        let insert_expr = InsertExpr {
-            schema_name: "public".to_string(),
-            table_name: "demo".to_string(),
-            region_number: 0,
-            columns,
-            row_count,
-        };
-        let object_expr = ObjectExpr {
-            header: Some(ExprHeader::default()),
-            expr: Some(object_expr::Expr::Insert(insert_expr)),
-        };
-        let result = GrpcQueryHandler::do_query(&*instance, object_expr)
-            .await
-            .unwrap();
-        assert_matches!(
-            result.result,
-            Some(object_result::Result::Mutate(MutateResult {
-                success: 4,
-                failure: 0
-            }))
-        );
-
-        // select
-        let object_expr = ObjectExpr {
-            header: Some(ExprHeader::default()),
-            expr: Some(object_expr::Expr::Select(SelectExpr {
-                expr: Some(select_expr::Expr::Sql("select * from demo".to_string())),
-            })),
-        };
-        let result = GrpcQueryHandler::do_query(&*instance, object_expr)
-            .await
-            .unwrap();
-        match result.result {
-            Some(object_result::Result::Select(select_result)) => {
-                let select_result: SelectResult = (*select_result.raw_data).try_into().unwrap();
-
-                assert_eq!(4, select_result.row_count);
-                let actual_columns = select_result.columns;
-                assert_eq!(5, actual_columns.len());
-
-                // Respect the order in create table schema
-                let expected_columns = vec![
-                    expected_host_col,
-                    expected_cpu_col,
-                    expected_mem_col,
-                    expected_disk_col,
-                    expected_ts_col,
-                ];
-                expected_columns
-                    .iter()
-                    .zip(actual_columns.iter())
-                    .for_each(|(x, y)| assert_eq!(x, y));
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    fn create_expr() -> CreateExpr {
-        let column_defs = vec![
-            GrpcColumnDef {
-                name: "host".to_string(),
-                datatype: ColumnDataType::String as i32,
-                is_nullable: false,
-                default_constraint: None,
-            },
-            GrpcColumnDef {
-                name: "cpu".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
-                is_nullable: true,
-                default_constraint: None,
-            },
-            GrpcColumnDef {
-                name: "memory".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
-                is_nullable: true,
-                default_constraint: None,
-            },
-            GrpcColumnDef {
-                name: "disk_util".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
-                is_nullable: true,
-                default_constraint: Some(
-                    ColumnDefaultConstraint::Value(Value::from(9.9f64))
-                        .try_into()
-                        .unwrap(),
-                ),
-            },
-            GrpcColumnDef {
-                name: "ts".to_string(),
-                datatype: ColumnDataType::Timestamp as i32,
-                is_nullable: true,
-                default_constraint: None,
-            },
-        ];
-        CreateExpr {
-            catalog_name: None,
-            schema_name: None,
-            table_name: "demo".to_string(),
-            desc: None,
-            column_defs,
-            time_index: "ts".to_string(),
-            primary_keys: vec!["host".to_string()],
-            create_if_not_exists: true,
-            table_options: Default::default(),
-            table_id: None,
-            region_ids: vec![0],
-        }
+        // test describe table
+        let sql = "DESC TABLE {catalog}{schema}demo;";
+        replace_test(sql, plugins, &query_ctx);
     }
 }

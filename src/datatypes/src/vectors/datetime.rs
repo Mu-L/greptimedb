@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,264 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::Any;
-use std::sync::Arc;
+use crate::types::DateTimeType;
+use crate::vectors::{PrimitiveVector, PrimitiveVectorBuilder};
 
-use arrow::array::{Array, ArrayRef, PrimitiveArray};
-use common_time::datetime::DateTime;
-use snafu::OptionExt;
-
-use crate::data_type::ConcreteDataType;
-use crate::error::{self, Result};
-use crate::prelude::{
-    MutableVector, ScalarVector, ScalarVectorBuilder, Validity, Value, ValueRef, Vector, VectorRef,
-};
-use crate::serialize::Serializable;
-use crate::vectors::{PrimitiveIter, PrimitiveVector, PrimitiveVectorBuilder};
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct DateTimeVector {
-    array: PrimitiveVector<i64>,
-}
-
-impl DateTimeVector {
-    pub fn new(array: PrimitiveArray<i64>) -> Self {
-        Self {
-            array: PrimitiveVector { array },
-        }
-    }
-
-    pub fn try_from_arrow_array(array: impl AsRef<dyn Array>) -> Result<Self> {
-        Ok(Self::new(
-            array
-                .as_ref()
-                .as_any()
-                .downcast_ref::<PrimitiveArray<i64>>()
-                .with_context(|| error::ConversionSnafu {
-                    from: format!("{:?}", array.as_ref().data_type()),
-                })?
-                .clone(),
-        ))
-    }
-
-    pub(crate) fn as_arrow(&self) -> &dyn Array {
-        self.array.as_arrow()
-    }
-}
-
-impl Vector for DateTimeVector {
-    fn data_type(&self) -> ConcreteDataType {
-        ConcreteDataType::datetime_datatype()
-    }
-
-    fn vector_type_name(&self) -> String {
-        "DateTimeVector".to_string()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn len(&self) -> usize {
-        self.array.len()
-    }
-
-    fn to_arrow_array(&self) -> ArrayRef {
-        let validity = self.array.array.validity().cloned();
-        let buffer = self.array.array.values().clone();
-        Arc::new(PrimitiveArray::new(
-            arrow::datatypes::DataType::Date64,
-            buffer,
-            validity,
-        ))
-    }
-
-    fn to_boxed_arrow_array(&self) -> Box<dyn Array> {
-        let validity = self.array.array.validity().cloned();
-        let buffer = self.array.array.values().clone();
-        Box::new(PrimitiveArray::new(
-            arrow::datatypes::DataType::Date64,
-            buffer,
-            validity,
-        ))
-    }
-
-    fn validity(&self) -> Validity {
-        self.array.validity()
-    }
-
-    fn memory_size(&self) -> usize {
-        self.array.memory_size()
-    }
-
-    fn is_null(&self, row: usize) -> bool {
-        self.array.is_null(row)
-    }
-
-    fn slice(&self, offset: usize, length: usize) -> VectorRef {
-        Arc::new(Self {
-            array: PrimitiveVector::new(self.array.array.slice(offset, length)),
-        })
-    }
-
-    fn get(&self, index: usize) -> Value {
-        match self.array.get(index) {
-            Value::Int64(v) => Value::DateTime(DateTime::new(v)),
-            Value::Null => Value::Null,
-            _ => {
-                unreachable!()
-            }
-        }
-    }
-
-    fn get_ref(&self, index: usize) -> ValueRef {
-        match self.array.get(index) {
-            Value::Int64(v) => ValueRef::DateTime(DateTime::new(v)),
-            Value::Null => ValueRef::Null,
-            _ => {
-                unreachable!()
-            }
-        }
-    }
-}
-
-impl Serializable for DateTimeVector {
-    fn serialize_to_json(&self) -> crate::Result<Vec<serde_json::Value>> {
-        Ok(self
-            .array
-            .iter_data()
-            .map(|v| v.map(DateTime::new))
-            .map(|v| match v {
-                None => serde_json::Value::Null,
-                Some(v) => v.into(),
-            })
-            .collect::<Vec<_>>())
-    }
-}
-
-impl From<Vec<Option<i64>>> for DateTimeVector {
-    fn from(data: Vec<Option<i64>>) -> Self {
-        Self {
-            array: PrimitiveVector::<i64>::from(data),
-        }
-    }
-}
-
-pub struct DateTimeVectorBuilder {
-    buffer: PrimitiveVectorBuilder<i64>,
-}
-
-impl ScalarVectorBuilder for DateTimeVectorBuilder {
-    type VectorType = DateTimeVector;
-
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            buffer: PrimitiveVectorBuilder::with_capacity(capacity),
-        }
-    }
-
-    fn push(&mut self, value: Option<<Self::VectorType as ScalarVector>::RefItem<'_>>) {
-        self.buffer.push(value.map(|d| d.val()))
-    }
-
-    fn finish(&mut self) -> Self::VectorType {
-        Self::VectorType {
-            array: self.buffer.finish(),
-        }
-    }
-}
-
-impl MutableVector for DateTimeVectorBuilder {
-    fn data_type(&self) -> ConcreteDataType {
-        ConcreteDataType::datetime_datatype()
-    }
-
-    fn len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_mut_any(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn to_vector(&mut self) -> VectorRef {
-        Arc::new(self.finish())
-    }
-
-    fn push_value_ref(&mut self, value: ValueRef) -> Result<()> {
-        self.buffer.push(value.as_datetime()?.map(|d| d.val()));
-        Ok(())
-    }
-
-    fn extend_slice_of(&mut self, vector: &dyn Vector, offset: usize, length: usize) -> Result<()> {
-        let concrete_vector = vector
-            .as_any()
-            .downcast_ref::<DateTimeVector>()
-            .with_context(|| error::CastTypeSnafu {
-                msg: format!(
-                    "Failed to convert vector from {} to DateVector",
-                    vector.vector_type_name()
-                ),
-            })?;
-        self.buffer
-            .extend_slice_of(&concrete_vector.array, offset, length)?;
-        Ok(())
-    }
-}
-
-pub struct DateTimeIter<'a> {
-    iter: PrimitiveIter<'a, i64>,
-}
-
-impl<'a> Iterator for DateTimeIter<'a> {
-    type Item = Option<DateTime>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|v| v.map(DateTime::new))
-    }
-}
-
-impl ScalarVector for DateTimeVector {
-    type OwnedItem = DateTime;
-    type RefItem<'a> = DateTime;
-    type Iter<'a> = DateTimeIter<'a>;
-    type Builder = DateTimeVectorBuilder;
-
-    fn get_data(&self, idx: usize) -> Option<Self::RefItem<'_>> {
-        self.array.get_data(idx).map(DateTime::new)
-    }
-
-    fn iter_data(&self) -> Self::Iter<'_> {
-        DateTimeIter {
-            iter: self.array.iter_data(),
-        }
-    }
-}
-
-pub(crate) fn replicate_datetime(vector: &DateTimeVector, offsets: &[usize]) -> VectorRef {
-    let array = crate::vectors::primitive::replicate_primitive_with_type(
-        &vector.array,
-        offsets,
-        vector.data_type(),
-    );
-    Arc::new(DateTimeVector { array })
-}
+/// Vector of [`DateTime`](common_time::Date)
+pub type DateTimeVector = PrimitiveVector<DateTimeType>;
+/// Builder for [`DateTimeVector`].
+pub type DateTimeVectorBuilder = PrimitiveVectorBuilder<DateTimeType>;
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches::assert_matches;
+    use std::sync::Arc;
+
+    use arrow::array::{Array, PrimitiveArray};
+    use arrow_array::ArrayRef;
+    use common_time::timezone::set_default_timezone;
+    use common_time::DateTime;
 
     use super::*;
     use crate::data_type::DataType;
-    use crate::types::DateTimeType;
+    use crate::prelude::{
+        ConcreteDataType, ScalarVector, ScalarVectorBuilder, Value, ValueRef, Vector, VectorRef,
+    };
+    use crate::serialize::Serializable;
 
     #[test]
     fn test_datetime_vector() {
-        let v = DateTimeVector::new(PrimitiveArray::from_vec(vec![1, 2, 3]));
+        set_default_timezone(Some("Asia/Shanghai")).unwrap();
+        let v = DateTimeVector::new(PrimitiveArray::from(vec![1000, 2000, 3000]));
         assert_eq!(ConcreteDataType::datetime_datatype(), v.data_type());
         assert_eq!(3, v.len());
         assert_eq!("DateTimeVector", v.vector_type_name());
@@ -278,25 +48,24 @@ mod tests {
             v.to_arrow_array().data_type()
         );
 
-        assert_eq!(Some(DateTime::new(1)), v.get_data(0));
-        assert_eq!(Value::DateTime(DateTime::new(1)), v.get(0));
-        assert_eq!(ValueRef::DateTime(DateTime::new(1)), v.get_ref(0));
+        assert_eq!(Some(DateTime::new(1000)), v.get_data(0));
+        assert_eq!(Value::DateTime(DateTime::new(1000)), v.get(0));
+        assert_eq!(ValueRef::DateTime(DateTime::new(1000)), v.get_ref(0));
 
         let mut iter = v.iter_data();
-        assert_eq!(Some(DateTime::new(1)), iter.next().unwrap());
-        assert_eq!(Some(DateTime::new(2)), iter.next().unwrap());
-        assert_eq!(Some(DateTime::new(3)), iter.next().unwrap());
+        assert_eq!(Some(DateTime::new(1000)), iter.next().unwrap());
+        assert_eq!(Some(DateTime::new(2000)), iter.next().unwrap());
+        assert_eq!(Some(DateTime::new(3000)), iter.next().unwrap());
         assert!(!v.is_null(0));
-        assert_eq!(24, v.memory_size()); // size of i64 * 3
+        assert_eq!(24, v.memory_size());
 
-        assert_matches!(v.validity(), Validity::AllValid);
         if let Value::DateTime(d) = v.get(0) {
-            assert_eq!(1, d.val());
+            assert_eq!(1000, d.val());
         } else {
             unreachable!()
         }
         assert_eq!(
-            "[\"1970-01-01 00:00:01\",\"1970-01-01 00:00:02\",\"1970-01-01 00:00:03\"]",
+            "[\"1970-01-01 08:00:01+0800\",\"1970-01-01 08:00:02+0800\",\"1970-01-01 08:00:03+0800\"]",
             serde_json::to_string(&v.serialize_to_json().unwrap()).unwrap()
         );
     }
@@ -314,21 +83,22 @@ mod tests {
         assert_eq!(Value::Null, v.get(1));
         assert_eq!(Value::DateTime(DateTime::new(-1)), v.get(2));
 
-        let input =
-            DateTimeVector::from_slice(&[DateTime::new(1), DateTime::new(2), DateTime::new(3)]);
+        let input = DateTimeVector::from_wrapper_slice([
+            DateTime::new(1),
+            DateTime::new(2),
+            DateTime::new(3),
+        ]);
 
-        let mut builder = DateTimeType::default().create_mutable_vector(3);
-        builder
-            .push_value_ref(ValueRef::DateTime(DateTime::new(5)))
-            .unwrap();
-        assert!(builder.push_value_ref(ValueRef::Int32(123)).is_err());
+        let mut builder = DateTimeType.create_mutable_vector(3);
+        builder.push_value_ref(ValueRef::DateTime(DateTime::new(5)));
+        assert!(builder.try_push_value_ref(ValueRef::Int32(123)).is_err());
         builder.extend_slice_of(&input, 1, 2).unwrap();
         assert!(builder
-            .extend_slice_of(&crate::vectors::Int32Vector::from_slice(&[13]), 0, 1)
+            .extend_slice_of(&crate::vectors::Int32Vector::from_slice([13]), 0, 1)
             .is_err());
         let vector = builder.to_vector();
 
-        let expect: VectorRef = Arc::new(DateTimeVector::from_slice(&[
+        let expect: VectorRef = Arc::new(DateTimeVector::from_wrapper_slice([
             DateTime::new(5),
             DateTime::new(2),
             DateTime::new(3),
@@ -338,9 +108,9 @@ mod tests {
 
     #[test]
     fn test_datetime_from_arrow() {
-        let vector = DateTimeVector::from_slice(&[DateTime::new(1), DateTime::new(2)]);
-        let arrow = vector.as_arrow().slice(0, vector.len());
-        let vector2 = DateTimeVector::try_from_arrow_array(&arrow).unwrap();
+        let vector = DateTimeVector::from_wrapper_slice([DateTime::new(1), DateTime::new(2)]);
+        let arrow: ArrayRef = Arc::new(vector.as_arrow().slice(0, vector.len())) as _;
+        let vector2 = DateTimeVector::try_from_arrow_array(arrow).unwrap();
         assert_eq!(vector, vector2);
     }
 }

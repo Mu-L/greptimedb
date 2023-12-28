@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-///! Common actions for manifest
+//! Common actions for manifest
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::ManifestVersion;
@@ -37,6 +37,16 @@ pub fn supported_protocol_version() -> (ProtocolVersion, ProtocolVersion) {
 pub struct ProtocolAction {
     pub min_reader_version: ProtocolVersion,
     pub min_writer_version: ProtocolVersion,
+}
+
+impl std::fmt::Display for ProtocolAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Protocol({}, {})",
+            &self.min_reader_version, &self.min_writer_version,
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

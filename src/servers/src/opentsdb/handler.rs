@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,6 +14,8 @@
 
 //! Modified from Tokio's mini-redis example.
 
+use common_error::ext::ErrorExt;
+use session::context::QueryContextBuilder;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::Result;
@@ -23,7 +25,7 @@ use crate::query_handler::OpentsdbProtocolHandlerRef;
 use crate::shutdown::Shutdown;
 
 /// Per-connection handler. Reads requests from `connection` and applies the OpenTSDB metric to
-/// [OpentsdbLineProtocolHandler].
+/// [OpentsdbProtocolHandlerRef].
 pub(crate) struct Handler<S: AsyncWrite + AsyncRead + Unpin> {
     query_handler: OpentsdbProtocolHandlerRef,
 
@@ -59,6 +61,8 @@ impl<S: AsyncWrite + AsyncRead + Unpin> Handler<S> {
     }
 
     pub(crate) async fn run(&mut self) -> Result<()> {
+        // TODO(shuiyisong): figure out how to auth in tcp connection.
+        let ctx = QueryContextBuilder::default().build();
         while !self.shutdown.is_shutdown() {
             // While reading a request, also listen for the shutdown signal.
             let maybe_line = tokio::select! {
@@ -88,13 +92,15 @@ impl<S: AsyncWrite + AsyncRead + Unpin> Handler<S> {
 
             match DataPoint::try_create(&line) {
                 Ok(data_point) => {
-                    let result = self.query_handler.exec(&data_point).await;
+                    let _timer =
+                        crate::metrics::METRIC_TCP_OPENTSDB_LINE_WRITE_ELAPSED.start_timer();
+                    let result = self.query_handler.exec(vec![data_point], ctx.clone()).await;
                     if let Err(e) = result {
-                        self.connection.write_line(e.to_string()).await?;
+                        self.connection.write_line(e.output_msg()).await?;
                     }
                 }
                 Err(e) => {
-                    self.connection.write_line(e.to_string()).await?;
+                    self.connection.write_line(e.output_msg()).await?;
                 }
             }
         }
@@ -108,6 +114,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
+    use session::context::QueryContextRef;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{broadcast, mpsc};
 
@@ -121,8 +128,8 @@ mod tests {
 
     #[async_trait]
     impl OpentsdbProtocolHandler for DummyQueryHandler {
-        async fn exec(&self, data_point: &DataPoint) -> Result<()> {
-            let metric = data_point.metric();
+        async fn exec(&self, data_points: Vec<DataPoint>, _ctx: QueryContextRef) -> Result<usize> {
+            let metric = data_points.first().unwrap().metric();
             if metric == "should_failed" {
                 return error::InternalSnafu {
                     err_msg: "expected",
@@ -130,7 +137,7 @@ mod tests {
                 .fail();
             }
             self.tx.send(metric.to_string()).await.unwrap();
-            Ok(())
+            Ok(data_points.len())
         }
     }
 
@@ -162,7 +169,7 @@ mod tests {
             .await
             .unwrap();
         let resp = client.read_line().await.unwrap();
-        assert_eq!(resp, Some("Internal error: expected".to_string()));
+        assert_eq!(resp, Some("Internal error: 1003".to_string()));
 
         client.write_line("get".to_string()).await.unwrap();
         let resp = client.read_line().await.unwrap();
@@ -179,14 +186,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        tokio::spawn(async move {
+        let _handle = common_runtime::spawn_read(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
 
                 let query_handler = query_handler.clone();
                 let connection = Connection::new(stream);
                 let shutdown = Shutdown::new(notify_shutdown.subscribe());
-                tokio::spawn(async move {
+                let _handle = common_runtime::spawn_read(async move {
                     Handler::new(query_handler, connection, shutdown)
                         .run()
                         .await

@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,6 +17,13 @@ use std::panic;
 use std::time::Duration;
 
 use backtrace::Backtrace;
+use lazy_static::lazy_static;
+use prometheus::*;
+
+lazy_static! {
+    pub static ref PANIC_COUNTER: IntCounter =
+        register_int_counter!("panic_counter", "panic_counter").unwrap();
+}
 
 pub fn set_panic_hook() {
     // Set a panic hook that records the panic as a `tracing` event at the
@@ -28,7 +35,7 @@ pub fn set_panic_hook() {
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic| {
         let backtrace = Backtrace::new();
-        let backtrace = format!("{:?}", backtrace);
+        let backtrace = format!("{backtrace:?}");
         if let Some(location) = panic.location() {
             tracing::error!(
                 message = %panic,
@@ -40,11 +47,12 @@ pub fn set_panic_hook() {
         } else {
             tracing::error!(message = %panic, backtrace = %backtrace);
         }
+        PANIC_COUNTER.inc();
         default_hook(panic);
     }));
 
     #[cfg(feature = "deadlock_detection")]
-    std::thread::spawn(move || loop {
+    let _ = std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(5));
         let deadlocks = parking_lot::deadlock::check_deadlock();
         if deadlocks.is_empty() {

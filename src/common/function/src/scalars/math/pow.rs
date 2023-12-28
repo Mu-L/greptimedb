@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,17 +15,18 @@
 use std::fmt;
 use std::sync::Arc;
 
+use common_query::error::Result;
 use common_query::prelude::{Signature, Volatility};
 use datatypes::data_type::DataType;
 use datatypes::prelude::ConcreteDataType;
+use datatypes::types::LogicalPrimitiveType;
 use datatypes::vectors::VectorRef;
 use datatypes::with_match_primitive_type_id;
 use num::traits::Pow;
 use num_traits::AsPrimitive;
 
-use crate::error::Result;
+use crate::function::{Function, FunctionContext};
 use crate::scalars::expression::{scalar_binary_op, EvalContext};
-use crate::scalars::function::{Function, FunctionContext};
 
 #[derive(Clone, Debug, Default)]
 pub struct PowFunction;
@@ -46,7 +47,7 @@ impl Function for PowFunction {
     fn eval(&self, _func_ctx: FunctionContext, columns: &[VectorRef]) -> Result<VectorRef> {
         with_match_primitive_type_id!(columns[0].data_type().logical_type_id(), |$S| {
             with_match_primitive_type_id!(columns[1].data_type().logical_type_id(), |$T| {
-                let col = scalar_binary_op::<$S, $T, f64, _>(&columns[0], &columns[1], scalar_pow, &mut EvalContext::default())?;
+                let col = scalar_binary_op::<<$S as LogicalPrimitiveType>::Native, <$T as LogicalPrimitiveType>::Native, f64, _>(&columns[0], &columns[1], scalar_pow, &mut EvalContext::default())?;
                 Ok(Arc::new(col))
             },{
                 unreachable!()
@@ -82,9 +83,10 @@ mod tests {
     use datatypes::vectors::{Float32Vector, Int8Vector};
 
     use super::*;
+    use crate::function::FunctionContext;
     #[test]
     fn test_pow_function() {
-        let pow = PowFunction::default();
+        let pow = PowFunction;
 
         assert_eq!("pow", pow.name());
         assert_eq!(

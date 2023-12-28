@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,86 +13,69 @@
 // limitations under the License.
 
 use std::any::Any;
+use std::sync::Arc;
 
-use common_error::prelude::*;
-use storage::error::Error as StorageError;
+use common_error::ext::{BoxedError, ErrorExt};
+use common_error::status_code::StatusCode;
+use common_macro::stack_trace_debug;
+use servers::define_into_tonic_status;
+use snafu::{Location, Snafu};
+use store_api::storage::RegionId;
 use table::error::Error as TableError;
 
-use crate::datanode::ObjectStoreConfig;
-
 /// Business error of datanode.
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub))]
+#[stack_trace_debug]
 pub enum Error {
-    #[snafu(display("Failed to execute sql, source: {}", source))]
-    ExecuteSql {
-        #[snafu(backtrace)]
+    #[snafu(display("Failed to execute async task"))]
+    AsyncTaskExecute {
+        location: Location,
+        source: Arc<Error>,
+    },
+
+    #[snafu(display("Failed to watch change"))]
+    WatchAsyncTaskChange {
+        location: Location,
+        #[snafu(source)]
+        error: tokio::sync::watch::error::RecvError,
+    },
+
+    #[snafu(display("Failed to handle heartbeat response"))]
+    HandleHeartbeatResponse {
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Failed to get info from meta server"))]
+    GetMetadata {
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Failed to execute logical plan"))]
+    ExecuteLogicalPlan {
+        location: Location,
         source: query::error::Error,
     },
 
-    #[snafu(display("Failed to decode logical plan, source: {}", source))]
+    #[snafu(display("Failed to decode logical plan"))]
     DecodeLogicalPlan {
-        #[snafu(backtrace)]
+        location: Location,
         source: substrait::error::Error,
     },
 
-    #[snafu(display("Failed to execute physical plan, source: {}", source))]
-    ExecutePhysicalPlan {
-        #[snafu(backtrace)]
-        source: query::error::Error,
-    },
-
-    #[snafu(display("Failed to create catalog list, source: {}", source))]
-    NewCatalog {
-        #[snafu(backtrace)]
-        source: catalog::error::Error,
-    },
+    #[snafu(display("Incorrect internal state: {}", state))]
+    IncorrectInternalState { state: String, location: Location },
 
     #[snafu(display("Catalog not found: {}", name))]
-    CatalogNotFound { name: String, backtrace: Backtrace },
+    CatalogNotFound { name: String, location: Location },
 
     #[snafu(display("Schema not found: {}", name))]
-    SchemaNotFound { name: String, backtrace: Backtrace },
-
-    #[snafu(display("Failed to create table: {}, source: {}", table_name, source))]
-    CreateTable {
-        table_name: String,
-        #[snafu(backtrace)]
-        source: TableError,
-    },
-
-    #[snafu(display("Failed to get table: {}, source: {}", table_name, source))]
-    GetTable {
-        table_name: String,
-        #[snafu(backtrace)]
-        source: TableError,
-    },
-
-    #[snafu(display("Failed to alter table {}, source: {}", table_name, source))]
-    AlterTable {
-        table_name: String,
-        #[snafu(backtrace)]
-        source: TableError,
-    },
-
-    #[snafu(display("Failed to drop table {}, source: {}", table_name, source))]
-    DropTable {
-        table_name: String,
-        #[snafu(backtrace)]
-        source: BoxedError,
-    },
-
-    #[snafu(display("Table not found: {}", table_name))]
-    TableNotFound { table_name: String },
-
-    #[snafu(display("Column {} not found in table {}", column_name, table_name))]
-    ColumnNotFound {
-        column_name: String,
-        table_name: String,
-    },
+    SchemaNotFound { name: String, location: Location },
 
     #[snafu(display("Missing timestamp column in request"))]
-    MissingTimestampColumn { backtrace: Backtrace },
+    MissingTimestampColumn { location: Location },
 
     #[snafu(display(
         "Columns and values number mismatch, columns: {}, values: {}",
@@ -101,268 +84,263 @@ pub enum Error {
     ))]
     ColumnValuesNumberMismatch { columns: usize, values: usize },
 
-    #[snafu(display("Failed to parse sql value, source: {}", source))]
-    ParseSqlValue {
-        #[snafu(backtrace)]
-        source: sql::error::Error,
-    },
-
-    #[snafu(display("Failed to insert value to table: {}, source: {}", table_name, source))]
-    Insert {
+    #[snafu(display("Failed to delete value from table: {}", table_name))]
+    Delete {
         table_name: String,
-        #[snafu(backtrace)]
+        location: Location,
         source: TableError,
     },
 
-    #[snafu(display("Failed to start server, source: {}", source))]
+    #[snafu(display("Failed to start server"))]
     StartServer {
-        #[snafu(backtrace)]
+        location: Location,
         source: servers::error::Error,
     },
 
-    #[snafu(display("Failed to parse address {}, source: {}", addr, source))]
+    #[snafu(display("Failed to parse address {}", addr))]
     ParseAddr {
         addr: String,
-        source: std::net::AddrParseError,
+        #[snafu(source)]
+        error: std::net::AddrParseError,
     },
 
-    #[snafu(display("Failed to bind address {}, source: {}", addr, source))]
-    TcpBind {
-        addr: String,
-        source: std::io::Error,
+    #[snafu(display("Failed to create directory {}", dir))]
+    CreateDir {
+        dir: String,
+        #[snafu(source)]
+        error: std::io::Error,
     },
 
-    #[snafu(display("Failed to start gRPC server, source: {}", source))]
-    StartGrpc { source: tonic::transport::Error },
+    #[snafu(display("Failed to remove directory {}", dir))]
+    RemoveDir {
+        dir: String,
+        #[snafu(source)]
+        error: std::io::Error,
+    },
 
-    #[snafu(display("Failed to create directory {}, source: {}", dir, source))]
-    CreateDir { dir: String, source: std::io::Error },
+    #[snafu(display("Failed to open log store"))]
+    OpenLogStore {
+        location: Location,
+        source: Box<log_store::error::Error>,
+    },
 
-    #[snafu(display("Failed to open log store, source: {}", source))]
-    OpenLogStore { source: log_store::error::Error },
-
-    #[snafu(display("Failed to storage engine, source: {}", source))]
-    OpenStorageEngine { source: StorageError },
-
-    #[snafu(display("Failed to init backend, config: {:#?}, source: {}", config, source))]
+    #[snafu(display("Failed to init backend"))]
     InitBackend {
-        config: ObjectStoreConfig,
-        source: object_store::Error,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: object_store::Error,
+        location: Location,
     },
 
-    #[snafu(display("Unsupported expr type: {}", name))]
-    UnsupportedExpr { name: String },
-
-    #[snafu(display("Runtime resource error, source: {}", source))]
+    #[snafu(display("Runtime resource error"))]
     RuntimeResource {
-        #[snafu(backtrace)]
+        location: Location,
         source: common_runtime::error::Error,
     },
 
+    #[snafu(display("Expect KvBackend but not found"))]
+    MissingKvBackend { location: Location },
+
     #[snafu(display("Invalid SQL, error: {}", msg))]
-    InvalidSql { msg: String, backtrace: Backtrace },
+    InvalidSql { msg: String },
 
-    #[snafu(display("Failed to create schema when creating table, source: {}", source))]
-    CreateSchema {
-        #[snafu(backtrace)]
-        source: datatypes::error::Error,
-    },
-
-    #[snafu(display("Failed to convert datafusion schema, source: {}", source))]
-    ConvertSchema {
-        #[snafu(backtrace)]
-        source: datatypes::error::Error,
-    },
+    #[snafu(display("Not support SQL, error: {}", msg))]
+    NotSupportSql { msg: String },
 
     #[snafu(display("Specified timestamp key or primary key column not found: {}", name))]
-    KeyColumnNotFound { name: String, backtrace: Backtrace },
+    KeyColumnNotFound { name: String, location: Location },
 
-    #[snafu(display("Invalid primary key: {}", msg))]
-    InvalidPrimaryKey { msg: String, backtrace: Backtrace },
+    #[snafu(display("Illegal primary keys definition: {}", msg))]
+    IllegalPrimaryKeysDef { msg: String, location: Location },
 
-    #[snafu(display(
-        "Constraint in CREATE TABLE statement is not supported yet: {}",
-        constraint
-    ))]
-    ConstraintNotSupported {
-        constraint: String,
-        backtrace: Backtrace,
-    },
+    #[snafu(display("Schema {} already exists", name))]
+    SchemaExists { name: String, location: Location },
 
-    #[snafu(display("Failed to insert into system catalog table, source: {}", source))]
-    InsertSystemCatalog {
-        #[snafu(backtrace)]
-        source: catalog::error::Error,
-    },
-
-    #[snafu(display("Failed to register a new schema, source: {}", source))]
-    RegisterSchema {
-        #[snafu(backtrace)]
-        source: catalog::error::Error,
-    },
-
-    #[snafu(display("Failed to decode as physical plan, source: {}", source))]
-    IntoPhysicalPlan {
-        #[snafu(backtrace)]
-        source: common_grpc::Error,
-    },
-
-    #[snafu(display("Failed to convert alter expr to request: {}", source))]
-    AlterExprToRequest {
-        #[snafu(backtrace)]
-        source: common_grpc_expr::error::Error,
-    },
-
-    #[snafu(display("Failed to convert create expr to request: {}", source))]
-    CreateExprToRequest {
-        #[snafu(backtrace)]
-        source: common_grpc_expr::error::Error,
-    },
-
-    #[snafu(display("Failed to parse SQL, source: {}", source))]
-    ParseSql {
-        #[snafu(backtrace)]
-        source: sql::error::Error,
-    },
-
-    #[snafu(display("Failed to start script manager, source: {}", source))]
-    StartScriptManager {
-        #[snafu(backtrace)]
-        source: script::error::Error,
-    },
-
-    #[snafu(display(
-        "Failed to parse string to timestamp, string: {}, source: {}",
-        raw,
-        source
-    ))]
-    ParseTimestamp {
-        raw: String,
-        #[snafu(backtrace)]
-        source: common_time::error::Error,
-    },
-
-    #[snafu(display("Failed to access catalog, source: {}", source))]
+    #[snafu(display("Failed to access catalog"))]
     Catalog {
-        #[snafu(backtrace)]
+        location: Location,
         source: catalog::error::Error,
     },
 
-    #[snafu(display("Failed to find table {} from catalog, source: {}", table_name, source))]
-    FindTable {
-        table_name: String,
-        source: catalog::error::Error,
-    },
-
-    #[snafu(display("Failed to initialize meta client, source: {}", source))]
+    #[snafu(display("Failed to initialize meta client"))]
     MetaClientInit {
-        #[snafu(backtrace)]
+        location: Location,
         source: meta_client::error::Error,
     },
-
-    #[snafu(display("Failed to insert data, source: {}", source))]
-    InsertData {
-        #[snafu(backtrace)]
-        source: common_grpc_expr::error::Error,
-    },
-
-    #[snafu(display("Insert batch is empty"))]
-    EmptyInsertBatch,
 
     #[snafu(display(
         "Table id provider not found, cannot execute SQL directly on datanode in distributed mode"
     ))]
-    TableIdProviderNotFound { backtrace: Backtrace },
+    TableIdProviderNotFound { location: Location },
 
-    #[snafu(display("Failed to bump table id, source: {}", source))]
-    BumpTableId {
-        #[snafu(backtrace)]
-        source: table::error::Error,
+    #[snafu(display("Missing node id in Datanode config"))]
+    MissingNodeId { location: Location },
+
+    #[snafu(display("Missing required field: {}", name))]
+    MissingRequiredField { name: String, location: Location },
+
+    #[snafu(display("Cannot find requested database: {}-{}", catalog, schema))]
+    DatabaseNotFound { catalog: String, schema: String },
+
+    #[snafu(display(
+        "No valid default value can be built automatically, column: {}",
+        column,
+    ))]
+    ColumnNoneDefaultValue { column: String, location: Location },
+
+    #[snafu(display("Failed to shutdown server"))]
+    ShutdownServer {
+        location: Location,
+        source: servers::error::Error,
     },
 
-    #[snafu(display("Failed to do vector computation, source: {}", source))]
-    VectorComputation {
-        #[snafu(backtrace)]
-        source: datatypes::error::Error,
+    #[snafu(display("Failed to shutdown instance"))]
+    ShutdownInstance {
+        location: Location,
+        source: BoxedError,
     },
 
-    #[snafu(display("Missing node id option in distributed mode"))]
-    MissingNodeId { backtrace: Backtrace },
+    #[snafu(display("Payload not exist"))]
+    PayloadNotExist { location: Location },
 
-    #[snafu(display("Missing node id option in distributed mode"))]
-    MissingMetasrvOpts { backtrace: Backtrace },
+    #[snafu(display("Missing WAL dir config"))]
+    MissingWalDirConfig { location: Location },
+
+    #[snafu(display("Unexpected, violated: {}", violated))]
+    Unexpected {
+        violated: String,
+        location: Location,
+    },
+
+    #[snafu(display("Failed to handle request for region {}", region_id))]
+    HandleRegionRequest {
+        region_id: RegionId,
+        location: Location,
+        source: BoxedError,
+    },
+
+    #[snafu(display("RegionId {} not found", region_id))]
+    RegionNotFound {
+        region_id: RegionId,
+        location: Location,
+    },
+
+    #[snafu(display("Region {} not ready", region_id))]
+    RegionNotReady {
+        region_id: RegionId,
+        location: Location,
+    },
+
+    #[snafu(display("Region {} is busy", region_id))]
+    RegionBusy {
+        region_id: RegionId,
+        location: Location,
+    },
+
+    #[snafu(display("Region engine {} is not registered", name))]
+    RegionEngineNotFound { name: String, location: Location },
+
+    #[snafu(display("Unsupported gRPC request, kind: {}", kind))]
+    UnsupportedGrpcRequest { kind: String, location: Location },
+
+    #[snafu(display("Unsupported output type, expected: {}", expected))]
+    UnsupportedOutput {
+        expected: String,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to get metadata from engine {} for region_id {}",
+        engine,
+        region_id,
+    ))]
+    GetRegionMetadata {
+        engine: String,
+        region_id: RegionId,
+        location: Location,
+        source: BoxedError,
+    },
+
+    #[snafu(display("Failed to build region requests"))]
+    BuildRegionRequests {
+        location: Location,
+        source: store_api::metadata::MetadataError,
+    },
+
+    #[snafu(display("Failed to stop region engine {}", name))]
+    StopRegionEngine {
+        name: String,
+        location: Location,
+        source: BoxedError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
+        use Error::*;
         match self {
-            Error::ExecuteSql { source } => source.status_code(),
-            Error::DecodeLogicalPlan { source } => source.status_code(),
-            Error::ExecutePhysicalPlan { source } => source.status_code(),
-            Error::NewCatalog { source } => source.status_code(),
-            Error::FindTable { source, .. } => source.status_code(),
-            Error::CreateTable { source, .. }
-            | Error::GetTable { source, .. }
-            | Error::AlterTable { source, .. } => source.status_code(),
-            Error::DropTable { source, .. } => source.status_code(),
+            ExecuteLogicalPlan { source, .. } => source.status_code(),
 
-            Error::Insert { source, .. } => source.status_code(),
-
-            Error::TableNotFound { .. } => StatusCode::TableNotFound,
-            Error::ColumnNotFound { .. } => StatusCode::TableColumnNotFound,
-
-            Error::ParseSqlValue { source, .. } | Error::ParseSql { source, .. } => {
+            BuildRegionRequests { source, .. } => source.status_code(),
+            HandleHeartbeatResponse { source, .. } | GetMetadata { source, .. } => {
                 source.status_code()
             }
 
-            Error::AlterExprToRequest { source, .. }
-            | Error::CreateExprToRequest { source, .. } => source.status_code(),
-            Error::CreateSchema { source, .. }
-            | Error::ConvertSchema { source, .. }
-            | Error::VectorComputation { source } => source.status_code(),
+            DecodeLogicalPlan { source, .. } => source.status_code(),
 
-            Error::ColumnValuesNumberMismatch { .. }
-            | Error::InvalidSql { .. }
-            | Error::KeyColumnNotFound { .. }
-            | Error::InvalidPrimaryKey { .. }
-            | Error::MissingTimestampColumn { .. }
-            | Error::CatalogNotFound { .. }
-            | Error::SchemaNotFound { .. }
-            | Error::ConstraintNotSupported { .. }
-            | Error::ParseTimestamp { .. } => StatusCode::InvalidArguments,
+            Delete { source, .. } => source.status_code(),
+
+            ColumnValuesNumberMismatch { .. }
+            | InvalidSql { .. }
+            | NotSupportSql { .. }
+            | KeyColumnNotFound { .. }
+            | IllegalPrimaryKeysDef { .. }
+            | MissingTimestampColumn { .. }
+            | CatalogNotFound { .. }
+            | SchemaNotFound { .. }
+            | SchemaExists { .. }
+            | DatabaseNotFound { .. }
+            | MissingNodeId { .. }
+            | ColumnNoneDefaultValue { .. }
+            | MissingWalDirConfig { .. }
+            | MissingKvBackend { .. } => StatusCode::InvalidArguments,
+
+            PayloadNotExist { .. } | Unexpected { .. } | WatchAsyncTaskChange { .. } => {
+                StatusCode::Unexpected
+            }
+
+            AsyncTaskExecute { source, .. } => source.status_code(),
 
             // TODO(yingwen): Further categorize http error.
-            Error::StartServer { .. }
-            | Error::ParseAddr { .. }
-            | Error::TcpBind { .. }
-            | Error::StartGrpc { .. }
-            | Error::CreateDir { .. }
-            | Error::InsertSystemCatalog { .. }
-            | Error::RegisterSchema { .. }
-            | Error::IntoPhysicalPlan { .. }
-            | Error::UnsupportedExpr { .. }
-            | Error::Catalog { .. } => StatusCode::Internal,
+            ParseAddr { .. }
+            | CreateDir { .. }
+            | RemoveDir { .. }
+            | Catalog { .. }
+            | MissingRequiredField { .. }
+            | IncorrectInternalState { .. }
+            | ShutdownInstance { .. }
+            | RegionEngineNotFound { .. }
+            | UnsupportedOutput { .. }
+            | GetRegionMetadata { .. } => StatusCode::Internal,
 
-            Error::InitBackend { .. } => StatusCode::StorageUnavailable,
-            Error::OpenLogStore { source } => source.status_code(),
-            Error::StartScriptManager { source } => source.status_code(),
-            Error::OpenStorageEngine { source } => source.status_code(),
-            Error::RuntimeResource { .. } => StatusCode::RuntimeResourcesExhausted,
-            Error::MetaClientInit { source, .. } => source.status_code(),
-            Error::InsertData { source, .. } => source.status_code(),
-            Error::EmptyInsertBatch => StatusCode::InvalidArguments,
-            Error::TableIdProviderNotFound { .. } => StatusCode::Unsupported,
-            Error::BumpTableId { source, .. } => source.status_code(),
-            Error::MissingNodeId { .. } => StatusCode::InvalidArguments,
-            Error::MissingMetasrvOpts { .. } => StatusCode::InvalidArguments,
+            RegionNotFound { .. } => StatusCode::RegionNotFound,
+            RegionNotReady { .. } => StatusCode::RegionNotReady,
+            RegionBusy { .. } => StatusCode::RegionBusy,
+
+            StartServer { source, .. } | ShutdownServer { source, .. } => source.status_code(),
+
+            InitBackend { .. } => StatusCode::StorageUnavailable,
+
+            OpenLogStore { source, .. } => source.status_code(),
+            RuntimeResource { .. } => StatusCode::RuntimeResourcesExhausted,
+            MetaClientInit { source, .. } => source.status_code(),
+            TableIdProviderNotFound { .. } | UnsupportedGrpcRequest { .. } => {
+                StatusCode::Unsupported
+            }
+            HandleRegionRequest { source, .. } => source.status_code(),
+            StopRegionEngine { source, .. } => source.status_code(),
         }
-    }
-
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -370,61 +348,4 @@ impl ErrorExt for Error {
     }
 }
 
-impl From<Error> for tonic::Status {
-    fn from(err: Error) -> Self {
-        tonic::Status::new(tonic::Code::Internal, err.to_string())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::str::FromStr;
-
-    use common_error::ext::BoxedError;
-    use common_error::mock::MockError;
-
-    use super::*;
-
-    fn throw_query_error() -> std::result::Result<(), query::error::Error> {
-        Err(query::error::Error::new(MockError::with_backtrace(
-            StatusCode::Internal,
-        )))
-    }
-
-    fn throw_catalog_error() -> catalog::error::Result<()> {
-        Err(catalog::error::Error::RegisterTable {
-            source: BoxedError::new(MockError::with_backtrace(StatusCode::Internal)),
-        })
-    }
-
-    fn assert_internal_error(err: &Error) {
-        assert!(err.backtrace_opt().is_some());
-        assert_eq!(StatusCode::Internal, err.status_code());
-    }
-
-    fn assert_tonic_internal_error(err: Error) {
-        let s: tonic::Status = err.into();
-        assert_eq!(s.code(), tonic::Code::Internal);
-    }
-
-    #[test]
-    fn test_error() {
-        let err = throw_query_error().context(ExecuteSqlSnafu).err().unwrap();
-        assert_internal_error(&err);
-        assert_tonic_internal_error(err);
-        let err = throw_catalog_error()
-            .context(NewCatalogSnafu)
-            .err()
-            .unwrap();
-        assert_internal_error(&err);
-        assert_tonic_internal_error(err);
-    }
-
-    #[test]
-    fn test_parse_timestamp() {
-        let err = common_time::timestamp::Timestamp::from_str("test")
-            .context(ParseTimestampSnafu { raw: "test" })
-            .unwrap_err();
-        assert_eq!(StatusCode::InvalidArguments, err.status_code());
-    }
-}
+define_into_tonic_status!(Error);

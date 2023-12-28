@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,8 +14,12 @@
 
 use std::sync::Arc;
 
-use api::v1::greptime_client::GreptimeClient;
-use api::v1::*;
+use api::v1::greptime_database_client::GreptimeDatabaseClient;
+use api::v1::health_check_client::HealthCheckClient;
+use api::v1::prometheus_gateway_client::PrometheusGatewayClient;
+use api::v1::region::region_client::RegionClient as PbRegionClient;
+use api::v1::HealthCheckRequest;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use common_grpc::channel_manager::ChannelManager;
 use parking_lot::RwLock;
 use snafu::{OptionExt, ResultExt};
@@ -23,6 +27,25 @@ use tonic::transport::Channel;
 
 use crate::load_balance::{LoadBalance, Loadbalancer};
 use crate::{error, Result};
+
+pub(crate) struct DatabaseClient {
+    pub(crate) inner: GreptimeDatabaseClient<Channel>,
+}
+
+pub(crate) struct FlightClient {
+    addr: String,
+    client: FlightServiceClient<Channel>,
+}
+
+impl FlightClient {
+    pub(crate) fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    pub(crate) fn mut_inner(&mut self) -> &mut FlightServiceClient<Channel> {
+        &mut self.client
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Client {
@@ -58,11 +81,6 @@ impl Inner {
 impl Client {
     pub fn new() -> Self {
         Default::default()
-    }
-
-    pub fn with_manager(channel_manager: ChannelManager) -> Self {
-        let inner = Arc::new(Inner::with_manager(channel_manager));
-        Self { inner }
     }
 
     pub fn with_urls<U, A>(urls: A) -> Self
@@ -104,57 +122,74 @@ impl Client {
         self.inner.set_peers(urls);
     }
 
-    pub async fn admin(&self, req: AdminRequest) -> Result<AdminResponse> {
-        let req = BatchRequest {
-            admins: vec![req],
-            ..Default::default()
-        };
-
-        let mut res = self.batch(req).await?;
-        res.admins.pop().context(error::MissingResultSnafu {
-            name: "admins",
-            expected: 1_usize,
-            actual: 0_usize,
-        })
-    }
-
-    pub async fn database(&self, req: DatabaseRequest) -> Result<DatabaseResponse> {
-        let req = BatchRequest {
-            databases: vec![req],
-            ..Default::default()
-        };
-
-        let mut res = self.batch(req).await?;
-        res.databases.pop().context(error::MissingResultSnafu {
-            name: "database",
-            expected: 1_usize,
-            actual: 0_usize,
-        })
-    }
-
-    pub async fn batch(&self, req: BatchRequest) -> Result<BatchResponse> {
-        let peer = self
+    fn find_channel(&self) -> Result<(String, Channel)> {
+        let addr = self
             .inner
             .get_peer()
             .context(error::IllegalGrpcClientStateSnafu {
                 err_msg: "No available peer found",
             })?;
-        let mut client = self.make_client(&peer)?;
-        let result = client
-            .batch(req)
-            .await
-            .context(error::TonicStatusSnafu { addr: peer })?;
-        Ok(result.into_inner())
-    }
 
-    fn make_client(&self, addr: impl AsRef<str>) -> Result<GreptimeClient<Channel>> {
-        let addr = addr.as_ref();
         let channel = self
             .inner
             .channel_manager
-            .get(addr)
-            .context(error::CreateChannelSnafu { addr })?;
-        Ok(GreptimeClient::new(channel))
+            .get(&addr)
+            .context(error::CreateChannelSnafu { addr: &addr })?;
+        Ok((addr, channel))
+    }
+
+    fn max_grpc_recv_message_size(&self) -> usize {
+        self.inner
+            .channel_manager
+            .config()
+            .max_recv_message_size
+            .as_bytes() as usize
+    }
+
+    fn max_grpc_send_message_size(&self) -> usize {
+        self.inner
+            .channel_manager
+            .config()
+            .max_send_message_size
+            .as_bytes() as usize
+    }
+
+    pub(crate) fn make_flight_client(&self) -> Result<FlightClient> {
+        let (addr, channel) = self.find_channel()?;
+        Ok(FlightClient {
+            addr,
+            client: FlightServiceClient::new(channel)
+                .max_decoding_message_size(self.max_grpc_recv_message_size())
+                .max_encoding_message_size(self.max_grpc_send_message_size()),
+        })
+    }
+
+    pub(crate) fn make_database_client(&self) -> Result<DatabaseClient> {
+        let (_, channel) = self.find_channel()?;
+        Ok(DatabaseClient {
+            inner: GreptimeDatabaseClient::new(channel)
+                .max_decoding_message_size(self.max_grpc_recv_message_size())
+                .max_encoding_message_size(self.max_grpc_send_message_size()),
+        })
+    }
+
+    pub(crate) fn raw_region_client(&self) -> Result<PbRegionClient<Channel>> {
+        let (_, channel) = self.find_channel()?;
+        Ok(PbRegionClient::new(channel)
+            .max_decoding_message_size(self.max_grpc_recv_message_size())
+            .max_encoding_message_size(self.max_grpc_send_message_size()))
+    }
+
+    pub fn make_prometheus_gateway_client(&self) -> Result<PrometheusGatewayClient<Channel>> {
+        let (_, channel) = self.find_channel()?;
+        Ok(PrometheusGatewayClient::new(channel))
+    }
+
+    pub async fn health_check(&self) -> Result<()> {
+        let (_, channel) = self.find_channel()?;
+        let mut client = HealthCheckClient::new(channel);
+        let _ = client.health_check(HealthCheckRequest {}).await?;
+        Ok(())
     }
 }
 

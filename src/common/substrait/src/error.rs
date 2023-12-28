@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,78 +14,78 @@
 
 use std::any::Any;
 
-use common_error::prelude::{BoxedError, ErrorExt, StatusCode};
+use common_error::ext::{BoxedError, ErrorExt};
+use common_error::status_code::StatusCode;
+use common_macro::stack_trace_debug;
 use datafusion::error::DataFusionError;
 use datatypes::prelude::ConcreteDataType;
 use prost::{DecodeError, EncodeError};
-use snafu::{Backtrace, ErrorCompat, Snafu};
+use snafu::{Location, Snafu};
 
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub))]
+#[stack_trace_debug]
 pub enum Error {
     #[snafu(display("Unsupported physical plan: {}", name))]
-    UnsupportedPlan { name: String, backtrace: Backtrace },
+    UnsupportedPlan { name: String, location: Location },
 
     #[snafu(display("Unsupported expr: {}", name))]
-    UnsupportedExpr { name: String, backtrace: Backtrace },
+    UnsupportedExpr { name: String, location: Location },
 
     #[snafu(display("Unsupported concrete type: {:?}", ty))]
     UnsupportedConcreteType {
         ty: ConcreteDataType,
-        backtrace: Backtrace,
+        location: Location,
     },
 
     #[snafu(display("Unsupported substrait type: {}", ty))]
-    UnsupportedSubstraitType { ty: String, backtrace: Backtrace },
+    UnsupportedSubstraitType { ty: String, location: Location },
 
-    #[snafu(display("Failed to decode substrait relation, source: {}", source))]
+    #[snafu(display("Failed to decode substrait relation"))]
     DecodeRel {
-        source: DecodeError,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: DecodeError,
+        location: Location,
     },
 
-    #[snafu(display("Failed to encode substrait relation, source: {}", source))]
+    #[snafu(display("Failed to encode substrait relation"))]
     EncodeRel {
-        source: EncodeError,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: EncodeError,
+        location: Location,
     },
 
     #[snafu(display("Input plan is empty"))]
-    EmptyPlan { backtrace: Backtrace },
+    EmptyPlan { location: Location },
 
     #[snafu(display("Input expression is empty"))]
-    EmptyExpr { backtrace: Backtrace },
+    EmptyExpr { location: Location },
 
     #[snafu(display("Missing required field in protobuf, field: {}, plan: {}", field, plan))]
     MissingField {
         field: String,
         plan: String,
-        backtrace: Backtrace,
+        location: Location,
     },
 
     #[snafu(display("Invalid parameters: {}", reason))]
-    InvalidParameters {
-        reason: String,
-        backtrace: Backtrace,
-    },
+    InvalidParameters { reason: String, location: Location },
 
-    #[snafu(display("Internal error from DataFusion: {}", source))]
+    #[snafu(display("Internal error from DataFusion"))]
     DFInternal {
-        source: DataFusionError,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: DataFusionError,
+        location: Location,
     },
 
-    #[snafu(display("Internal error: {}", source))]
+    #[snafu(display("Internal error"))]
     Internal {
-        #[snafu(backtrace)]
+        location: Location,
         source: BoxedError,
     },
 
-    #[snafu(display("Table querying not found: {}", name))]
-    TableNotFound { name: String, backtrace: Backtrace },
-
     #[snafu(display("Cannot convert plan doesn't belong to GreptimeDB"))]
-    UnknownPlan { backtrace: Backtrace },
+    UnknownPlan { location: Location },
 
     #[snafu(display(
         "Schema from Substrait proto doesn't match with the schema in storage.
@@ -97,13 +97,34 @@ pub enum Error {
     SchemaNotMatch {
         substrait_schema: datafusion::arrow::datatypes::SchemaRef,
         storage_schema: datafusion::arrow::datatypes::SchemaRef,
-        backtrace: Backtrace,
+        location: Location,
     },
 
-    #[snafu(display("Failed to convert DataFusion schema, source: {}", source))]
+    #[snafu(display("Failed to convert DataFusion schema"))]
     ConvertDfSchema {
-        #[snafu(backtrace)]
+        location: Location,
         source: datatypes::error::Error,
+    },
+
+    #[snafu(display("Unable to resolve table: {table_name}, error: "))]
+    ResolveTable {
+        table_name: String,
+        location: Location,
+        source: catalog::error::Error,
+    },
+
+    #[snafu(display("Failed to encode DataFusion plan"))]
+    EncodeDfPlan {
+        #[snafu(source)]
+        error: datafusion::error::DataFusionError,
+        location: Location,
+    },
+
+    #[snafu(display("Failed to decode DataFusion plan"))]
+    DecodeDfPlan {
+        #[snafu(source)]
+        error: datafusion::error::DataFusionError,
+        location: Location,
     },
 }
 
@@ -123,15 +144,14 @@ impl ErrorExt for Error {
             | Error::EmptyExpr { .. }
             | Error::MissingField { .. }
             | Error::InvalidParameters { .. }
-            | Error::TableNotFound { .. }
             | Error::SchemaNotMatch { .. } => StatusCode::InvalidArguments,
-            Error::DFInternal { .. } | Error::Internal { .. } => StatusCode::Internal,
-            Error::ConvertDfSchema { source } => source.status_code(),
+            Error::DFInternal { .. }
+            | Error::Internal { .. }
+            | Error::EncodeDfPlan { .. }
+            | Error::DecodeDfPlan { .. } => StatusCode::Internal,
+            Error::ConvertDfSchema { source, .. } => source.status_code(),
+            Error::ResolveTable { source, .. } => source.status_code(),
         }
-    }
-
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
     }
 
     fn as_any(&self) -> &dyn Any {

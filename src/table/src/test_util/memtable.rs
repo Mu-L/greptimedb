@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,38 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use common_query::physical_plan::PhysicalPlanRef;
-use common_query::prelude::Expr;
+use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use common_error::ext::BoxedError;
 use common_recordbatch::error::Result as RecordBatchResult;
-use common_recordbatch::{RecordBatch, RecordBatchStream};
+use common_recordbatch::{RecordBatch, RecordBatchStream, SendableRecordBatchStream};
 use datatypes::prelude::*;
 use datatypes::schema::{ColumnSchema, Schema, SchemaRef};
 use datatypes::vectors::UInt32Vector;
 use futures::task::{Context, Poll};
 use futures::Stream;
 use snafu::prelude::*;
-use store_api::storage::RegionNumber;
+use store_api::data_source::DataSource;
+use store_api::storage::{RegionNumber, ScanRequest};
 
-use crate::error::{Result, SchemaConversionSnafu, TableProjectionSnafu};
+use crate::error::{SchemaConversionSnafu, TableProjectionSnafu, TablesRecordBatchSnafu};
 use crate::metadata::{
-    TableId, TableInfoBuilder, TableInfoRef, TableMetaBuilder, TableType, TableVersion,
+    FilterPushDownType, TableId, TableInfoBuilder, TableMetaBuilder, TableType, TableVersion,
 };
-use crate::table::scan::SimpleTableScan;
-use crate::Table;
+use crate::thin_table::{ThinTable, ThinTableAdapter};
+use crate::TableRef;
 
-#[derive(Debug, Clone)]
-pub struct MemTable {
-    info: TableInfoRef,
-    recordbatch: RecordBatch,
-}
+pub struct MemTable;
 
 impl MemTable {
-    pub fn new(table_name: impl Into<String>, recordbatch: RecordBatch) -> Self {
+    pub fn table(table_name: impl Into<String>, recordbatch: RecordBatch) -> TableRef {
         Self::new_with_region(table_name, recordbatch, vec![0])
     }
 
@@ -51,13 +46,13 @@ impl MemTable {
         table_name: impl Into<String>,
         recordbatch: RecordBatch,
         regions: Vec<RegionNumber>,
-    ) -> Self {
+    ) -> TableRef {
         Self::new_with_catalog(
             table_name,
             recordbatch,
-            0,
-            "greptime".to_string(),
-            "public".to_string(),
+            1,
+            DEFAULT_CATALOG_NAME.to_string(),
+            DEFAULT_SCHEMA_NAME.to_string(),
             regions,
         )
     }
@@ -69,16 +64,15 @@ impl MemTable {
         catalog_name: String,
         schema_name: String,
         regions: Vec<RegionNumber>,
-    ) -> Self {
+    ) -> TableRef {
         let schema = recordbatch.schema.clone();
 
         let meta = TableMetaBuilder::default()
             .schema(schema)
             .primary_key_indices(vec![])
             .value_indices(vec![])
-            .engine("mock".to_string())
+            .engine("mito".to_string())
             .next_column_id(0)
-            .engine_options(Default::default())
             .options(Default::default())
             .created_on(Default::default())
             .region_numbers(regions)
@@ -99,16 +93,14 @@ impl MemTable {
                 .unwrap(),
         );
 
-        Self { info, recordbatch }
-    }
-
-    pub fn table_name(&self) -> &str {
-        &self.info.name
+        let thin_table = ThinTable::new(info, FilterPushDownType::Unsupported);
+        let data_source = Arc::new(MemtableDataSource { recordbatch });
+        Arc::new(ThinTableAdapter::new(thin_table, data_source))
     }
 
     /// Creates a 1 column 100 rows table, with table name "numbers", column name "uint32s" and
     /// column type "uint32". Column data increased from 0 to 100.
-    pub fn default_numbers_table() -> Self {
+    pub fn default_numbers_table() -> TableRef {
         let column_schemas = vec![ColumnSchema::new(
             "uint32s",
             ConcreteDataType::uint32_datatype(),
@@ -119,57 +111,53 @@ impl MemTable {
             (0..100).collect::<Vec<_>>(),
         ))];
         let recordbatch = RecordBatch::new(schema, columns).unwrap();
-        MemTable::new("numbers", recordbatch)
+        MemTable::table("numbers", recordbatch)
     }
 }
 
-#[async_trait]
-impl Table for MemTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+struct MemtableDataSource {
+    recordbatch: RecordBatch,
+}
 
-    fn schema(&self) -> SchemaRef {
-        self.recordbatch.schema.clone()
-    }
-
-    fn table_info(&self) -> TableInfoRef {
-        self.info.clone()
-    }
-
-    async fn scan(
+impl DataSource for MemtableDataSource {
+    fn get_stream(
         &self,
-        projection: &Option<Vec<usize>>,
-        _filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<PhysicalPlanRef> {
-        let df_recordbatch = if let Some(indices) = projection {
+        request: ScanRequest,
+    ) -> std::result::Result<SendableRecordBatchStream, BoxedError> {
+        let df_recordbatch = if let Some(indices) = request.projection {
             self.recordbatch
-                .df_recordbatch
-                .project(indices)
-                .context(TableProjectionSnafu)?
+                .df_record_batch()
+                .project(&indices)
+                .context(TableProjectionSnafu)
+                .map_err(BoxedError::new)?
         } else {
-            self.recordbatch.df_recordbatch.clone()
+            self.recordbatch.df_record_batch().clone()
         };
 
         let rows = df_recordbatch.num_rows();
-        let limit = if let Some(limit) = limit {
+        let limit = if let Some(limit) = request.limit {
             limit.min(rows)
         } else {
             rows
         };
         let df_recordbatch = df_recordbatch.slice(0, limit);
 
-        let recordbatch = RecordBatch {
-            schema: Arc::new(
-                Schema::try_from(df_recordbatch.schema().clone()).context(SchemaConversionSnafu)?,
+        let recordbatch = RecordBatch::try_from_df_record_batch(
+            Arc::new(
+                Schema::try_from(df_recordbatch.schema())
+                    .context(SchemaConversionSnafu)
+                    .map_err(BoxedError::new)?,
             ),
             df_recordbatch,
-        };
-        Ok(Arc::new(SimpleTableScan::new(Box::pin(MemtableStream {
+        )
+        .map_err(BoxedError::new)
+        .context(TablesRecordBatchSnafu)
+        .map_err(BoxedError::new)?;
+
+        Ok(Box::pin(MemtableStream {
             schema: recordbatch.schema.clone(),
             recordbatch: Some(recordbatch),
-        }))))
+        }))
     }
 }
 
@@ -197,11 +185,10 @@ impl Stream for MemtableStream {
 
 #[cfg(test)]
 mod test {
-    use common_query::physical_plan::RuntimeEnv;
     use common_recordbatch::util;
     use datatypes::prelude::*;
     use datatypes::schema::ColumnSchema;
-    use datatypes::vectors::{Int32Vector, StringVector};
+    use datatypes::vectors::{Helper, Int32Vector, StringVector};
 
     use super::*;
 
@@ -209,16 +196,17 @@ mod test {
     async fn test_scan_with_projection() {
         let table = build_testing_table();
 
-        let scan_stream = table.scan(&Some(vec![1]), &[], None).await.unwrap();
-        let scan_stream = scan_stream
-            .execute(0, Arc::new(RuntimeEnv::default()))
-            .unwrap();
-        let recordbatch = util::collect(scan_stream).await.unwrap();
+        let scan_req = ScanRequest {
+            projection: Some(vec![1]),
+            ..Default::default()
+        };
+        let stream = table.scan_to_stream(scan_req).await.unwrap();
+        let recordbatch = util::collect(stream).await.unwrap();
         assert_eq!(1, recordbatch.len());
-        let columns = recordbatch[0].df_recordbatch.columns();
+        let columns = recordbatch[0].df_record_batch().columns();
         assert_eq!(1, columns.len());
 
-        let string_column = VectorHelper::try_into_vector(&columns[0]).unwrap();
+        let string_column = Helper::try_into_vector(&columns[0]).unwrap();
         let string_column = string_column
             .as_any()
             .downcast_ref::<StringVector>()
@@ -231,21 +219,22 @@ mod test {
     async fn test_scan_with_limit() {
         let table = build_testing_table();
 
-        let scan_stream = table.scan(&None, &[], Some(2)).await.unwrap();
-        let scan_stream = scan_stream
-            .execute(0, Arc::new(RuntimeEnv::default()))
-            .unwrap();
-        let recordbatch = util::collect(scan_stream).await.unwrap();
+        let scan_req = ScanRequest {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let stream = table.scan_to_stream(scan_req).await.unwrap();
+        let recordbatch = util::collect(stream).await.unwrap();
         assert_eq!(1, recordbatch.len());
-        let columns = recordbatch[0].df_recordbatch.columns();
+        let columns = recordbatch[0].df_record_batch().columns();
         assert_eq!(2, columns.len());
 
-        let i32_column = VectorHelper::try_into_vector(&columns[0]).unwrap();
+        let i32_column = Helper::try_into_vector(&columns[0]).unwrap();
         let i32_column = i32_column.as_any().downcast_ref::<Int32Vector>().unwrap();
         let i32_column = i32_column.iter_data().flatten().collect::<Vec<i32>>();
         assert_eq!(vec![-100], i32_column);
 
-        let string_column = VectorHelper::try_into_vector(&columns[1]).unwrap();
+        let string_column = Helper::try_into_vector(&columns[1]).unwrap();
         let string_column = string_column
             .as_any()
             .downcast_ref::<StringVector>()
@@ -254,7 +243,7 @@ mod test {
         assert_eq!(vec!["hello"], string_column);
     }
 
-    fn build_testing_table() -> MemTable {
+    fn build_testing_table() -> TableRef {
         let i32_column_schema =
             ColumnSchema::new("i32_numbers", ConcreteDataType::int32_datatype(), true);
         let string_column_schema =
@@ -277,6 +266,6 @@ mod test {
             ])),
         ];
         let recordbatch = RecordBatch::new(schema, columns).unwrap();
-        MemTable::new("", recordbatch)
+        MemTable::table("", recordbatch)
     }
 }

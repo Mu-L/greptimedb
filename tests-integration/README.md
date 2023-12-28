@@ -7,9 +7,11 @@ Take `s3` for example. You need to set your S3 bucket, access key id and secret 
 ```sh
 # Settings for s3 test
 GT_S3_BUCKET=S3 bucket
+GT_S3_REGION=S3 region
 GT_S3_ACCESS_KEY_ID=S3 access key id
 GT_S3_ACCESS_KEY=S3 secret access key
 ```
+
 
 ## Run
 
@@ -23,4 +25,16 @@ Test s3 storage:
 
 ```
 cargo test s3
+```
+
+Test oss storage:
+
+```
+cargo test oss
+```
+
+Test azblob storage:
+
+```
+cargo test azblob
 ```

@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,101 +14,167 @@
 
 use std::ops::Deref;
 
+use common_error::ext::ErrorExt;
 use common_query::Output;
-use common_recordbatch::{util, RecordBatch};
-use common_telemetry::error;
-use common_time::datetime::DateTime;
-use common_time::timestamp::TimeUnit;
+use common_recordbatch::{RecordBatch, SendableRecordBatchStream};
+use common_telemetry::{debug, error};
 use datatypes::prelude::{ConcreteDataType, Value};
-use datatypes::schema::{ColumnSchema, SchemaRef};
+use datatypes::schema::SchemaRef;
+use futures::StreamExt;
 use opensrv_mysql::{
     Column, ColumnFlags, ColumnType, ErrorKind, OkResponse, QueryResultWriter, RowWriter,
 };
+use session::context::QueryContextRef;
 use snafu::prelude::*;
 use tokio::io::AsyncWrite;
 
 use crate::error::{self, Error, Result};
+use crate::metrics::*;
+
+/// Try to write multiple output to the writer if possible.
+pub async fn write_output<W: AsyncWrite + Send + Sync + Unpin>(
+    w: QueryResultWriter<'_, W>,
+    query_context: QueryContextRef,
+    outputs: Vec<Result<Output>>,
+) -> Result<()> {
+    let mut writer = Some(MysqlResultWriter::new(w, query_context.clone()));
+    for output in outputs {
+        let result_writer = writer.take().context(error::InternalSnafu {
+            err_msg: "Sending multiple result set is unsupported",
+        })?;
+        writer = result_writer.try_write_one(output).await?;
+    }
+
+    if let Some(result_writer) = writer {
+        result_writer.finish().await?;
+    }
+    Ok(())
+}
 
 struct QueryResult {
-    recordbatches: Vec<RecordBatch>,
     schema: SchemaRef,
+    stream: SendableRecordBatchStream,
 }
 
 pub struct MysqlResultWriter<'a, W: AsyncWrite + Unpin> {
-    // `QueryResultWriter` will be consumed when the write completed (see
-    // QueryResultWriter::completed), thus we use an option to wrap it.
-    inner: Option<QueryResultWriter<'a, W>>,
+    writer: QueryResultWriter<'a, W>,
+    query_context: QueryContextRef,
 }
 
 impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
-    pub fn new(inner: QueryResultWriter<'a, W>) -> MysqlResultWriter<'a, W> {
-        MysqlResultWriter::<'a, W> { inner: Some(inner) }
+    pub fn new(
+        writer: QueryResultWriter<'a, W>,
+        query_context: QueryContextRef,
+    ) -> MysqlResultWriter<'a, W> {
+        MysqlResultWriter::<'a, W> {
+            writer,
+            query_context,
+        }
     }
 
-    pub async fn write(&mut self, query: &str, output: Result<Output>) -> Result<()> {
-        let writer = self.inner.take().context(error::InternalSnafu {
-            err_msg: "inner MySQL writer is consumed",
-        })?;
+    /// Try to write one result set. If there are more than one result set, return `Some`.
+    pub async fn try_write_one(
+        self,
+        output: Result<Output>,
+    ) -> Result<Option<MysqlResultWriter<'a, W>>> {
+        // We don't support sending multiple query result because the RowWriter's lifetime is bound to
+        // a local variable.
         match output {
             Ok(output) => match output {
                 Output::Stream(stream) => {
-                    let schema = stream.schema().clone();
-                    let recordbatches = util::collect(stream)
-                        .await
-                        .context(error::CollectRecordbatchSnafu)?;
                     let query_result = QueryResult {
-                        recordbatches,
-                        schema,
+                        schema: stream.schema(),
+                        stream,
                     };
-                    Self::write_query_result(query, query_result, writer).await?
+                    Self::write_query_result(query_result, self.writer, self.query_context).await?;
                 }
                 Output::RecordBatches(recordbatches) => {
                     let query_result = QueryResult {
                         schema: recordbatches.schema(),
-                        recordbatches: recordbatches.take(),
+                        stream: recordbatches.as_stream(),
                     };
-                    Self::write_query_result(query, query_result, writer).await?
+                    Self::write_query_result(query_result, self.writer, self.query_context).await?;
                 }
-                Output::AffectedRows(rows) => Self::write_affected_rows(writer, rows).await?,
+                Output::AffectedRows(rows) => {
+                    let next_writer = Self::write_affected_rows(self.writer, rows).await?;
+                    return Ok(Some(MysqlResultWriter::new(
+                        next_writer,
+                        self.query_context,
+                    )));
+                }
             },
-            Err(error) => Self::write_query_error(query, error, writer).await?,
+            Err(error) => Self::write_query_error(error, self.writer).await?,
         }
+        Ok(None)
+    }
+
+    /// Indicate no more result set to write. No need to call this if there is only one result set.
+    pub async fn finish(self) -> Result<()> {
+        self.writer.no_more_results().await?;
         Ok(())
     }
 
-    async fn write_affected_rows(w: QueryResultWriter<'a, W>, rows: usize) -> Result<()> {
-        w.completed(OkResponse {
-            affected_rows: rows as u64,
-            ..Default::default()
-        })
-        .await?;
-        Ok(())
+    async fn write_affected_rows(
+        w: QueryResultWriter<'a, W>,
+        rows: usize,
+    ) -> Result<QueryResultWriter<'a, W>> {
+        let next_writer = w
+            .complete_one(OkResponse {
+                affected_rows: rows as u64,
+                ..Default::default()
+            })
+            .await?;
+        Ok(next_writer)
     }
 
     async fn write_query_result(
-        query: &str,
-        query_result: QueryResult,
+        mut query_result: QueryResult,
         writer: QueryResultWriter<'a, W>,
+        query_context: QueryContextRef,
     ) -> Result<()> {
         match create_mysql_column_def(&query_result.schema) {
             Ok(column_def) => {
+                // The RowWriter's lifetime is bound to `column_def` thus we can't use finish_one()
+                // to return a new QueryResultWriter.
                 let mut row_writer = writer.start(&column_def).await?;
-                for recordbatch in &query_result.recordbatches {
-                    Self::write_recordbatch(&mut row_writer, recordbatch).await?;
+                while let Some(record_batch) = query_result.stream.next().await {
+                    match record_batch {
+                        Ok(record_batch) => {
+                            Self::write_recordbatch(
+                                &mut row_writer,
+                                &record_batch,
+                                query_context.clone(),
+                            )
+                            .await?
+                        }
+                        Err(e) => {
+                            if e.status_code().should_log_error() {
+                                error!(e; "Failed to handle mysql query");
+                            } else {
+                                debug!("Failed to handle mysql query, error: {e:?}");
+                            }
+                            let err = e.output_msg();
+                            row_writer
+                                .finish_error(ErrorKind::ER_INTERNAL_ERROR, &err.as_bytes())
+                                .await?;
+
+                            return Ok(());
+                        }
+                    }
                 }
                 row_writer.finish().await?;
                 Ok(())
             }
-            Err(error) => Self::write_query_error(query, error, writer).await,
+            Err(error) => Self::write_query_error(error, writer).await,
         }
     }
 
     async fn write_recordbatch(
         row_writer: &mut RowWriter<'_, W>,
         recordbatch: &RecordBatch,
+        query_context: QueryContextRef,
     ) -> Result<()> {
         for row in recordbatch.rows() {
-            let row = row.context(error::CollectRecordbatchSnafu)?;
             for value in row.into_iter() {
                 match value {
                     Value::Null => row_writer.write_col(None::<u8>)?,
@@ -125,10 +191,16 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
                     Value::Float64(v) => row_writer.write_col(v.0)?,
                     Value::String(v) => row_writer.write_col(v.as_utf8())?,
                     Value::Binary(v) => row_writer.write_col(v.deref())?,
-                    Value::Date(v) => row_writer.write_col(v.val())?,
-                    Value::DateTime(v) => row_writer.write_col(v.val())?,
-                    Value::Timestamp(v) => row_writer
-                        .write_col(DateTime::new(v.convert_to(TimeUnit::Second)).to_string())?,
+                    Value::Date(v) => row_writer.write_col(v.to_chrono_date())?,
+                    // convert datetime and timestamp to timezone of current connection
+                    Value::DateTime(v) => row_writer.write_col(
+                        v.to_chrono_datetime_with_timezone(Some(query_context.timezone())),
+                    )?,
+                    Value::Timestamp(v) => row_writer.write_col(
+                        v.to_chrono_datetime_with_timezone(Some(query_context.timezone())),
+                    )?,
+                    Value::Interval(v) => row_writer.write_col(v.to_iso8601_string())?,
+                    Value::Duration(v) => row_writer.write_col(v.to_std_duration())?,
                     Value::List(_) => {
                         return Err(Error::Internal {
                             err_msg: format!(
@@ -137,6 +209,9 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
                             ),
                         })
                     }
+                    Value::Time(v) => row_writer
+                        .write_col(v.to_timezone_aware_string(Some(query_context.timezone())))?,
+                    Value::Decimal128(v) => row_writer.write_col(v.to_string())?,
                 }
             }
             row_writer.end_row().await?;
@@ -144,21 +219,29 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
         Ok(())
     }
 
-    async fn write_query_error(
-        query: &str,
-        error: Error,
-        w: QueryResultWriter<'a, W>,
-    ) -> Result<()> {
-        error!(error; "Failed to execute query '{}'", query);
+    async fn write_query_error(error: impl ErrorExt, w: QueryResultWriter<'a, W>) -> Result<()> {
+        METRIC_ERROR_COUNTER
+            .with_label_values(&[METRIC_ERROR_COUNTER_LABEL_MYSQL])
+            .inc();
+
+        if error.status_code().should_log_error() {
+            error!(error; "Failed to handle mysql query");
+        } else {
+            debug!("Failed to handle mysql query, error: {error:?}");
+        }
 
         let kind = ErrorKind::ER_INTERNAL_ERROR;
-        w.error(kind, error.to_string().as_bytes()).await?;
+        let error = error.output_msg();
+        w.error(kind, error.as_bytes()).await?;
         Ok(())
     }
 }
 
-fn create_mysql_column(column_schema: &ColumnSchema) -> Result<Column> {
-    let column_type = match column_schema.data_type {
+pub(crate) fn create_mysql_column(
+    data_type: &ConcreteDataType,
+    column_name: &str,
+) -> Result<Column> {
+    let column_type = match data_type {
         ConcreteDataType::Null(_) => Ok(ColumnType::MYSQL_TYPE_NULL),
         ConcreteDataType::Boolean(_) | ConcreteDataType::Int8(_) | ConcreteDataType::UInt8(_) => {
             Ok(ColumnType::MYSQL_TYPE_TINY)
@@ -170,29 +253,39 @@ fn create_mysql_column(column_schema: &ColumnSchema) -> Result<Column> {
         ConcreteDataType::Int64(_) | ConcreteDataType::UInt64(_) => {
             Ok(ColumnType::MYSQL_TYPE_LONGLONG)
         }
-        ConcreteDataType::Float32(_) | ConcreteDataType::Float64(_) => {
-            Ok(ColumnType::MYSQL_TYPE_FLOAT)
-        }
+        ConcreteDataType::Float32(_) => Ok(ColumnType::MYSQL_TYPE_FLOAT),
+        ConcreteDataType::Float64(_) => Ok(ColumnType::MYSQL_TYPE_DOUBLE),
         ConcreteDataType::Binary(_) | ConcreteDataType::String(_) => {
             Ok(ColumnType::MYSQL_TYPE_VARCHAR)
         }
-        ConcreteDataType::Timestamp(_) => Ok(ColumnType::MYSQL_TYPE_DATETIME),
+        ConcreteDataType::Timestamp(_) => Ok(ColumnType::MYSQL_TYPE_TIMESTAMP),
+        ConcreteDataType::Time(_) => Ok(ColumnType::MYSQL_TYPE_TIME),
+        ConcreteDataType::Date(_) => Ok(ColumnType::MYSQL_TYPE_DATE),
+        ConcreteDataType::DateTime(_) => Ok(ColumnType::MYSQL_TYPE_DATETIME),
+        ConcreteDataType::Interval(_) => Ok(ColumnType::MYSQL_TYPE_VARCHAR),
+        ConcreteDataType::Duration(_) => Ok(ColumnType::MYSQL_TYPE_TIME),
+        ConcreteDataType::Decimal128(_) => Ok(ColumnType::MYSQL_TYPE_DECIMAL),
         _ => error::InternalSnafu {
-            err_msg: format!(
-                "not implemented for column datatype {:?}",
-                column_schema.data_type
-            ),
+            err_msg: format!("not implemented for column datatype {:?}", data_type),
         }
         .fail(),
     };
+    let mut colflags = ColumnFlags::empty();
+    match data_type {
+        ConcreteDataType::UInt16(_)
+        | ConcreteDataType::UInt8(_)
+        | ConcreteDataType::UInt32(_)
+        | ConcreteDataType::UInt64(_) => colflags |= ColumnFlags::UNSIGNED_FLAG,
+        _ => {}
+    };
     column_type.map(|column_type| Column {
-        column: column_schema.name.clone(),
+        column: column_name.to_string(),
         coltype: column_type,
 
         // TODO(LFC): Currently "table" and "colflags" are not relevant in MySQL server
         //   implementation, will revisit them again in the future.
         table: "".to_string(),
-        colflags: ColumnFlags::empty(),
+        colflags,
     })
 }
 
@@ -201,6 +294,6 @@ pub fn create_mysql_column_def(schema: &SchemaRef) -> Result<Vec<Column>> {
     schema
         .column_schemas()
         .iter()
-        .map(create_mysql_column)
+        .map(|column_schema| create_mysql_column(&column_schema.data_type, &column_schema.name))
         .collect()
 }

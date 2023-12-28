@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,6 +15,7 @@
 //! Script engine
 
 use std::any::Any;
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use common_error::ext::ErrorExt;
@@ -30,7 +31,11 @@ pub trait Script {
     fn as_any(&self) -> &dyn Any;
 
     /// Execute the script and returns the output.
-    async fn execute(&self, ctx: EvalContext) -> std::result::Result<Output, Self::Error>;
+    async fn execute(
+        &self,
+        params: HashMap<String, String>,
+        ctx: EvalContext,
+    ) -> std::result::Result<Output, Self::Error>;
 }
 
 #[async_trait]

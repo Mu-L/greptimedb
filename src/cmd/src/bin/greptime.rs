@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,29 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![doc = include_str!("../../../../README.md")]
+
 use std::fmt;
 
-use clap::Parser;
+use clap::{FromArgMatches, Parser, Subcommand};
 use cmd::error::Result;
-use cmd::{datanode, frontend, metasrv, standalone};
-use common_telemetry::logging::{error, info};
-
-#[derive(Parser)]
-#[clap(name = "greptimedb", version = print_version())]
-struct Command {
-    #[clap(long, default_value = "/tmp/greptimedb/logs")]
-    log_dir: String,
-    #[clap(long, default_value = "info")]
-    log_level: String,
-    #[clap(subcommand)]
-    subcmd: SubCommand,
-}
-
-impl Command {
-    async fn run(self) -> Result<()> {
-        self.subcmd.run().await
-    }
-}
+use cmd::options::{CliOptions, Options};
+use cmd::{
+    cli, datanode, frontend, greptimedb_cli, log_versions, metasrv, standalone, start_app, App,
+};
 
 #[derive(Parser)]
 enum SubCommand {
@@ -46,15 +33,46 @@ enum SubCommand {
     Metasrv(metasrv::Command),
     #[clap(name = "standalone")]
     Standalone(standalone::Command),
+    #[clap(name = "cli")]
+    Cli(cli::Command),
 }
 
 impl SubCommand {
-    async fn run(self) -> Result<()> {
+    async fn build(self, opts: Options) -> Result<Box<dyn App>> {
+        let app: Box<dyn App> = match (self, opts) {
+            (SubCommand::Datanode(cmd), Options::Datanode(dn_opts)) => {
+                let app = cmd.build(*dn_opts).await?;
+                Box::new(app) as _
+            }
+            (SubCommand::Frontend(cmd), Options::Frontend(fe_opts)) => {
+                let app = cmd.build(*fe_opts).await?;
+                Box::new(app) as _
+            }
+            (SubCommand::Metasrv(cmd), Options::Metasrv(meta_opts)) => {
+                let app = cmd.build(*meta_opts).await?;
+                Box::new(app) as _
+            }
+            (SubCommand::Standalone(cmd), Options::Standalone(opts)) => {
+                let app = cmd.build(*opts).await?;
+                Box::new(app) as _
+            }
+            (SubCommand::Cli(cmd), Options::Cli(_)) => {
+                let app = cmd.build().await?;
+                Box::new(app) as _
+            }
+
+            _ => unreachable!(),
+        };
+        Ok(app)
+    }
+
+    fn load_options(&self, cli_options: &CliOptions) -> Result<Options> {
         match self {
-            SubCommand::Datanode(cmd) => cmd.run().await,
-            SubCommand::Frontend(cmd) => cmd.run().await,
-            SubCommand::Metasrv(cmd) => cmd.run().await,
-            SubCommand::Standalone(cmd) => cmd.run().await,
+            SubCommand::Datanode(cmd) => cmd.load_options(cli_options),
+            SubCommand::Frontend(cmd) => cmd.load_options(cli_options),
+            SubCommand::Metasrv(cmd) => cmd.load_options(cli_options),
+            SubCommand::Standalone(cmd) => cmd.load_options(cli_options),
+            SubCommand::Cli(cmd) => cmd.load_options(cli_options),
         }
     }
 }
@@ -66,46 +84,54 @@ impl fmt::Display for SubCommand {
             SubCommand::Frontend(..) => write!(f, "greptime-frontend"),
             SubCommand::Metasrv(..) => write!(f, "greptime-metasrv"),
             SubCommand::Standalone(..) => write!(f, "greptime-standalone"),
+            SubCommand::Cli(_) => write!(f, "greptime-cli"),
         }
     }
 }
 
-fn print_version() -> &'static str {
-    concat!(
-        "\nbranch: ",
-        env!("GIT_BRANCH"),
-        "\ncommit: ",
-        env!("GIT_COMMIT"),
-        "\ndirty: ",
-        env!("GIT_DIRTY"),
-        "\nversion: ",
-        env!("CARGO_PKG_VERSION")
-    )
-}
+#[cfg(not(windows))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cmd = Command::parse();
-    // TODO(dennis):
-    // 1. adds ip/port to app
-    let app_name = &cmd.subcmd.to_string();
-    let log_dir = &cmd.log_dir;
-    let log_level = &cmd.log_level;
+    let metadata = human_panic::Metadata {
+        version: env!("CARGO_PKG_VERSION").into(),
+        name: "GreptimeDB".into(),
+        authors: Default::default(),
+        homepage: "https://github.com/GreptimeTeam/greptimedb/discussions".into(),
+    };
+    human_panic::setup_panic!(metadata);
 
     common_telemetry::set_panic_hook();
-    common_telemetry::init_default_metrics_recorder();
-    let _guard = common_telemetry::init_global_logging(app_name, log_dir, log_level, false);
 
-    tokio::select! {
-        result = cmd.run() => {
-            if let Err(err) = result {
-                error!(err; "Fatal error occurs!");
-            }
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Goodbye!");
-        }
-    }
+    let cli = greptimedb_cli();
 
-    Ok(())
+    let cli = SubCommand::augment_subcommands(cli);
+
+    let args = cli.get_matches();
+
+    let subcmd = match SubCommand::from_arg_matches(&args) {
+        Ok(subcmd) => subcmd,
+        Err(e) => e.exit(),
+    };
+
+    let app_name = subcmd.to_string();
+
+    let cli_options = CliOptions::new(&args);
+
+    let opts = subcmd.load_options(&cli_options)?;
+
+    let _guard = common_telemetry::init_global_logging(
+        &app_name,
+        opts.logging_options(),
+        cli_options.tracing_options(),
+        opts.node_id(),
+    );
+
+    log_versions();
+
+    let app = subcmd.build(opts).await?;
+
+    start_app(app).await
 }

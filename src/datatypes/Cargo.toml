@@ -1,37 +1,30 @@
 [package]
 name = "datatypes"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [features]
 default = []
 test = []
 
 [dependencies]
-common-base = { path = "../common/base" }
-common-error = { path = "../common/error" }
-common-time = { path = "../common/time" }
-datafusion-common = { git = "https://github.com/apache/arrow-datafusion.git", branch = "arrow2" }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow.workspace = true
+common-base.workspace = true
+common-decimal.workspace = true
+common-error.workspace = true
+common-macro.workspace = true
+common-telemetry.workspace = true
+common-time.workspace = true
+datafusion-common.workspace = true
 enum_dispatch = "0.3"
 num = "0.4"
 num-traits = "0.2"
 ordered-float = { version = "3.0", features = ["serde"] }
 paste = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-snafu = { version = "0.7", features = ["backtraces"] }
-
-[dependencies.arrow]
-package = "arrow2"
-version = "0.10"
-features = [
-    "io_csv",
-    "io_json",
-    "io_parquet",
-    "io_parquet_compression",
-    "io_ipc",
-    "ahash",
-    "compute",
-    "serde_types",
-]
+rust_decimal = "1.32.0"
+serde.workspace = true
+serde_json.workspace = true
+snafu.workspace = true

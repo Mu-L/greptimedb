@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,6 +13,15 @@
 // limitations under the License.
 
 mod health;
+mod heartbeat;
+mod leader;
+mod meta;
+// TODO(weny): removes it.
+mod node_lease;
+#[allow(dead_code)]
+mod region_migration;
+mod route;
+mod util;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -25,8 +34,64 @@ use tonic::transport::NamedService;
 
 use crate::metasrv::MetaSrv;
 
-pub fn make_admin_service(_: MetaSrv) -> Admin {
+pub fn make_admin_service(meta_srv: MetaSrv) -> Admin {
     let router = Router::new().route("/health", health::HealthHandler);
+
+    let router = router.route(
+        "/node-lease",
+        node_lease::NodeLeaseHandler {
+            meta_peer_client: meta_srv.meta_peer_client().clone(),
+        },
+    );
+
+    let handler = heartbeat::HeartBeatHandler {
+        meta_peer_client: meta_srv.meta_peer_client().clone(),
+    };
+    let router = router
+        .route("/heartbeat", handler.clone())
+        .route("/heartbeat/help", handler);
+
+    let router = router.route(
+        "/catalogs",
+        meta::CatalogsHandler {
+            table_metadata_manager: meta_srv.table_metadata_manager().clone(),
+        },
+    );
+
+    let handler = meta::SchemasHandler {
+        table_metadata_manager: meta_srv.table_metadata_manager().clone(),
+    };
+    let router = router
+        .route("/schemas", handler.clone())
+        .route("/schemas/help", handler);
+
+    let handler = meta::TablesHandler {
+        table_metadata_manager: meta_srv.table_metadata_manager().clone(),
+    };
+    let router = router
+        .route("/tables", handler.clone())
+        .route("/tables/help", handler);
+
+    let handler = meta::TableHandler {
+        table_metadata_manager: meta_srv.table_metadata_manager().clone(),
+    };
+    let router = router
+        .route("/table", handler.clone())
+        .route("/table/help", handler);
+
+    let router = router.route(
+        "/leader",
+        leader::LeaderHandler {
+            election: meta_srv.election().cloned(),
+        },
+    );
+
+    let handler = route::RouteHandler {
+        table_metadata_manager: meta_srv.table_metadata_manager().clone(),
+    };
+    let router = router
+        .route("/route", handler.clone())
+        .route("/route/help", handler);
 
     let router = Router::nest("/admin", router);
 
@@ -66,7 +131,7 @@ impl<T> Service<http::Request<T>> for Admin
 where
     T: Send,
 {
-    type Response = http::Response<tonic::body::BoxBody>;
+    type Response = http::Response<BoxBody>;
     type Error = Infallible;
     type Future = BoxFuture<Self::Response, Self::Error>;
 
@@ -84,7 +149,7 @@ where
                     .into_owned()
                     .collect()
             })
-            .unwrap_or_else(HashMap::new);
+            .unwrap_or_default();
         let path = req.uri().path().to_owned();
         Box::pin(async move { router.call(&path, query_params).await })
     }
@@ -117,7 +182,7 @@ impl Router {
     pub fn route(mut self, path: &str, handler: impl HttpHandler + 'static) -> Self {
         check_path(path);
 
-        self.handlers.insert(path.to_owned(), Box::new(handler));
+        let _ = self.handlers.insert(path.to_owned(), Box::new(handler));
 
         self
     }

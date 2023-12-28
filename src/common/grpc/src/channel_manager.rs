@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,25 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use common_base::readable_size::ReadableSize;
+use common_telemetry::info;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
-use snafu::ResultExt;
-use tonic::transport::{Channel as InnerChannel, Endpoint, Uri};
+use lazy_static::lazy_static;
+use snafu::{OptionExt, ResultExt};
+use tonic::transport::{
+    Certificate, Channel as InnerChannel, ClientTlsConfig, Endpoint, Identity, Uri,
+};
 use tower::make::MakeConnection;
 
-use crate::error;
-use crate::error::Result;
+use crate::error::{CreateChannelSnafu, InvalidConfigFilePathSnafu, InvalidTlsConfigSnafu, Result};
 
 const RECYCLE_CHANNEL_INTERVAL_SECS: u64 = 60;
+pub const DEFAULT_GRPC_REQUEST_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_GRPC_CONNECT_TIMEOUT_SECS: u64 = 1;
+pub const DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE: ReadableSize = ReadableSize::mb(512);
+pub const DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE: ReadableSize = ReadableSize::mb(512);
+
+lazy_static! {
+    static ref ID: AtomicU64 = AtomicU64::new(0);
+}
 
 #[derive(Clone, Debug)]
 pub struct ChannelManager {
+    id: u64,
     config: ChannelConfig,
+    client_tls_config: Option<ClientTlsConfig>,
     pool: Arc<Pool>,
+    channel_recycle_started: Arc<AtomicBool>,
 }
 
 impl Default for ChannelManager {
@@ -45,14 +60,41 @@ impl ChannelManager {
     }
 
     pub fn with_config(config: ChannelConfig) -> Self {
+        let id = ID.fetch_add(1, Ordering::Relaxed);
         let pool = Arc::new(Pool::default());
-        let cloned_pool = pool.clone();
+        Self {
+            id,
+            config,
+            client_tls_config: None,
+            pool,
+            channel_recycle_started: Arc::new(AtomicBool::new(false)),
+        }
+    }
 
-        common_runtime::spawn_bg(async {
-            recycle_channel_in_loop(cloned_pool, RECYCLE_CHANNEL_INTERVAL_SECS).await;
-        });
+    pub fn with_tls_config(config: ChannelConfig) -> Result<Self> {
+        let mut cm = Self::with_config(config.clone());
 
-        Self { config, pool }
+        // setup tls
+        let path_config = config.client_tls.context(InvalidTlsConfigSnafu {
+            msg: "no config input",
+        })?;
+
+        let server_root_ca_cert = std::fs::read_to_string(path_config.server_ca_cert_path)
+            .context(InvalidConfigFilePathSnafu)?;
+        let server_root_ca_cert = Certificate::from_pem(server_root_ca_cert);
+        let client_cert = std::fs::read_to_string(path_config.client_cert_path)
+            .context(InvalidConfigFilePathSnafu)?;
+        let client_key = std::fs::read_to_string(path_config.client_key_path)
+            .context(InvalidConfigFilePathSnafu)?;
+        let client_identity = Identity::from_pem(client_cert, client_key);
+
+        cm.client_tls_config = Some(
+            ClientTlsConfig::new()
+                .ca_certificate(server_root_ca_cert)
+                .identity(client_identity),
+        );
+
+        Ok(cm)
     }
 
     pub fn config(&self) -> &ChannelConfig {
@@ -60,6 +102,8 @@ impl ChannelManager {
     }
 
     pub fn get(&self, addr: impl AsRef<str>) -> Result<InnerChannel> {
+        self.trigger_channel_recycling();
+
         let addr = addr.as_ref();
         // It will acquire the read lock.
         if let Some(inner_ch) = self.pool.get(addr) {
@@ -119,8 +163,14 @@ impl ChannelManager {
     }
 
     fn build_endpoint(&self, addr: &str) -> Result<Endpoint> {
+        let http_prefix = if self.client_tls_config.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+
         let mut endpoint =
-            Endpoint::new(format!("http://{}", addr)).context(error::CreateChannelSnafu)?;
+            Endpoint::new(format!("{http_prefix}://{addr}")).context(CreateChannelSnafu)?;
 
         if let Some(dur) = self.config.timeout {
             endpoint = endpoint.timeout(dur);
@@ -152,12 +202,44 @@ impl ChannelManager {
         if let Some(enabled) = self.config.http2_adaptive_window {
             endpoint = endpoint.http2_adaptive_window(enabled);
         }
+        if let Some(tls_config) = &self.client_tls_config {
+            endpoint = endpoint
+                .tls_config(tls_config.clone())
+                .context(CreateChannelSnafu)?;
+        }
+
         endpoint = endpoint
             .tcp_keepalive(self.config.tcp_keepalive)
             .tcp_nodelay(self.config.tcp_nodelay);
 
         Ok(endpoint)
     }
+
+    fn trigger_channel_recycling(&self) {
+        if self
+            .channel_recycle_started
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let pool = self.pool.clone();
+        let _handle = common_runtime::spawn_bg(async {
+            recycle_channel_in_loop(pool, RECYCLE_CHANNEL_INTERVAL_SECS).await;
+        });
+        info!(
+            "ChannelManager: {}, channel recycle is started, running in the background!",
+            self.id
+        );
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientTlsOption {
+    pub server_ca_cert_path: String,
+    pub client_cert_path: String,
+    pub client_key_path: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,23 +256,31 @@ pub struct ChannelConfig {
     pub http2_adaptive_window: Option<bool>,
     pub tcp_keepalive: Option<Duration>,
     pub tcp_nodelay: bool,
+    pub client_tls: Option<ClientTlsOption>,
+    // Max gRPC receiving(decoding) message size
+    pub max_recv_message_size: ReadableSize,
+    // Max gRPC sending(encoding) message size
+    pub max_send_message_size: ReadableSize,
 }
 
 impl Default for ChannelConfig {
     fn default() -> Self {
         Self {
-            timeout: None,
-            connect_timeout: None,
+            timeout: Some(Duration::from_secs(DEFAULT_GRPC_REQUEST_TIMEOUT_SECS)),
+            connect_timeout: Some(Duration::from_secs(DEFAULT_GRPC_CONNECT_TIMEOUT_SECS)),
             concurrency_limit: None,
             rate_limit: None,
             initial_stream_window_size: None,
             initial_connection_window_size: None,
-            http2_keep_alive_interval: None,
+            http2_keep_alive_interval: Some(Duration::from_secs(30)),
             http2_keep_alive_timeout: None,
-            http2_keep_alive_while_idle: None,
+            http2_keep_alive_while_idle: Some(true),
             http2_adaptive_window: None,
             tcp_keepalive: None,
             tcp_nodelay: true,
+            client_tls: None,
+            max_recv_message_size: DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE,
+            max_send_message_size: DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE,
         }
     }
 }
@@ -307,6 +397,16 @@ impl ChannelConfig {
             ..self
         }
     }
+
+    /// Set the value of tls client auth.
+    ///
+    /// Disabled by default.
+    pub fn client_tls_config(self, client_tls_option: ClientTlsOption) -> Self {
+        Self {
+            client_tls: Some(client_tls_option),
+            ..self
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -329,7 +429,7 @@ impl Channel {
 
     #[inline]
     pub fn increase_access(&self) {
-        self.access.fetch_add(1, Ordering::Relaxed);
+        let _ = self.access.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -358,7 +458,7 @@ impl Pool {
     }
 
     fn put(&self, addr: &str, channel: Channel) {
-        self.channels.insert(addr.to_string(), channel);
+        let _ = self.channels.insert(addr.to_string(), channel);
     }
 
     fn retain_channel<F>(&self, f: F)
@@ -373,7 +473,7 @@ async fn recycle_channel_in_loop(pool: Arc<Pool>, interval_secs: u64) {
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
 
     loop {
-        interval.tick().await;
+        let _ = interval.tick().await;
         pool.retain_channel(|_, c| c.access.swap(0, Ordering::Relaxed) != 0)
     }
 }
@@ -399,9 +499,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_access_count() {
-        let pool = Arc::new(Pool::default());
-        let config = ChannelConfig::new();
-        let mgr = Arc::new(ChannelManager { pool, config });
+        let mgr = ChannelManager::new();
+        // Do not start recycle
+        mgr.channel_recycle_started.store(true, Ordering::Relaxed);
+        let mgr = Arc::new(mgr);
         let addr = "test_uri";
 
         let mut joins = Vec::with_capacity(10);
@@ -431,18 +532,21 @@ mod tests {
         let default_cfg = ChannelConfig::new();
         assert_eq!(
             ChannelConfig {
-                timeout: None,
-                connect_timeout: None,
+                timeout: Some(Duration::from_secs(DEFAULT_GRPC_REQUEST_TIMEOUT_SECS)),
+                connect_timeout: Some(Duration::from_secs(DEFAULT_GRPC_CONNECT_TIMEOUT_SECS)),
                 concurrency_limit: None,
                 rate_limit: None,
                 initial_stream_window_size: None,
                 initial_connection_window_size: None,
-                http2_keep_alive_interval: None,
+                http2_keep_alive_interval: Some(Duration::from_secs(30)),
                 http2_keep_alive_timeout: None,
-                http2_keep_alive_while_idle: None,
+                http2_keep_alive_while_idle: Some(true),
                 http2_adaptive_window: None,
                 tcp_keepalive: None,
                 tcp_nodelay: true,
+                client_tls: None,
+                max_recv_message_size: DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE,
+                max_send_message_size: DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE,
             },
             default_cfg
         );
@@ -459,7 +563,12 @@ mod tests {
             .http2_keep_alive_while_idle(true)
             .http2_adaptive_window(true)
             .tcp_keepalive(Duration::from_secs(2))
-            .tcp_nodelay(false);
+            .tcp_nodelay(false)
+            .client_tls_config(ClientTlsOption {
+                server_ca_cert_path: "some_server_path".to_string(),
+                client_cert_path: "some_cert_path".to_string(),
+                client_key_path: "some_key_path".to_string(),
+            });
 
         assert_eq!(
             ChannelConfig {
@@ -475,6 +584,13 @@ mod tests {
                 http2_adaptive_window: Some(true),
                 tcp_keepalive: Some(Duration::from_secs(2)),
                 tcp_nodelay: false,
+                client_tls: Some(ClientTlsOption {
+                    server_ca_cert_path: "some_server_path".to_string(),
+                    client_cert_path: "some_cert_path".to_string(),
+                    client_key_path: "some_key_path".to_string(),
+                }),
+                max_recv_message_size: DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE,
+                max_send_message_size: DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE,
             },
             cfg
         );
@@ -482,7 +598,6 @@ mod tests {
 
     #[test]
     fn test_build_endpoint() {
-        let pool = Arc::new(Pool::default());
         let config = ChannelConfig::new()
             .timeout(Duration::from_secs(3))
             .connect_timeout(Duration::from_secs(5))
@@ -496,27 +611,20 @@ mod tests {
             .http2_adaptive_window(true)
             .tcp_keepalive(Duration::from_secs(2))
             .tcp_nodelay(true);
-        let mgr = ChannelManager { pool, config };
+        let mgr = ChannelManager::with_config(config);
 
         let res = mgr.build_endpoint("test_addr");
 
-        assert!(res.is_ok());
+        let _ = res.unwrap();
     }
 
     #[tokio::test]
     async fn test_channel_with_connector() {
-        let pool = Pool {
-            channels: DashMap::default(),
-        };
-
-        let pool = Arc::new(pool);
-
-        let config = ChannelConfig::new();
-        let mgr = ChannelManager { pool, config };
+        let mgr = ChannelManager::new();
 
         let addr = "test_addr";
         let res = mgr.get(addr);
-        assert!(res.is_ok());
+        let _ = res.unwrap();
 
         mgr.retain_channel(|addr, channel| {
             assert_eq!("test_addr", addr);
@@ -534,7 +642,7 @@ mod tests {
             }),
         );
 
-        assert!(res.is_ok());
+        let _ = res.unwrap();
 
         mgr.retain_channel(|addr, channel| {
             assert_eq!("test_addr", addr);

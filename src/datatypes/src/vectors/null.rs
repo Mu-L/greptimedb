@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,7 +17,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, NullArray};
-use arrow::datatypes::DataType as ArrowDataType;
 use snafu::{ensure, OptionExt};
 
 use crate::data_type::ConcreteDataType;
@@ -27,15 +26,18 @@ use crate::types::NullType;
 use crate::value::{Value, ValueRef};
 use crate::vectors::{self, MutableVector, Validity, Vector, VectorRef};
 
+/// A vector where all elements are nulls.
 #[derive(PartialEq)]
 pub struct NullVector {
     array: NullArray,
 }
 
+// TODO(yingwen): Support null vector with other logical types.
 impl NullVector {
+    /// Create a new `NullVector` with `n` elements.
     pub fn new(n: usize) -> Self {
         Self {
-            array: NullArray::new(ArrowDataType::Null, n),
+            array: NullArray::new(n),
         }
     }
 
@@ -52,7 +54,7 @@ impl From<NullArray> for NullVector {
 
 impl Vector for NullVector {
     fn data_type(&self) -> ConcreteDataType {
-        ConcreteDataType::Null(NullType::default())
+        ConcreteDataType::Null(NullType)
     }
 
     fn vector_type_name(&self) -> String {
@@ -76,11 +78,15 @@ impl Vector for NullVector {
     }
 
     fn validity(&self) -> Validity {
-        Validity::AllNull
+        Validity::all_null(self.array.len())
     }
 
     fn memory_size(&self) -> usize {
         0
+    }
+
+    fn null_count(&self) -> usize {
+        self.array.len()
     }
 
     fn is_null(&self, _row: usize) -> bool {
@@ -150,11 +156,15 @@ impl MutableVector for NullVectorBuilder {
         vector
     }
 
-    fn push_value_ref(&mut self, value: ValueRef) -> Result<()> {
+    fn to_vector_cloned(&self) -> VectorRef {
+        Arc::new(NullVector::new(self.length))
+    }
+
+    fn try_push_value_ref(&mut self, value: ValueRef) -> Result<()> {
         ensure!(
             value.is_null(),
             error::CastTypeSnafu {
-                msg: format!("Failed to cast value ref {:?} to null", value),
+                msg: format!("Failed to cast value ref {value:?} to null"),
             }
         );
 
@@ -163,7 +173,7 @@ impl MutableVector for NullVectorBuilder {
     }
 
     fn extend_slice_of(&mut self, vector: &dyn Vector, offset: usize, length: usize) -> Result<()> {
-        vector
+        let _ = vector
             .as_any()
             .downcast_ref::<NullVector>()
             .with_context(|| error::CastTypeSnafu {
@@ -182,6 +192,10 @@ impl MutableVector for NullVectorBuilder {
 
         self.length += length;
         Ok(())
+    }
+
+    fn push_null(&mut self) {
+        self.length += 1;
     }
 }
 
@@ -208,16 +222,15 @@ mod tests {
 
         assert_eq!(v.len(), 32);
         assert_eq!(0, v.memory_size());
-        let arrow_arr = v.to_arrow_array();
-        assert_eq!(arrow_arr.null_count(), 32);
+        assert_eq!(v.null_count(), 32);
 
-        let array2 = arrow_arr.slice(8, 16);
-        assert_eq!(array2.len(), 16);
-        assert_eq!(array2.null_count(), 16);
+        let vector2 = v.slice(8, 16);
+        assert_eq!(vector2.len(), 16);
+        assert_eq!(vector2.null_count(), 16);
 
         assert_eq!("NullVector", v.vector_type_name());
         assert!(!v.is_const());
-        assert_eq!(Validity::AllNull, v.validity());
+        assert!(v.validity().is_all_null());
         assert!(v.only_null());
 
         for i in 0..32 {
@@ -230,7 +243,7 @@ mod tests {
     #[test]
     fn test_debug_null_vector() {
         let array = NullVector::new(1024 * 1024);
-        assert_eq!(format!("{:?}", array), "NullVector(1048576)");
+        assert_eq!(format!("{array:?}"), "NullVector(1048576)");
     }
 
     #[test]
@@ -246,24 +259,34 @@ mod tests {
     #[test]
     fn test_null_vector_validity() {
         let vector = NullVector::new(5);
-        assert_eq!(Validity::AllNull, vector.validity());
+        assert!(vector.validity().is_all_null());
         assert_eq!(5, vector.null_count());
     }
 
     #[test]
     fn test_null_vector_builder() {
-        let mut builder = NullType::default().create_mutable_vector(3);
-        builder.push_value_ref(ValueRef::Null).unwrap();
-        assert!(builder.push_value_ref(ValueRef::Int32(123)).is_err());
+        let mut builder = NullType.create_mutable_vector(3);
+        builder.push_null();
+        assert!(builder.try_push_value_ref(ValueRef::Int32(123)).is_err());
 
         let input = NullVector::new(3);
         builder.extend_slice_of(&input, 1, 2).unwrap();
         assert!(builder
-            .extend_slice_of(&crate::vectors::Int32Vector::from_slice(&[13]), 0, 1)
+            .extend_slice_of(&crate::vectors::Int32Vector::from_slice([13]), 0, 1)
             .is_err());
         let vector = builder.to_vector();
 
         let expect: VectorRef = Arc::new(input);
         assert_eq!(expect, vector);
+    }
+
+    #[test]
+    fn test_null_vector_builder_finish_cloned() {
+        let mut builder = NullType.create_mutable_vector(3);
+        builder.push_null();
+        builder.push_null();
+        let vector = builder.to_vector_cloned();
+        assert_eq!(vector.len(), 2);
+        assert_eq!(vector.null_count(), 2);
     }
 }

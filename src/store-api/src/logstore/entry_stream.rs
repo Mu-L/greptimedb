@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,7 +14,7 @@
 
 use std::pin::Pin;
 
-use common_error::prelude::ErrorExt;
+use common_error::ext::ErrorExt;
 use futures::Stream;
 
 use crate::logstore::entry::Entry;
@@ -33,29 +33,23 @@ mod tests {
     use std::any::Any;
     use std::task::{Context, Poll};
 
+    use common_error::ext::StackError;
     use futures::StreamExt;
+    use snafu::Snafu;
 
     use super::*;
-    use crate::logstore::entry::{Encode, Epoch, Id, Offset};
+    pub use crate::logstore::entry::Id;
 
     pub struct SimpleEntry {
-        /// Offset of current entry
-        offset: Offset,
-        /// Epoch of current entry
-        epoch: Epoch,
         /// Binary data of current entry
         data: Vec<u8>,
     }
-
-    use common_base::buffer::{Buffer, BufferMut};
-    use common_error::prelude::{ErrorExt, Snafu};
-    use snafu::{Backtrace, ErrorCompat};
 
     #[derive(Debug, Snafu)]
     #[snafu(visibility(pub))]
     pub struct Error {}
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Eq, PartialEq, Hash)]
     pub struct Namespace {}
 
     impl crate::logstore::Namespace for Namespace {
@@ -65,29 +59,16 @@ mod tests {
     }
 
     impl ErrorExt for Error {
-        fn backtrace_opt(&self) -> Option<&Backtrace> {
-            ErrorCompat::backtrace(self)
-        }
-
         fn as_any(&self) -> &dyn Any {
             self
         }
     }
 
-    impl Encode for SimpleEntry {
-        type Error = Error;
+    impl StackError for Error {
+        fn debug_fmt(&self, _: usize, _: &mut Vec<String>) {}
 
-        fn encode_to<T: BufferMut>(&self, buf: &mut T) -> Result<usize, Self::Error> {
-            buf.write_from_slice(self.data.as_slice()).unwrap();
-            Ok(self.data.as_slice().len())
-        }
-
-        fn decode<T: Buffer>(_buf: &mut T) -> Result<Self, Self::Error> {
-            unimplemented!()
-        }
-
-        fn encoded_size(&self) -> usize {
-            self.data.as_slice().len()
+        fn next(&self) -> Option<&dyn StackError> {
+            None
         }
     }
 
@@ -103,37 +84,15 @@ mod tests {
             0u64
         }
 
-        fn offset(&self) -> Offset {
-            self.offset
-        }
-
-        fn set_id(&mut self, _id: Id) {}
-
-        fn epoch(&self) -> Epoch {
-            self.epoch
-        }
-
-        fn len(&self) -> usize {
-            self.data.len()
-        }
-
-        fn is_empty(&self) -> bool {
-            self.data.is_empty()
-        }
-
         fn namespace(&self) -> Self::Namespace {
             Namespace {}
         }
     }
 
     impl SimpleEntry {
-        pub fn new(data: impl AsRef<[u8]>, offset: Offset, epoch: u64) -> Self {
+        pub fn new(data: impl AsRef<[u8]>) -> Self {
             let data = data.as_ref().to_vec();
-            Self {
-                data,
-                offset,
-                epoch,
-            }
+            Self { data }
         }
     }
 
@@ -165,9 +124,8 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_entry_stream() {
-        let stream = async_stream::stream!({
-            yield Ok(vec![SimpleEntry::new("test_entry".as_bytes(), 0, 128)])
-        });
+        let stream =
+            async_stream::stream!(yield Ok(vec![SimpleEntry::new("test_entry".as_bytes())]));
 
         let mut stream_impl = EntryStreamImpl {
             inner: Box::pin(stream),

@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -78,7 +78,7 @@ impl FromRow for MysqlTextRow {
             let value = if let Some(mysql_value) = row.as_ref(i) {
                 match mysql_value {
                     MysqlValue::NULL => Value::Null,
-                    MysqlValue::Bytes(v) => Value::from(v.to_vec()),
+                    MysqlValue::Bytes(v) => Value::from(v.clone()),
                     _ => unreachable!(),
                 }
             } else {
@@ -119,7 +119,7 @@ pub fn all_datatype_testing_data() -> TestingData {
         ColumnType::MYSQL_TYPE_LONG,
         ColumnType::MYSQL_TYPE_LONGLONG,
         ColumnType::MYSQL_TYPE_FLOAT,
-        ColumnType::MYSQL_TYPE_FLOAT,
+        ColumnType::MYSQL_TYPE_DOUBLE,
         ColumnType::MYSQL_TYPE_VARCHAR,
         ColumnType::MYSQL_TYPE_VARCHAR,
     ];

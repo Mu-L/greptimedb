@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,225 +12,124 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_error::prelude::*;
+use common_error::ext::ErrorExt;
+use common_error::status_code::StatusCode;
+use common_error::{GREPTIME_ERROR_CODE, GREPTIME_ERROR_MSG};
+use common_macro::stack_trace_debug;
+use snafu::{Location, Snafu};
+use tonic::Status;
 
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub))]
+#[stack_trace_debug]
 pub enum Error {
-    #[snafu(display("Failed to connect to {}, source: {}", url, source))]
-    ConnectFailed {
-        url: String,
-        source: tonic::transport::Error,
-        backtrace: Backtrace,
-    },
-
     #[snafu(display("Illegal GRPC client state: {}", err_msg))]
-    IllegalGrpcClientState {
-        err_msg: String,
-        backtrace: Backtrace,
-    },
+    IllegalGrpcClientState { err_msg: String, location: Location },
 
-    #[snafu(display("Tonic internal error, source: {}", source))]
-    TonicStatus {
-        source: tonic::Status,
-        backtrace: Backtrace,
-    },
+    #[snafu(display("{}", msg))]
+    MetaServer { code: StatusCode, msg: String },
 
     #[snafu(display("Failed to ask leader from all endpoints"))]
-    AskLeader { backtrace: Backtrace },
+    AskLeader { location: Location },
 
     #[snafu(display("No leader, should ask leader first"))]
-    NoLeader { backtrace: Backtrace },
+    NoLeader { location: Location },
 
-    #[snafu(display("Failed to create gRPC channel, source: {}", source))]
+    #[snafu(display("Ask leader timeout"))]
+    AskLeaderTimeout {
+        location: Location,
+        #[snafu(source)]
+        error: tokio::time::error::Elapsed,
+    },
+
+    #[snafu(display("Failed to create gRPC channel"))]
     CreateChannel {
-        #[snafu(backtrace)]
+        location: Location,
         source: common_grpc::error::Error,
     },
 
     #[snafu(display("{} not started", name))]
-    NotStarted { name: String, backtrace: Backtrace },
+    NotStarted { name: String, location: Location },
 
     #[snafu(display("Failed to send heartbeat: {}", err_msg))]
-    SendHeartbeat {
-        err_msg: String,
-        backtrace: Backtrace,
-    },
+    SendHeartbeat { err_msg: String, location: Location },
 
     #[snafu(display("Failed create heartbeat stream to server"))]
-    CreateHeartbeatStream { backtrace: Backtrace },
+    CreateHeartbeatStream { location: Location },
 
-    #[snafu(display("Route info corrupted: {}", err_msg))]
-    RouteInfoCorrupted {
-        err_msg: String,
-        backtrace: Backtrace,
+    #[snafu(display("Invalid response header"))]
+    InvalidResponseHeader {
+        location: Location,
+        source: common_meta::error::Error,
     },
 
-    #[snafu(display("Illegal state from server, code: {}, error: {}", code, err_msg))]
-    IllegalServerState {
-        code: i32,
-        err_msg: String,
-        backtrace: Backtrace,
+    #[snafu(display("Failed to convert Metasrv request"))]
+    ConvertMetaRequest {
+        location: Location,
+        source: common_meta::error::Error,
     },
+
+    #[snafu(display("Failed to convert Metasrv response"))]
+    ConvertMetaResponse {
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Retry exceeded max times({}), message: {}", times, msg))]
+    RetryTimesExceeded { times: usize, msg: String },
 }
 
 #[allow(dead_code)]
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl ErrorExt for Error {
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
-    }
-
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
     fn status_code(&self) -> StatusCode {
         match self {
-            Error::ConnectFailed { .. }
-            | Error::IllegalGrpcClientState { .. }
-            | Error::TonicStatus { .. }
+            Error::IllegalGrpcClientState { .. }
             | Error::AskLeader { .. }
             | Error::NoLeader { .. }
+            | Error::AskLeaderTimeout { .. }
             | Error::NotStarted { .. }
             | Error::SendHeartbeat { .. }
             | Error::CreateHeartbeatStream { .. }
             | Error::CreateChannel { .. }
-            | Error::IllegalServerState { .. } => StatusCode::Internal,
-            Error::RouteInfoCorrupted { .. } => StatusCode::Unexpected,
+            | Error::RetryTimesExceeded { .. } => StatusCode::Internal,
+
+            Error::MetaServer { code, .. } => *code,
+
+            Error::InvalidResponseHeader { source, .. }
+            | Error::ConvertMetaRequest { source, .. }
+            | Error::ConvertMetaResponse { source, .. } => source.status_code(),
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    type StdResult<E> = std::result::Result<(), E>;
-
-    fn throw_none_option() -> Option<String> {
-        None
-    }
-
-    #[test]
-    fn test_connect_failed_error() {
-        fn throw_tonic_error() -> StdResult<tonic::transport::Error> {
-            tonic::transport::Endpoint::new("http//http").map(|_| ())
+// FIXME(dennis): partial duplicated with src/client/src/error.rs
+impl From<Status> for Error {
+    fn from(e: Status) -> Self {
+        fn get_metadata_value(s: &Status, key: &str) -> Option<String> {
+            s.metadata()
+                .get(key)
+                .and_then(|v| String::from_utf8(v.as_bytes().to_vec()).ok())
         }
-        let e = throw_tonic_error()
-            .context(ConnectFailedSnafu { url: "" })
-            .err()
-            .unwrap();
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::Internal);
-    }
 
-    #[test]
-    fn test_illegal_grpc_client_state_error() {
-        let e = throw_none_option()
-            .context(IllegalGrpcClientStateSnafu { err_msg: "" })
-            .err()
-            .unwrap();
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::Internal);
-    }
-
-    #[test]
-    fn test_tonic_status_error() {
-        fn throw_tonic_status_error() -> StdResult<tonic::Status> {
-            Err(tonic::Status::new(tonic::Code::Aborted, ""))
-        }
-        let e = throw_tonic_status_error()
-            .context(TonicStatusSnafu)
-            .err()
-            .unwrap();
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::Internal);
-    }
-
-    #[test]
-    fn test_ask_leader_error() {
-        let e = throw_none_option().context(AskLeaderSnafu).err().unwrap();
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::Internal);
-    }
-
-    #[test]
-    fn test_no_leader_error() {
-        let e = throw_none_option().context(NoLeaderSnafu).err().unwrap();
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::Internal);
-    }
-
-    #[test]
-    fn test_create_channel_error() {
-        fn throw_common_grpc_error() -> StdResult<common_grpc::Error> {
-            tonic::transport::Endpoint::new("http//http")
-                .map(|_| ())
-                .context(common_grpc::error::CreateChannelSnafu)
-        }
-        let e = throw_common_grpc_error()
-            .context(CreateChannelSnafu)
-            .err()
-            .unwrap();
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::Internal);
-    }
-
-    #[test]
-    fn test_not_started_error() {
-        let e = throw_none_option()
-            .context(NotStartedSnafu { name: "" })
-            .err()
-            .unwrap();
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::Internal);
-    }
-
-    #[test]
-    fn test_send_heartbeat_error() {
-        let e = throw_none_option()
-            .context(SendHeartbeatSnafu { err_msg: "" })
-            .err()
-            .unwrap();
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::Internal);
-    }
-
-    #[test]
-    fn test_create_heartbeat_stream_error() {
-        let e = throw_none_option()
-            .context(CreateHeartbeatStreamSnafu)
-            .err()
-            .unwrap();
-
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::Internal);
-    }
-
-    #[test]
-    fn test_route_info_corruped_error() {
-        let e = throw_none_option()
-            .context(RouteInfoCorruptedSnafu { err_msg: "" })
-            .err()
-            .unwrap();
-
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::Unexpected);
-    }
-
-    #[test]
-    fn test_illegal_server_state_error() {
-        let e = throw_none_option()
-            .context(IllegalServerStateSnafu {
-                code: 1,
-                err_msg: "",
+        let code = get_metadata_value(&e, GREPTIME_ERROR_CODE)
+            .and_then(|s| {
+                if let Ok(code) = s.parse::<u32>() {
+                    StatusCode::from_u32(code)
+                } else {
+                    None
+                }
             })
-            .err()
-            .unwrap();
+            .unwrap_or(StatusCode::Internal);
 
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::Internal);
+        let msg =
+            get_metadata_value(&e, GREPTIME_ERROR_MSG).unwrap_or_else(|| e.message().to_string());
+
+        Self::MetaServer { code, msg }
     }
 }

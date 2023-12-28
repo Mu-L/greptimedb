@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,12 +16,14 @@ use std::collections::HashMap;
 
 use axum::extract::{Query, RawBody, State};
 use axum::http::StatusCode as HttpStatusCode;
-use axum::Json;
+use axum::{Extension, Json};
+use common_error::ext::ErrorExt;
 use hyper::Body;
 use serde::{Deserialize, Serialize};
+use session::context::QueryContextRef;
 use snafu::ResultExt;
 
-use crate::error::{self, Error, Result};
+use crate::error::{self, Result};
 use crate::opentsdb::codec::DataPoint;
 use crate::query_handler::OpentsdbProtocolHandlerRef;
 
@@ -53,11 +55,7 @@ impl From<DataPointRequest> for DataPoint {
     fn from(request: DataPointRequest) -> Self {
         let ts_millis = DataPoint::timestamp_to_millis(request.timestamp);
 
-        let tags = request
-            .tags
-            .into_iter()
-            .map(|(k, v)| (k, v))
-            .collect::<Vec<(String, String)>>();
+        let tags = request.tags.into_iter().collect::<Vec<(String, String)>>();
 
         DataPoint::new(request.metric, ts_millis, request.value, tags)
     }
@@ -76,22 +74,25 @@ pub enum OpentsdbPutResponse {
 pub async fn put(
     State(opentsdb_handler): State<OpentsdbProtocolHandlerRef>,
     Query(params): Query<HashMap<String, String>>,
+    Extension(ctx): Extension<QueryContextRef>,
     RawBody(body): RawBody,
 ) -> Result<(HttpStatusCode, Json<OpentsdbPutResponse>)> {
     let summary = params.contains_key("summary");
     let details = params.contains_key("details");
 
-    let data_points = parse_data_points(body).await?;
+    let data_point_requests = parse_data_points(body).await?;
+    let data_points = data_point_requests
+        .iter()
+        .map(|point| point.clone().into())
+        .collect::<Vec<_>>();
 
     let response = if !summary && !details {
-        for data_point in data_points.into_iter() {
-            if let Err(e) = opentsdb_handler.exec(&data_point.into()).await {
-                // Not debugging purpose, failed fast.
-                return error::InternalSnafu {
-                    err_msg: e.to_string(),
-                }
-                .fail();
+        if let Err(e) = opentsdb_handler.exec(data_points, ctx.clone()).await {
+            // Not debugging purpose, failed fast.
+            return error::InternalSnafu {
+                err_msg: e.to_string(),
             }
+            .fail();
         }
         (HttpStatusCode::NO_CONTENT, Json(OpentsdbPutResponse::Empty))
     } else {
@@ -105,13 +106,11 @@ pub async fn put(
             },
         };
 
-        for data_point in data_points.into_iter() {
-            let result = opentsdb_handler.exec(&data_point.clone().into()).await;
+        for (data_point, request) in data_points.into_iter().zip(data_point_requests) {
+            let result = opentsdb_handler.exec(vec![data_point], ctx.clone()).await;
             match result {
-                Ok(()) => response.on_success(),
-                Err(e) => {
-                    response.on_failed(data_point, e);
-                }
+                Ok(affected_rows) => response.on_success(affected_rows),
+                Err(e) => response.on_failed(request, e),
             }
         }
         (
@@ -146,17 +145,17 @@ pub struct OpentsdbDebuggingResponse {
 }
 
 impl OpentsdbDebuggingResponse {
-    fn on_success(&mut self) {
-        self.success += 1;
+    fn on_success(&mut self, affected_rows: usize) {
+        self.success += affected_rows as i32;
     }
 
-    fn on_failed(&mut self, datapoint: DataPointRequest, error: Error) {
+    fn on_failed(&mut self, datapoint: DataPointRequest, error: impl ErrorExt) {
         self.failed += 1;
 
         if let Some(details) = self.errors.as_mut() {
             let error = OpentsdbDetailError {
                 datapoint,
-                error: error.to_string(),
+                error: error.output_msg(),
             };
             details.push(error);
         };
@@ -165,6 +164,7 @@ impl OpentsdbDebuggingResponse {
 
 #[cfg(test)]
 mod test {
+
     use super::*;
 
     #[test]
@@ -214,7 +214,7 @@ mod test {
         assert_eq!(data_points.len(), 1);
         assert_eq!(data_points[0], data_point1);
 
-        let body = Body::from(format!("[{},{}]", raw_data_point1, raw_data_point2));
+        let body = Body::from(format!("[{raw_data_point1},{raw_data_point2}]"));
         let data_points = parse_data_points(body).await.unwrap();
         assert_eq!(data_points.len(), 2);
         assert_eq!(data_points[0], data_point1);
@@ -223,17 +223,13 @@ mod test {
         let body = Body::from("");
         let result = parse_data_points(body).await;
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "Invalid OpenTSDB Json request, source: EOF while parsing a value at line 1 column 0"
-        );
+        let err = result.unwrap_err().output_msg();
+        assert!(err.contains("EOF while parsing a value at line 1 column 0"));
 
         let body = Body::from("hello world");
         let result = parse_data_points(body).await;
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "Invalid OpenTSDB Json request, source: expected value at line 1 column 1"
-        );
+        let err = result.unwrap_err().output_msg();
+        assert!(err.contains("expected value at line 1 column 1"));
     }
 }

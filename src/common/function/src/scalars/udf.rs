@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,15 +14,16 @@
 
 use std::sync::Arc;
 
-use common_query::error::{ExecuteFunctionSnafu, FromScalarValueSnafu};
+use common_query::error::FromScalarValueSnafu;
 use common_query::prelude::{
-    ColumnarValue, ReturnTypeFunction, ScalarFunctionImplementation, ScalarUdf, ScalarValue,
+    ColumnarValue, ReturnTypeFunction, ScalarFunctionImplementation, ScalarUdf,
 };
 use datatypes::error::Error as DataTypeError;
-use datatypes::prelude::{ConcreteDataType, VectorHelper};
+use datatypes::prelude::*;
+use datatypes::vectors::Helper;
 use snafu::ResultExt;
 
-use crate::scalars::function::{FunctionContext, FunctionRef};
+use crate::function::{FunctionContext, FunctionRef};
 
 /// Create a ScalarUdf from function.
 pub fn create_udf(func: FunctionRef) -> ScalarUdf {
@@ -47,22 +48,14 @@ pub fn create_udf(func: FunctionRef) -> ScalarUdf {
         let args: Result<Vec<_>, DataTypeError> = args
             .iter()
             .map(|arg| match arg {
-                ColumnarValue::Scalar(v) => VectorHelper::try_from_scalar_value(v.clone(), rows),
+                ColumnarValue::Scalar(v) => Helper::try_from_scalar_value(v.clone(), rows),
                 ColumnarValue::Vector(v) => Ok(v.clone()),
             })
             .collect();
 
         let result = func_cloned.eval(func_ctx, &args.context(FromScalarValueSnafu)?);
-
-        let udf = if len.is_some() {
-            result.map(ColumnarValue::Vector)?
-        } else {
-            ScalarValue::try_from_array(&result?.to_arrow_array(), 0)
-                .map(ColumnarValue::Scalar)
-                .context(ExecuteFunctionSnafu)?
-        };
-
-        Ok(udf)
+        let udf_result = result.map(ColumnarValue::Vector)?;
+        Ok(udf_result)
     });
 
     ScalarUdf::new(func.name(), &func.signature(), &return_type, &fun)
@@ -79,12 +72,12 @@ mod tests {
     use datatypes::vectors::{BooleanVector, ConstantVector};
 
     use super::*;
-    use crate::scalars::function::Function;
+    use crate::function::Function;
     use crate::scalars::test::TestAndFunction;
 
     #[test]
     fn test_create_udf() {
-        let f = Arc::new(TestAndFunction::default());
+        let f = Arc::new(TestAndFunction);
 
         let args: Vec<VectorRef> = vec![
             Arc::new(ConstantVector::new(
@@ -126,12 +119,7 @@ mod tests {
 
                 assert_eq!(4, vec.len());
                 for i in 0..4 {
-                    assert_eq!(
-                        i == 0 || i == 3,
-                        vec.get_data(i).unwrap(),
-                        "failed at {}",
-                        i
-                    )
+                    assert_eq!(i == 0 || i == 3, vec.get_data(i).unwrap(), "Failed at {i}",)
                 }
             }
             _ => unreachable!(),

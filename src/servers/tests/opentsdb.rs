@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,6 +27,7 @@ use servers::opentsdb::connection::Connection;
 use servers::opentsdb::OpentsdbServer;
 use servers::query_handler::OpentsdbProtocolHandler;
 use servers::server::Server;
+use session::context::QueryContextRef;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify};
 
@@ -36,8 +37,8 @@ struct DummyOpentsdbInstance {
 
 #[async_trait]
 impl OpentsdbProtocolHandler for DummyOpentsdbInstance {
-    async fn exec(&self, data_point: &DataPoint) -> Result<()> {
-        let metric = data_point.metric();
+    async fn exec(&self, data_points: Vec<DataPoint>, _ctx: QueryContextRef) -> Result<usize> {
+        let metric = data_points.first().unwrap().metric();
         if metric == "should_failed" {
             return server_error::InternalSnafu {
                 err_msg: "expected",
@@ -46,7 +47,7 @@ impl OpentsdbProtocolHandler for DummyOpentsdbInstance {
         }
         let i = metric.parse::<i32>().unwrap();
         let _ = self.tx.send(i * i).await;
-        Ok(())
+        Ok(data_points.len())
     }
 }
 
@@ -68,7 +69,7 @@ async fn test_start_opentsdb_server() -> Result<()> {
     let server = create_opentsdb_server(tx)?;
     let listening = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
     let result = server.start(listening).await;
-    assert!(result.is_ok());
+    let _ = result.unwrap();
 
     let result = server.start(listening).await;
     assert!(result
@@ -105,7 +106,7 @@ async fn test_shutdown_opentsdb_server_concurrently() -> Result<()> {
             match stream {
                 Ok(stream) => {
                     let mut connection = Connection::new(stream);
-                    let result = connection.write_line(format!("put {} 1 1", i)).await;
+                    let result = connection.write_line(format!("put {i} 1 1")).await;
                     i += 1;
 
                     if i > 4 {
@@ -116,7 +117,7 @@ async fn test_shutdown_opentsdb_server_concurrently() -> Result<()> {
                     if let Err(e) = result {
                         match e {
                             Error::InternalIo { .. } => return,
-                            _ => panic!("Not IO error, err is {}", e),
+                            _ => panic!("Not IO error, err is {e}"),
                         }
                     }
 
@@ -170,13 +171,13 @@ async fn test_opentsdb_connection_shutdown() -> Result<()> {
     let mut i = 2;
     loop {
         // The connection may not be unwritable after shutdown immediately.
-        let result = connection.write_line(format!("put {} 1 1", i)).await;
+        let result = connection.write_line(format!("put {i} 1 1")).await;
         i += 1;
         if result.is_err() {
             if let Err(e) = result {
                 match e {
                     Error::InternalIo { .. } => break,
-                    _ => panic!("Not IO error, err is {}", e),
+                    _ => panic!("Not IO error, err is {e}"),
                 }
             }
         }
@@ -203,7 +204,7 @@ async fn test_opentsdb_connect_after_shutdown() -> Result<()> {
 
     server.shutdown().await.unwrap();
 
-    TcpStream::connect(addr).await.unwrap_err();
+    assert!(TcpStream::connect(addr).await.is_err());
 
     Ok(())
 }
@@ -250,10 +251,7 @@ async fn test_query_concurrently() -> Result<()> {
             let stream = TcpStream::connect(addr).await.unwrap();
             let mut connection = Connection::new(stream);
             for i in 0..expect_executed_queries_per_worker {
-                connection
-                    .write_line(format!("put {} 1 1", i))
-                    .await
-                    .unwrap();
+                connection.write_line(format!("put {i} 1 1")).await.unwrap();
 
                 let should_recreate_conn = rand.gen_range(0..100) == 1;
                 if should_recreate_conn {

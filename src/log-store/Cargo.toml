@@ -1,28 +1,40 @@
 [package]
 name = "log-store"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+protobuf-build = { version = "0.15", default-features = false, features = [
+    "protobuf-codec",
+] }
 
 [dependencies]
-arc-swap = "1.5"
-async-stream = "0.3"
-async-trait = "0.1"
-base64 = "0.13"
+async-stream.workspace = true
+async-trait.workspace = true
 byteorder = "1.4"
-bytes = "1.1"
-common-base = { path = "../common/base" }
-common-error = { path = "../common/error" }
-common-runtime = { path = "../common/runtime" }
-common-telemetry = { path = "../common/telemetry" }
-crc = "3.0"
-futures = "0.3"
-futures-util = "0.3"
-hex = "0.4"
-snafu = { version = "0.7", features = ["backtraces"] }
-store-api = { path = "../store-api" }
-tempdir = "0.3"
-tokio = { version = "1.18", features = ["full"] }
+bytes.workspace = true
+common-base.workspace = true
+common-config.workspace = true
+common-error.workspace = true
+common-macro.workspace = true
+common-meta.workspace = true
+common-runtime.workspace = true
+common-telemetry.workspace = true
+dashmap.workspace = true
+futures-util.workspace = true
+futures.workspace = true
+protobuf = { version = "2", features = ["bytes"] }
+raft-engine.workspace = true
+rskafka.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
+store-api.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-rand = "0.8"
+common-meta = { workspace = true, features = ["testing"] }
+common-test-util.workspace = true
+rand.workspace = true

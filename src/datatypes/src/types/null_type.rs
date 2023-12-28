@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,18 +22,18 @@ use crate::type_id::LogicalTypeId;
 use crate::value::Value;
 use crate::vectors::{MutableVector, NullVectorBuilder};
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NullType;
 
 impl NullType {
     pub fn arc() -> DataTypeRef {
-        Arc::new(Self)
+        Arc::new(NullType)
     }
 }
 
 impl DataType for NullType {
-    fn name(&self) -> &str {
-        "Null"
+    fn name(&self) -> String {
+        "Null".to_string()
     }
 
     fn logical_type_id(&self) -> LogicalTypeId {
@@ -49,6 +49,11 @@ impl DataType for NullType {
     }
 
     fn create_mutable_vector(&self, _capacity: usize) -> Box<dyn MutableVector> {
-        Box::new(NullVectorBuilder::default())
+        Box::<NullVectorBuilder>::default()
+    }
+
+    // Unconditional cast other type to Value::Null
+    fn try_cast(&self, _from: Value) -> Option<Value> {
+        Some(Value::Null)
     }
 }

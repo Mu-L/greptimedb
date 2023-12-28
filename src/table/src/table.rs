@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod adapter;
+mod metrics;
 pub mod numbers;
 pub mod scan;
 
@@ -21,12 +22,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common_query::logical_plan::Expr;
-use common_query::physical_plan::PhysicalPlanRef;
+use common_recordbatch::SendableRecordBatchStream;
 use datatypes::schema::SchemaRef;
+use store_api::storage::ScanRequest;
 
 use crate::error::Result;
 use crate::metadata::{FilterPushDownType, TableId, TableInfoRef, TableType};
-use crate::requests::{AlterTableRequest, InsertRequest};
 
 /// Table abstraction.
 #[async_trait]
@@ -42,36 +43,14 @@ pub trait Table: Send + Sync {
     fn table_info(&self) -> TableInfoRef;
 
     /// Get the type of this table for metadata/catalog purposes.
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
+    fn table_type(&self) -> TableType;
 
-    /// Insert values into table.
-    async fn insert(&self, _request: InsertRequest) -> Result<usize> {
-        unimplemented!();
-    }
+    async fn scan_to_stream(&self, request: ScanRequest) -> Result<SendableRecordBatchStream>;
 
-    /// Scan the table and returns a SendableRecordBatchStream.
-    async fn scan(
-        &self,
-        projection: &Option<Vec<usize>>,
-        filters: &[Expr],
-        // limit can be used to reduce the amount scanned
-        // from the datasource as a performance optimization.
-        // If set, it contains the amount of rows needed by the `LogicalPlan`,
-        // The datasource should return *at least* this number of rows if available.
-        limit: Option<usize>,
-    ) -> Result<PhysicalPlanRef>;
-
-    /// Tests whether the table provider can make use of a filter expression
+    /// Tests whether the table provider can make use of any or all filter expressions
     /// to optimise data retrieval.
-    fn supports_filter_pushdown(&self, _filter: &Expr) -> Result<FilterPushDownType> {
-        Ok(FilterPushDownType::Unsupported)
-    }
-
-    async fn alter(&self, request: AlterTableRequest) -> Result<()> {
-        let _ = request;
-        unimplemented!()
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<FilterPushDownType>> {
+        Ok(vec![FilterPushDownType::Unsupported; filters.len()])
     }
 }
 

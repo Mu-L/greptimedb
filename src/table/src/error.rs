@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,68 +14,64 @@
 
 use std::any::Any;
 
-use common_error::prelude::*;
-use common_recordbatch::error::Error as RecordBatchError;
+use common_error::ext::{BoxedError, ErrorExt};
+use common_error::status_code::StatusCode;
+use common_macro::stack_trace_debug;
 use datafusion::error::DataFusionError;
 use datatypes::arrow::error::ArrowError;
+use snafu::{Location, Snafu};
 
-common_error::define_opaque_error!(Error);
+use crate::metadata::TableId;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-impl From<Error> for DataFusionError {
-    fn from(e: Error) -> Self {
-        Self::External(Box::new(e))
-    }
-}
-
 /// Default error implementation of table.
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub))]
-pub enum InnerError {
-    #[snafu(display("Datafusion error: {}", source))]
+#[stack_trace_debug]
+pub enum Error {
+    #[snafu(display("DataFusion error"))]
     Datafusion {
-        source: DataFusionError,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: DataFusionError,
+        location: Location,
     },
 
-    #[snafu(display("Missing column when insert, column: {}", name))]
-    MissingColumn { name: String, backtrace: Backtrace },
-
-    #[snafu(display("Poll stream failed, source: {}", source))]
-    PollStream {
-        source: ArrowError,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display("Failed to convert Arrow schema, source: {}", source))]
+    #[snafu(display("Failed to convert Arrow schema"))]
     SchemaConversion {
         source: datatypes::error::Error,
-        backtrace: Backtrace,
+        location: Location,
     },
 
-    #[snafu(display("Table projection error, source: {}", source))]
+    #[snafu(display("Engine not found: {}", engine))]
+    EngineNotFound { engine: String, location: Location },
+
+    #[snafu(display("Engine exist: {}", engine))]
+    EngineExist { engine: String, location: Location },
+
+    #[snafu(display("Table projection error"))]
     TableProjection {
-        source: ArrowError,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: ArrowError,
+        location: Location,
     },
 
-    #[snafu(display("Failed to create record batch for Tables, source: {}", source))]
+    #[snafu(display("Failed to create record batch for Tables"))]
     TablesRecordBatch {
-        #[snafu(backtrace)]
+        location: Location,
         source: BoxedError,
     },
 
-    #[snafu(display("Column {} already exists in table {}", column_name, table_name))]
+    #[snafu(display("Column {column_name} already exists in table {table_name}"))]
     ColumnExists {
         column_name: String,
         table_name: String,
-        backtrace: Backtrace,
+        location: Location,
     },
 
-    #[snafu(display("Failed to build schema, msg: {}, source: {}", msg, source))]
+    #[snafu(display("Failed to build schema, msg: {}", msg))]
     SchemaBuild {
-        #[snafu(backtrace)]
+        location: Location,
         source: datatypes::error::Error,
         msg: String,
     },
@@ -84,8 +80,11 @@ pub enum InnerError {
     ColumnNotExists {
         column_name: String,
         table_name: String,
-        backtrace: Backtrace,
+        location: Location,
     },
+
+    #[snafu(display("Duplicated call to plan execute method. table: {}", table))]
+    DuplicatedExecuteCall { location: Location, table: String },
 
     #[snafu(display(
         "Not allowed to remove index column {} from table {}",
@@ -95,42 +94,84 @@ pub enum InnerError {
     RemoveColumnInIndex {
         column_name: String,
         table_name: String,
-        backtrace: Backtrace,
+        location: Location,
     },
 
     #[snafu(display(
-        "Failed to build column descriptor for table: {}, column: {}, source: {}",
+        "Failed to build column descriptor for table: {}, column: {}",
         table_name,
         column_name,
-        source,
     ))]
     BuildColumnDescriptor {
-        source: store_api::storage::ColumnDescriptorBuilderError,
+        #[snafu(source)]
+        error: store_api::storage::ColumnDescriptorBuilderError,
         table_name: String,
         column_name: String,
-        backtrace: Backtrace,
+        location: Location,
+    },
+
+    #[snafu(display("Regions schemas mismatch in table: {}", table))]
+    RegionSchemaMismatch { table: String, location: Location },
+
+    #[snafu(display("Failed to operate table"))]
+    TableOperation { source: BoxedError },
+
+    #[snafu(display("Unsupported operation: {}", operation))]
+    Unsupported { operation: String },
+
+    #[snafu(display("Failed to parse table option, key: {}, value: {}", key, value))]
+    ParseTableOption {
+        key: String,
+        value: String,
+        location: Location,
+    },
+
+    #[snafu(display("Invalid alter table({}) request: {}", table, err))]
+    InvalidAlterRequest {
+        table: String,
+        location: Location,
+        err: String,
+    },
+
+    #[snafu(display("Invalid table state: {}", table_id))]
+    InvalidTable {
+        table_id: TableId,
+        location: Location,
+    },
+
+    #[snafu(display("Missing time index column in table: {}", table_name))]
+    MissingTimeIndexColumn {
+        table_name: String,
+        location: Location,
     },
 }
 
-impl ErrorExt for InnerError {
+impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         match self {
-            InnerError::Datafusion { .. }
-            | InnerError::PollStream { .. }
-            | InnerError::SchemaConversion { .. }
-            | InnerError::TableProjection { .. } => StatusCode::EngineExecuteQuery,
-            InnerError::MissingColumn { .. }
-            | InnerError::RemoveColumnInIndex { .. }
-            | InnerError::BuildColumnDescriptor { .. } => StatusCode::InvalidArguments,
-            InnerError::TablesRecordBatch { .. } => StatusCode::Unexpected,
-            InnerError::ColumnExists { .. } => StatusCode::TableColumnExists,
-            InnerError::SchemaBuild { source, .. } => source.status_code(),
-            InnerError::ColumnNotExists { .. } => StatusCode::TableColumnNotFound,
-        }
-    }
+            Error::Datafusion { .. }
+            | Error::SchemaConversion { .. }
+            | Error::TableProjection { .. } => StatusCode::EngineExecuteQuery,
+            Error::RemoveColumnInIndex { .. }
+            | Error::BuildColumnDescriptor { .. }
+            | Error::InvalidAlterRequest { .. } => StatusCode::InvalidArguments,
+            Error::TablesRecordBatch { .. } | Error::DuplicatedExecuteCall { .. } => {
+                StatusCode::Unexpected
+            }
+            Error::ColumnExists { .. } => StatusCode::TableColumnExists,
+            Error::SchemaBuild { source, .. } => source.status_code(),
+            Error::TableOperation { source } => source.status_code(),
+            Error::ColumnNotExists { .. } => StatusCode::TableColumnNotFound,
+            Error::RegionSchemaMismatch { .. } => StatusCode::StorageUnavailable,
+            Error::Unsupported { .. } => StatusCode::Unsupported,
+            Error::ParseTableOption { .. }
+            | Error::EngineNotFound { .. }
+            | Error::EngineExist { .. } => StatusCode::InvalidArguments,
 
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
+            Error::InvalidTable { .. } | Error::MissingTimeIndexColumn { .. } => {
+                StatusCode::Internal
+            }
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -138,71 +179,8 @@ impl ErrorExt for InnerError {
     }
 }
 
-impl From<InnerError> for Error {
-    fn from(err: InnerError) -> Self {
-        Self::new(err)
-    }
-}
-
-impl From<InnerError> for DataFusionError {
-    fn from(e: InnerError) -> DataFusionError {
+impl From<Error> for DataFusionError {
+    fn from(e: Error) -> DataFusionError {
         DataFusionError::External(Box::new(e))
-    }
-}
-
-impl From<InnerError> for RecordBatchError {
-    fn from(e: InnerError) -> RecordBatchError {
-        RecordBatchError::new(e)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn throw_df_error() -> Result<()> {
-        Err(DataFusionError::NotImplemented("table test".to_string())).context(DatafusionSnafu)?
-    }
-
-    fn throw_missing_column_inner() -> std::result::Result<(), InnerError> {
-        MissingColumnSnafu { name: "test" }.fail()
-    }
-
-    fn throw_missing_column() -> Result<()> {
-        Ok(throw_missing_column_inner()?)
-    }
-
-    fn throw_arrow() -> Result<()> {
-        Err(ArrowError::Overflow).context(PollStreamSnafu)?
-    }
-
-    #[test]
-    fn test_error() {
-        let err = throw_df_error().err().unwrap();
-        assert!(err.backtrace_opt().is_some());
-        assert_eq!(StatusCode::EngineExecuteQuery, err.status_code());
-
-        let err = throw_missing_column().err().unwrap();
-        assert!(err.backtrace_opt().is_some());
-        assert_eq!(StatusCode::InvalidArguments, err.status_code());
-
-        let err = throw_arrow().err().unwrap();
-        assert!(err.backtrace_opt().is_some());
-        assert_eq!(StatusCode::EngineExecuteQuery, err.status_code());
-    }
-
-    #[test]
-    fn test_into_record_batch_error() {
-        let err = throw_missing_column_inner().err().unwrap();
-        let err: RecordBatchError = err.into();
-        assert!(err.backtrace_opt().is_some());
-        assert_eq!(StatusCode::InvalidArguments, err.status_code());
-    }
-
-    #[test]
-    fn test_into_df_error() {
-        let err = throw_missing_column_inner().err().unwrap();
-        let err: DataFusionError = err.into();
-        assert!(matches!(err, DataFusionError::External(_)));
     }
 }

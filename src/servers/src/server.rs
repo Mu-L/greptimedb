@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ use async_trait::async_trait;
 use common_runtime::Runtime;
 use common_telemetry::logging::{error, info};
 use futures::future::{AbortHandle, AbortRegistration, Abortable};
-use snafu::ResultExt;
+use snafu::{ensure, ResultExt};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -28,8 +29,18 @@ use crate::error::{self, Result};
 
 pub(crate) type AbortableStream = Abortable<TcpListenerStream>;
 
+pub type ServerHandlers = HashMap<String, ServerHandler>;
+
+pub type ServerHandler = (Box<dyn Server>, SocketAddr);
+
+pub async fn start_server(server_handler: &ServerHandler) -> Result<Option<SocketAddr>> {
+    let (server, addr) = server_handler;
+    info!("Starting {} at {}", server.name(), addr);
+    server.start(*addr).await.map(Some)
+}
+
 #[async_trait]
-pub trait Server: Send {
+pub trait Server: Send + Sync {
     /// Shutdown the server gracefully.
     async fn shutdown(&self) -> Result<()>;
 
@@ -37,6 +48,8 @@ pub trait Server: Send {
     ///
     /// Caller should ensure `start()` is only invoked once.
     async fn start(&self, listening: SocketAddr) -> Result<SocketAddr>;
+
+    fn name(&self) -> &str;
 }
 
 struct AcceptTask {
@@ -64,12 +77,12 @@ impl AcceptTask {
                         name, error
                     );
                 } else {
-                    info!("{} server is shutdown.", name);
+                    info!("{name} server is shutdown.");
                 }
                 Ok(())
             }
             None => error::InternalSnafu {
-                err_msg: format!("{} server is not started.", name),
+                err_msg: format!("{name} server is not started."),
             }
             .fail()?,
         }
@@ -86,32 +99,31 @@ impl AcceptTask {
                     tokio::net::TcpListener::bind(addr)
                         .await
                         .context(error::TokioIoSnafu {
-                            err_msg: format!("{} failed to bind addr {}", name, addr),
+                            err_msg: format!("{name} failed to bind addr {addr}"),
                         })?;
                 // get actually bond addr in case input addr use port 0
                 let addr = listener.local_addr()?;
-                info!("{} server started at {}", name, addr);
+                info!("{name} server started at {addr}");
 
                 let stream = TcpListenerStream::new(listener);
                 let stream = Abortable::new(stream, registration);
                 Ok((stream, addr))
             }
             None => error::InternalSnafu {
-                err_msg: format!("{} server has been started.", name),
+                err_msg: format!("{name} server has been started."),
             }
             .fail()?,
         }
     }
 
     fn start_with(&mut self, join_handle: JoinHandle<()>, name: &str) -> Result<()> {
-        if self.join_handle.is_some() {
-            return error::InternalSnafu {
-                err_msg: format!("{} server has been started.", name),
+        ensure!(
+            self.join_handle.is_none(),
+            error::InternalSnafu {
+                err_msg: format!("{name} server has been started."),
             }
-            .fail();
-        }
-        let _ = self.join_handle.insert(join_handle);
-
+        );
+        let _handle = self.join_handle.get_or_insert(join_handle);
         Ok(())
     }
 }

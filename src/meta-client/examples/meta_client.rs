@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,13 +14,13 @@
 
 use std::time::Duration;
 
-use api::v1::meta::{HeartbeatRequest, Peer};
+use api::v1::meta::{HeartbeatRequest, Peer, Role};
 use common_grpc::channel_manager::{ChannelConfig, ChannelManager};
-use meta_client::client::MetaClientBuilder;
-use meta_client::rpc::{
-    BatchPutRequest, CompareAndPutRequest, CreateRequest, DeleteRangeRequest, Partition,
-    PutRequest, RangeRequest, TableName,
+use common_meta::rpc::store::{
+    BatchDeleteRequest, BatchGetRequest, BatchPutRequest, CompareAndPutRequest, DeleteRangeRequest,
+    PutRequest, RangeRequest,
 };
+use meta_client::client::MetaClientBuilder;
 use tracing::{event, subscriber, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -37,7 +37,7 @@ async fn run() {
         .connect_timeout(Duration::from_secs(5))
         .tcp_nodelay(true);
     let channel_manager = ChannelManager::with_config(config);
-    let mut meta_client = MetaClientBuilder::new(id.0, id.1)
+    let mut meta_client = MetaClientBuilder::new(id.0, id.1, Role::Datanode)
         .enable_heartbeat()
         .enable_router()
         .enable_store()
@@ -50,7 +50,7 @@ async fn run() {
     let (sender, mut receiver) = meta_client.heartbeat().await.unwrap();
 
     // send heartbeats
-    tokio::spawn(async move {
+    let _handle = tokio::spawn(async move {
         for _ in 0..5 {
             let req = HeartbeatRequest {
                 peer: Some(Peer {
@@ -64,30 +64,11 @@ async fn run() {
         tokio::time::sleep(Duration::from_secs(10)).await;
     });
 
-    tokio::spawn(async move {
+    let _handle = tokio::spawn(async move {
         while let Some(res) = receiver.message().await.unwrap() {
-            event!(Level::INFO, "heartbeat response: {:#?}", res);
+            event!(Level::TRACE, "heartbeat response: {:#?}", res);
         }
     });
-
-    let p1 = Partition {
-        column_list: vec![b"col_1".to_vec(), b"col_2".to_vec()],
-        value_list: vec![b"k1".to_vec(), b"k2".to_vec()],
-    };
-
-    let p2 = Partition {
-        column_list: vec![b"col_1".to_vec(), b"col_2".to_vec()],
-        value_list: vec![b"Max1".to_vec(), b"Max2".to_vec()],
-    };
-
-    let table_name = TableName::new("test_catalog", "test_schema", "test_table");
-
-    let create_req = CreateRequest::new(table_name)
-        .add_partition(p1)
-        .add_partition(p2);
-
-    let res = meta_client.create_route(create_req).await;
-    event!(Level::INFO, "create_route result: {:#?}", res);
 
     // put
     let put = PutRequest::new()
@@ -140,4 +121,28 @@ async fn run() {
     // get none
     let res = meta_client.range(range).await.unwrap();
     event!(Level::INFO, "get range result: {:#?}", res);
+
+    // batch delete
+    // put two
+    let batch_put = BatchPutRequest::new()
+        .add_kv(b"batch_put1".to_vec(), b"batch_put_v1".to_vec())
+        .add_kv(b"batch_put2".to_vec(), b"batch_put_v2".to_vec())
+        .with_prev_kv();
+    let res = meta_client.batch_put(batch_put).await.unwrap();
+    event!(Level::INFO, "batch put result: {:#?}", res);
+
+    // delete one
+    let batch_delete = BatchDeleteRequest::new()
+        .add_key(b"batch_put1".to_vec())
+        .with_prev_kv();
+    let res = meta_client.batch_delete(batch_delete).await.unwrap();
+    event!(Level::INFO, "batch delete result: {:#?}", res);
+
+    // get other one
+    let batch_get = BatchGetRequest::new()
+        .add_key(b"batch_put1".to_vec())
+        .add_key(b"batch_put2".to_vec());
+
+    let res = meta_client.batch_get(batch_get).await.unwrap();
+    event!(Level::INFO, "batch get result: {:#?}", res);
 }

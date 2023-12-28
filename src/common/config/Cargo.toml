@@ -1,0 +1,14 @@
+[package]
+name = "common-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common-base.workspace = true
+humantime-serde.workspace = true
+rskafka.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_with = "3"
+toml.workspace = true

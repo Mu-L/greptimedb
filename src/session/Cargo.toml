@@ -1,9 +1,18 @@
 [package]
 name = "session"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+testing = []
 
 [dependencies]
+api.workspace = true
 arc-swap = "1.5"
-common-telemetry = { path = "../common/telemetry" }
+auth.workspace = true
+common-catalog.workspace = true
+common-telemetry.workspace = true
+common-time.workspace = true
+derive_builder.workspace = true
+sql.workspace = true

@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,22 +14,11 @@
 
 #![feature(assert_matches)]
 
-mod catalog;
-mod datanode;
 pub mod error;
-mod expr_factory;
 pub mod frontend;
-pub mod grpc;
-pub mod influxdb;
+pub mod heartbeat;
 pub mod instance;
-pub mod mysql;
-pub mod opentsdb;
-pub mod partitioning;
-pub mod postgres;
-pub mod prometheus;
+pub(crate) mod metrics;
+mod script;
 mod server;
-pub mod spliter;
-mod sql;
-mod table;
-#[cfg(test)]
-mod tests;
+pub mod service_config;

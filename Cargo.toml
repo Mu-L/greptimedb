@@ -2,43 +2,202 @@
 members = [
     "benchmarks",
     "src/api",
+    "src/auth",
     "src/catalog",
     "src/client",
     "src/cmd",
     "src/common/base",
     "src/common/catalog",
+    "src/common/config",
+    "src/common/datasource",
     "src/common/error",
     "src/common/function",
-    "src/common/function-macro",
+    "src/common/macro",
+    "src/common/greptimedb-telemetry",
     "src/common/grpc",
     "src/common/grpc-expr",
+    "src/common/mem-prof",
+    "src/common/meta",
+    "src/common/procedure",
+    "src/common/procedure-test",
     "src/common/query",
     "src/common/recordbatch",
     "src/common/runtime",
     "src/common/substrait",
     "src/common/telemetry",
+    "src/common/test-util",
     "src/common/time",
+    "src/common/decimal",
+    "src/common/version",
     "src/datanode",
     "src/datatypes",
-    "src/datatypes2",
+    "src/file-engine",
     "src/frontend",
     "src/log-store",
     "src/meta-client",
     "src/meta-srv",
-    "src/mito",
+    "src/metric-engine",
+    "src/mito2",
     "src/object-store",
+    "src/operator",
+    "src/partition",
+    "src/plugins",
     "src/promql",
+    "src/puffin",
     "src/query",
     "src/script",
     "src/servers",
     "src/session",
     "src/sql",
-    "src/storage",
     "src/store-api",
     "src/table",
+    "src/index",
     "tests-integration",
     "tests/runner",
 ]
+resolver = "2"
+
+[workspace.package]
+version = "0.5.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+ahash = { version = "0.8", features = ["compile-time-rng"] }
+aquamarine = "0.3"
+arrow = { version = "47.0" }
+arrow-array = "47.0"
+arrow-flight = "47.0"
+arrow-schema = { version = "47.0", features = ["serde"] }
+async-stream = "0.3"
+async-trait = "0.1"
+base64 = "0.21"
+bigdecimal = "0.4.2"
+bitflags = "2.4.1"
+bytemuck = "1.12"
+bytes = { version = "1.5", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "5.4"
+datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev = "26e43acac3a96cec8dd4c8365f22dfb1a84306e9" }
+datafusion-common = { git = "https://github.com/apache/arrow-datafusion.git", rev = "26e43acac3a96cec8dd4c8365f22dfb1a84306e9" }
+datafusion-expr = { git = "https://github.com/apache/arrow-datafusion.git", rev = "26e43acac3a96cec8dd4c8365f22dfb1a84306e9" }
+datafusion-optimizer = { git = "https://github.com/apache/arrow-datafusion.git", rev = "26e43acac3a96cec8dd4c8365f22dfb1a84306e9" }
+datafusion-physical-expr = { git = "https://github.com/apache/arrow-datafusion.git", rev = "26e43acac3a96cec8dd4c8365f22dfb1a84306e9" }
+datafusion-sql = { git = "https://github.com/apache/arrow-datafusion.git", rev = "26e43acac3a96cec8dd4c8365f22dfb1a84306e9" }
+datafusion-substrait = { git = "https://github.com/apache/arrow-datafusion.git", rev = "26e43acac3a96cec8dd4c8365f22dfb1a84306e9" }
+derive_builder = "0.12"
+etcd-client = "0.12"
+fst = "0.4.7"
+futures = "0.3"
+futures-util = "0.3"
+greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "a31ea166fc015ea7ff111ac94e26c3a5d64364d2" }
+humantime-serde = "1.1"
+itertools = "0.10"
+lazy_static = "1.4"
+meter-core = { git = "https://github.com/GreptimeTeam/greptime-meter.git", rev = "abbd357c1e193cd270ea65ee7652334a150b628f" }
+mockall = "0.11.4"
+moka = "0.12"
+once_cell = "1.18"
+opentelemetry-proto = { git = "https://github.com/waynexia/opentelemetry-rust.git", rev = "33841b38dda79b15f2024952be5f32533325ca02", features = [
+    "gen-tonic",
+    "metrics",
+    "trace",
+] }
+parquet = "47.0"
+paste = "1.0"
+pin-project = "1.0"
+prometheus = { version = "0.13.3", features = ["process"] }
+prost = "0.12"
+raft-engine = { git = "https://github.com/tikv/raft-engine.git", rev = "22dfb426cd994602b57725ef080287d3e53db479" }
+rand = "0.8"
+regex = "1.8"
+regex-automata = { version = "0.1", features = ["transducer"] }
+reqwest = { version = "0.11", default-features = false, features = [
+    "json",
+    "rustls-tls-native-roots",
+    "stream",
+] }
+rskafka = "0.5"
+rust_decimal = "1.33"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+smallvec = "1"
+snafu = "0.7"
+# on branch v0.38.x
+sqlparser = { git = "https://github.com/GreptimeTeam/sqlparser-rs.git", rev = "6a93567ae38d42be5c8d08b13c8ff4dde26502ef", features = [
+    "visitor",
+] }
+strum = { version = "0.25", features = ["derive"] }
+tempfile = "3"
+tokio = { version = "1.28", features = ["full"] }
+tokio-stream = { version = "0.1" }
+tokio-util = { version = "0.7", features = ["io-util", "compat"] }
+toml = "0.8.8"
+tonic = { version = "0.10", features = ["tls"] }
+uuid = { version = "1", features = ["serde", "v4", "fast-rng"] }
+
+## workspaces members
+api = { path = "src/api" }
+auth = { path = "src/auth" }
+catalog = { path = "src/catalog" }
+client = { path = "src/client" }
+cmd = { path = "src/cmd" }
+common-base = { path = "src/common/base" }
+common-catalog = { path = "src/common/catalog" }
+common-config = { path = "src/common/config" }
+common-datasource = { path = "src/common/datasource" }
+common-decimal = { path = "src/common/decimal" }
+common-error = { path = "src/common/error" }
+common-function = { path = "src/common/function" }
+common-greptimedb-telemetry = { path = "src/common/greptimedb-telemetry" }
+common-grpc = { path = "src/common/grpc" }
+common-grpc-expr = { path = "src/common/grpc-expr" }
+common-macro = { path = "src/common/macro" }
+common-mem-prof = { path = "src/common/mem-prof" }
+common-meta = { path = "src/common/meta" }
+common-pprof = { path = "src/common/pprof" }
+common-procedure = { path = "src/common/procedure" }
+common-procedure-test = { path = "src/common/procedure-test" }
+common-query = { path = "src/common/query" }
+common-recordbatch = { path = "src/common/recordbatch" }
+common-runtime = { path = "src/common/runtime" }
+common-telemetry = { path = "src/common/telemetry" }
+common-test-util = { path = "src/common/test-util" }
+common-time = { path = "src/common/time" }
+common-version = { path = "src/common/version" }
+datanode = { path = "src/datanode" }
+datatypes = { path = "src/datatypes" }
+file-engine = { path = "src/file-engine" }
+frontend = { path = "src/frontend" }
+log-store = { path = "src/log-store" }
+meta-client = { path = "src/meta-client" }
+meta-srv = { path = "src/meta-srv" }
+metric-engine = { path = "src/metric-engine" }
+mito2 = { path = "src/mito2" }
+object-store = { path = "src/object-store" }
+operator = { path = "src/operator" }
+partition = { path = "src/partition" }
+plugins = { path = "src/plugins" }
+promql = { path = "src/promql" }
+query = { path = "src/query" }
+script = { path = "src/script" }
+servers = { path = "src/servers" }
+session = { path = "src/session" }
+sql = { path = "src/sql" }
+store-api = { path = "src/store-api" }
+substrait = { path = "src/common/substrait" }
+table = { path = "src/table" }
+
+[workspace.dependencies.meter-macros]
+git = "https://github.com/GreptimeTeam/greptime-meter.git"
+rev = "abbd357c1e193cd270ea65ee7652334a150b628f"
 
 [profile.release]
-debug = true
+debug = 1
+
+[profile.nightly]
+inherits = "release"
+strip = true
+lto = "thin"
+debug = false
+incremental = false

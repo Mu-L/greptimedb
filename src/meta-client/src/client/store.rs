@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,11 +17,12 @@ use std::sync::Arc;
 
 use api::v1::meta::store_client::StoreClient;
 use api::v1::meta::{
-    BatchPutRequest, BatchPutResponse, CompareAndPutRequest, CompareAndPutResponse,
-    DeleteRangeRequest, DeleteRangeResponse, MoveValueRequest, MoveValueResponse, PutRequest,
-    PutResponse, RangeRequest, RangeResponse,
+    BatchDeleteRequest, BatchDeleteResponse, BatchGetRequest, BatchGetResponse, BatchPutRequest,
+    BatchPutResponse, CompareAndPutRequest, CompareAndPutResponse, DeleteRangeRequest,
+    DeleteRangeResponse, PutRequest, PutResponse, RangeRequest, RangeResponse, Role,
 };
 use common_grpc::channel_manager::ChannelManager;
+use common_telemetry::tracing_context::TracingContext;
 use snafu::{ensure, OptionExt, ResultExt};
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
@@ -36,9 +37,10 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(id: Id, channel_manager: ChannelManager) -> Self {
+    pub fn new(id: Id, role: Role, channel_manager: ChannelManager) -> Self {
         let inner = Arc::new(RwLock::new(Inner {
             id,
+            role,
             channel_manager,
             peers: vec![],
         }));
@@ -70,9 +72,19 @@ impl Client {
         inner.put(req).await
     }
 
+    pub async fn batch_get(&self, req: BatchGetRequest) -> Result<BatchGetResponse> {
+        let inner = self.inner.read().await;
+        inner.batch_get(req).await
+    }
+
     pub async fn batch_put(&self, req: BatchPutRequest) -> Result<BatchPutResponse> {
         let inner = self.inner.read().await;
         inner.batch_put(req).await
+    }
+
+    pub async fn batch_delete(&self, req: BatchDeleteRequest) -> Result<BatchDeleteResponse> {
+        let inner = self.inner.read().await;
+        inner.batch_delete(req).await
     }
 
     pub async fn compare_and_put(
@@ -87,16 +99,12 @@ impl Client {
         let inner = self.inner.read().await;
         inner.delete_range(req).await
     }
-
-    pub async fn move_value(&self, req: MoveValueRequest) -> Result<MoveValueResponse> {
-        let inner = self.inner.read().await;
-        inner.move_value(req).await
-    }
 }
 
 #[derive(Debug)]
 struct Inner {
     id: Id,
+    role: Role,
     channel_manager: ChannelManager,
     peers: Vec<String>,
 }
@@ -127,27 +135,61 @@ impl Inner {
 
     async fn range(&self, mut req: RangeRequest) -> Result<RangeResponse> {
         let mut client = self.random_client()?;
-        req.set_header(self.id);
-        let res = client.range(req).await.context(error::TonicStatusSnafu)?;
+        req.set_header(
+            self.id,
+            self.role,
+            TracingContext::from_current_span().to_w3c(),
+        );
+        let res = client.range(req).await.map_err(error::Error::from)?;
 
         Ok(res.into_inner())
     }
 
     async fn put(&self, mut req: PutRequest) -> Result<PutResponse> {
         let mut client = self.random_client()?;
-        req.set_header(self.id);
-        let res = client.put(req).await.context(error::TonicStatusSnafu)?;
+        req.set_header(
+            self.id,
+            self.role,
+            TracingContext::from_current_span().to_w3c(),
+        );
+        let res = client.put(req).await.map_err(error::Error::from)?;
+
+        Ok(res.into_inner())
+    }
+
+    async fn batch_get(&self, mut req: BatchGetRequest) -> Result<BatchGetResponse> {
+        let mut client = self.random_client()?;
+        req.set_header(
+            self.id,
+            self.role,
+            TracingContext::from_current_span().to_w3c(),
+        );
+
+        let res = client.batch_get(req).await.map_err(error::Error::from)?;
 
         Ok(res.into_inner())
     }
 
     async fn batch_put(&self, mut req: BatchPutRequest) -> Result<BatchPutResponse> {
         let mut client = self.random_client()?;
-        req.set_header(self.id);
-        let res = client
-            .batch_put(req)
-            .await
-            .context(error::TonicStatusSnafu)?;
+        req.set_header(
+            self.id,
+            self.role,
+            TracingContext::from_current_span().to_w3c(),
+        );
+        let res = client.batch_put(req).await.map_err(error::Error::from)?;
+
+        Ok(res.into_inner())
+    }
+
+    async fn batch_delete(&self, mut req: BatchDeleteRequest) -> Result<BatchDeleteResponse> {
+        let mut client = self.random_client()?;
+        req.set_header(
+            self.id,
+            self.role,
+            TracingContext::from_current_span().to_w3c(),
+        );
+        let res = client.batch_delete(req).await.map_err(error::Error::from)?;
 
         Ok(res.into_inner())
     }
@@ -157,33 +199,27 @@ impl Inner {
         mut req: CompareAndPutRequest,
     ) -> Result<CompareAndPutResponse> {
         let mut client = self.random_client()?;
-        req.set_header(self.id);
+        req.set_header(
+            self.id,
+            self.role,
+            TracingContext::from_current_span().to_w3c(),
+        );
         let res = client
             .compare_and_put(req)
             .await
-            .context(error::TonicStatusSnafu)?;
+            .map_err(error::Error::from)?;
 
         Ok(res.into_inner())
     }
 
     async fn delete_range(&self, mut req: DeleteRangeRequest) -> Result<DeleteRangeResponse> {
         let mut client = self.random_client()?;
-        req.set_header(self.id);
-        let res = client
-            .delete_range(req)
-            .await
-            .context(error::TonicStatusSnafu)?;
-
-        Ok(res.into_inner())
-    }
-
-    async fn move_value(&self, mut req: MoveValueRequest) -> Result<MoveValueResponse> {
-        let mut client = self.random_client()?;
-        req.set_header(self.id);
-        let res = client
-            .move_value(req)
-            .await
-            .context(error::TonicStatusSnafu)?;
+        req.set_header(
+            self.id,
+            self.role,
+            TracingContext::from_current_span().to_w3c(),
+        );
+        let res = client.delete_range(req).await.map_err(error::Error::from)?;
 
         Ok(res.into_inner())
     }
@@ -220,7 +256,7 @@ mod test {
 
     #[tokio::test]
     async fn test_start_client() {
-        let mut client = Client::new((0, 0), ChannelManager::default());
+        let mut client = Client::new((0, 0), Role::Frontend, ChannelManager::default());
         assert!(!client.is_started().await);
         client
             .start(&["127.0.0.1:1000", "127.0.0.1:1001"])
@@ -231,7 +267,7 @@ mod test {
 
     #[tokio::test]
     async fn test_already_start() {
-        let mut client = Client::new((0, 0), ChannelManager::default());
+        let mut client = Client::new((0, 0), Role::Frontend, ChannelManager::default());
         client
             .start(&["127.0.0.1:1000", "127.0.0.1:1001"])
             .await
@@ -247,7 +283,7 @@ mod test {
 
     #[tokio::test]
     async fn test_start_with_duplicate_peers() {
-        let mut client = Client::new((0, 0), ChannelManager::default());
+        let mut client = Client::new((0, 0), Role::Frontend, ChannelManager::default());
         client
             .start(&["127.0.0.1:1000", "127.0.0.1:1000", "127.0.0.1:1000"])
             .await

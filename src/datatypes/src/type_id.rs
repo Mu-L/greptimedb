@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -30,6 +30,8 @@ pub enum LogicalTypeId {
     Float32,
     Float64,
 
+    Decimal128,
+
     // String types:
     String,
     Binary,
@@ -42,9 +44,30 @@ pub enum LogicalTypeId {
     /// seconds/milliseconds/microseconds/nanoseconds, determined by precision.
     DateTime,
 
-    Timestamp,
+    TimestampSecond,
+    TimestampMillisecond,
+    TimestampMicrosecond,
+    TimestampNanosecond,
+    /// A 64-bit time representing the elapsed time since midnight in the unit of `TimeUnit`.
+    TimeSecond,
+    TimeMillisecond,
+    TimeMicrosecond,
+    TimeNanosecond,
+    /// A 64-bit duration representing the elapsed time in either seconds,
+    /// milliseconds, microseconds or nanoseconds.
+    DurationSecond,
+    DurationMillisecond,
+    DurationMicrosecond,
+    DurationNanosecond,
+    /// A 32-bit interval representing the elapsed time in months.
+    IntervalYearMonth,
+    /// A 64-bit interval representing the elapsed time in days and milliseconds.
+    IntervalDayTime,
+    /// A 128-bit interval representing the elapsed time in months, days and nanoseconds.
+    IntervalMonthDayNano,
 
     List,
+    Dictionary,
 }
 
 impl LogicalTypeId {
@@ -74,10 +97,35 @@ impl LogicalTypeId {
             LogicalTypeId::Binary => ConcreteDataType::binary_datatype(),
             LogicalTypeId::Date => ConcreteDataType::date_datatype(),
             LogicalTypeId::DateTime => ConcreteDataType::datetime_datatype(),
-            LogicalTypeId::Timestamp => ConcreteDataType::timestamp_millis_datatype(), // to timestamp type with default time unit
+            LogicalTypeId::TimestampSecond => ConcreteDataType::timestamp_second_datatype(),
+            LogicalTypeId::TimestampMillisecond => {
+                ConcreteDataType::timestamp_millisecond_datatype()
+            }
+            LogicalTypeId::TimestampMicrosecond => {
+                ConcreteDataType::timestamp_microsecond_datatype()
+            }
+            LogicalTypeId::TimestampNanosecond => ConcreteDataType::timestamp_nanosecond_datatype(),
             LogicalTypeId::List => {
                 ConcreteDataType::list_datatype(ConcreteDataType::null_datatype())
             }
+            LogicalTypeId::Dictionary => ConcreteDataType::dictionary_datatype(
+                ConcreteDataType::null_datatype(),
+                ConcreteDataType::null_datatype(),
+            ),
+            LogicalTypeId::TimeSecond => ConcreteDataType::time_second_datatype(),
+            LogicalTypeId::TimeMillisecond => ConcreteDataType::time_millisecond_datatype(),
+            LogicalTypeId::TimeMicrosecond => ConcreteDataType::time_microsecond_datatype(),
+            LogicalTypeId::TimeNanosecond => ConcreteDataType::time_nanosecond_datatype(),
+            LogicalTypeId::IntervalYearMonth => ConcreteDataType::interval_year_month_datatype(),
+            LogicalTypeId::IntervalDayTime => ConcreteDataType::interval_day_time_datatype(),
+            LogicalTypeId::IntervalMonthDayNano => {
+                ConcreteDataType::interval_month_day_nano_datatype()
+            }
+            LogicalTypeId::DurationSecond => ConcreteDataType::duration_second_datatype(),
+            LogicalTypeId::DurationMillisecond => ConcreteDataType::duration_millisecond_datatype(),
+            LogicalTypeId::DurationMicrosecond => ConcreteDataType::duration_microsecond_datatype(),
+            LogicalTypeId::DurationNanosecond => ConcreteDataType::duration_nanosecond_datatype(),
+            LogicalTypeId::Decimal128 => ConcreteDataType::decimal128_default_datatype(),
         }
     }
 }

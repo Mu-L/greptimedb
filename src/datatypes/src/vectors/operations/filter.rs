@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,16 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use crate::vectors::constant::filter_constant;
-
 macro_rules! filter_non_constant {
     ($vector: expr, $VectorType: ty, $filter: ident) => {{
         use std::sync::Arc;
 
+        use arrow::compute;
         use snafu::ResultExt;
 
         let arrow_array = $vector.as_arrow();
-        let filtered = arrow::compute::filter::filter(arrow_array, $filter.as_boolean_array())
+        let filtered = compute::filter(arrow_array, $filter.as_boolean_array())
             .context(crate::error::ArrowComputeSnafu)?;
         Ok(Arc::new(<$VectorType>::try_from_arrow_array(filtered)?))
     }};
@@ -33,17 +32,24 @@ pub(crate) use filter_non_constant;
 mod tests {
     use std::sync::Arc;
 
+    use common_time::{Date, DateTime};
+
     use crate::scalars::ScalarVector;
+    use crate::timestamp::{
+        TimestampMicrosecond, TimestampMillisecond, TimestampNanosecond, TimestampSecond,
+    };
+    use crate::types::WrapperType;
+    use crate::vectors::constant::ConstantVector;
     use crate::vectors::{
-        BooleanVector, ConstantVector, Int32Vector, NullVector, StringVector, VectorOp, VectorRef,
+        BooleanVector, Int32Vector, NullVector, StringVector, VectorOp, VectorRef,
     };
 
     fn check_filter_primitive(expect: &[i32], input: &[i32], filter: &[bool]) {
-        let v = Int32Vector::from_slice(&input);
+        let v = Int32Vector::from_slice(input);
         let filter = BooleanVector::from_slice(filter);
         let out = v.filter(&filter).unwrap();
 
-        let expect: VectorRef = Arc::new(Int32Vector::from_slice(&expect));
+        let expect: VectorRef = Arc::new(Int32Vector::from_slice(expect));
         assert_eq!(expect, out);
     }
 
@@ -62,7 +68,7 @@ mod tests {
     }
 
     fn check_filter_constant(expect_length: usize, input_length: usize, filter: &[bool]) {
-        let v = ConstantVector::new(Arc::new(Int32Vector::from_slice(&[123])), input_length);
+        let v = ConstantVector::new(Arc::new(Int32Vector::from_slice([123])), input_length);
         let filter = BooleanVector::from_slice(filter);
         let out = v.filter(&filter).unwrap();
 
@@ -105,7 +111,6 @@ mod tests {
         ($VectorType: ident, $ValueType: ident, $method: ident) => {{
             use std::sync::Arc;
 
-            use common_time::$ValueType;
             use $crate::vectors::{$VectorType, VectorRef};
 
             let v = $VectorType::from_iterator((0..5).map($ValueType::$method));
@@ -123,6 +128,18 @@ mod tests {
     fn test_filter_date_like() {
         impl_filter_date_like_test!(DateVector, Date, new);
         impl_filter_date_like_test!(DateTimeVector, DateTime, new);
-        impl_filter_date_like_test!(TimestampVector, Timestamp, from_millis);
+
+        impl_filter_date_like_test!(TimestampSecondVector, TimestampSecond, from_native);
+        impl_filter_date_like_test!(
+            TimestampMillisecondVector,
+            TimestampMillisecond,
+            from_native
+        );
+        impl_filter_date_like_test!(
+            TimestampMicrosecondVector,
+            TimestampMicrosecond,
+            from_native
+        );
+        impl_filter_date_like_test!(TimestampNanosecondVector, TimestampNanosecond, from_native);
     }
 }

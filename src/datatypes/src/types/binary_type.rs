@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::DataType as ArrowDataType;
-use common_base::bytes::StringBytes;
+use common_base::bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::data_type::{DataType, DataTypeRef};
@@ -24,7 +24,7 @@ use crate::type_id::LogicalTypeId;
 use crate::value::Value;
 use crate::vectors::{BinaryVectorBuilder, MutableVector};
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BinaryType;
 
 impl BinaryType {
@@ -34,8 +34,8 @@ impl BinaryType {
 }
 
 impl DataType for BinaryType {
-    fn name(&self) -> &str {
-        "Binary"
+    fn name(&self) -> String {
+        "Binary".to_string()
     }
 
     fn logical_type_id(&self) -> LogicalTypeId {
@@ -43,7 +43,7 @@ impl DataType for BinaryType {
     }
 
     fn default_value(&self) -> Value {
-        StringBytes::default().into()
+        Bytes::default().into()
     }
 
     fn as_arrow_type(&self) -> ArrowDataType {
@@ -52,5 +52,13 @@ impl DataType for BinaryType {
 
     fn create_mutable_vector(&self, capacity: usize) -> Box<dyn MutableVector> {
         Box::new(BinaryVectorBuilder::with_capacity(capacity))
+    }
+
+    fn try_cast(&self, from: Value) -> Option<Value> {
+        match from {
+            Value::Binary(v) => Some(Value::Binary(v)),
+            Value::String(v) => Some(Value::Binary(Bytes::from(v.as_utf8().as_bytes()))),
+            _ => None,
+        }
     }
 }

@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,31 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::Exclusive;
 
+use ::auth::{userinfo_by_name, Identity, Password, UserInfoRef, UserProviderRef};
 use async_trait::async_trait;
+use common_catalog::parse_catalog_and_schema_from_db_string;
+use common_error::ext::ErrorExt;
 use futures::{Sink, SinkExt};
-use pgwire::api::auth::{ServerParameterProvider, StartupHandler};
+use pgwire::api::auth::StartupHandler;
 use pgwire::api::{auth, ClientInfo, PgWireConnectionState};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::response::ErrorResponse;
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
-use snafu::ResultExt;
+use session::Session;
+use snafu::IntoError;
 
-use crate::auth::{Identity, Password, UserProviderRef};
-use crate::error;
-use crate::error::Result;
+use super::PostgresServerHandler;
+use crate::error::{AuthSnafu, Result};
+use crate::metrics::METRIC_AUTH_FAILURE;
+use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 
-struct PgPwdVerifier {
+pub(crate) struct PgLoginVerifier {
     user_provider: Option<UserProviderRef>,
+}
+
+impl PgLoginVerifier {
+    pub(crate) fn new(user_provider: Option<UserProviderRef>) -> Self {
+        Self { user_provider }
+    }
 }
 
 #[allow(dead_code)]
 struct LoginInfo {
     user: Option<String>,
-    database: Option<String>,
+    catalog: Option<String>,
+    schema: Option<String>,
     host: String,
 }
 
@@ -47,87 +59,78 @@ impl LoginInfo {
     {
         LoginInfo {
             user: client.metadata().get(super::METADATA_USER).map(Into::into),
-            database: client
+            catalog: client
                 .metadata()
-                .get(super::METADATA_DATABASE)
+                .get(super::METADATA_CATALOG)
+                .map(Into::into),
+            schema: client
+                .metadata()
+                .get(super::METADATA_SCHEMA)
                 .map(Into::into),
             host: client.socket_addr().ip().to_string(),
         }
     }
 }
 
-impl PgPwdVerifier {
-    async fn verify_pwd(&self, password: &str, login: LoginInfo) -> Result<bool> {
-        if let Some(user_provider) = &self.user_provider {
-            let user_name = match login.user {
-                Some(name) => name,
-                None => return Ok(false),
-            };
+impl PgLoginVerifier {
+    async fn auth(&self, login: &LoginInfo, password: &str) -> Result<Option<UserInfoRef>> {
+        let user_provider = match &self.user_provider {
+            Some(provider) => provider,
+            None => return Ok(None),
+        };
 
-            // TODO(fys): pass user_info to context
-            let _user_info = user_provider
-                .auth(
-                    Identity::UserId(&user_name, None),
-                    Password::PlainText(password),
-                )
-                .await
-                .context(error::AuthSnafu)?;
-        }
-        Ok(true)
-    }
-}
+        let user_name = match &login.user {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+        let catalog = match &login.catalog {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+        let schema = match &login.schema {
+            Some(name) => name,
+            None => return Ok(None),
+        };
 
-struct GreptimeDBStartupParameters {
-    version: &'static str,
-}
-
-impl GreptimeDBStartupParameters {
-    fn new() -> GreptimeDBStartupParameters {
-        GreptimeDBStartupParameters {
-            version: env!("CARGO_PKG_VERSION"),
-        }
-    }
-}
-
-impl ServerParameterProvider for GreptimeDBStartupParameters {
-    fn server_parameters<C>(&self, _client: &C) -> Option<HashMap<String, String>>
-    where
-        C: ClientInfo,
-    {
-        let mut params = HashMap::with_capacity(4);
-        params.insert("server_version".to_owned(), self.version.to_owned());
-        params.insert("server_encoding".to_owned(), "UTF8".to_owned());
-        params.insert("client_encoding".to_owned(), "UTF8".to_owned());
-        params.insert("DateStyle".to_owned(), "ISO YMD".to_owned());
-
-        Some(params)
-    }
-}
-
-pub struct PgAuthStartupHandler {
-    verifier: PgPwdVerifier,
-    param_provider: GreptimeDBStartupParameters,
-    with_pwd: bool,
-    force_tls: bool,
-}
-
-impl PgAuthStartupHandler {
-    pub fn new(with_pwd: bool, user_provider: Option<UserProviderRef>, force_tls: bool) -> Self {
-        PgAuthStartupHandler {
-            verifier: PgPwdVerifier { user_provider },
-            param_provider: GreptimeDBStartupParameters::new(),
-            with_pwd,
-            force_tls,
+        match user_provider
+            .auth(
+                Identity::UserId(user_name, None),
+                Password::PlainText(password.to_string().into()),
+                catalog,
+                schema,
+            )
+            .await
+        {
+            Err(e) => {
+                METRIC_AUTH_FAILURE
+                    .with_label_values(&[e.status_code().as_ref()])
+                    .inc();
+                Err(AuthSnafu.into_error(e))
+            }
+            Ok(user_info) => Ok(Some(user_info)),
         }
     }
+}
+
+fn set_client_info<C>(client: &C, session: &Session)
+where
+    C: ClientInfo,
+{
+    if let Some(current_catalog) = client.metadata().get(super::METADATA_CATALOG) {
+        session.set_catalog(current_catalog.clone());
+    }
+    if let Some(current_schema) = client.metadata().get(super::METADATA_SCHEMA) {
+        session.set_schema(current_schema.clone());
+    }
+    // set userinfo outside
 }
 
 #[async_trait]
-impl StartupHandler for PgAuthStartupHandler {
+impl StartupHandler for PostgresServerHandler {
     async fn on_startup<C>(
         &self,
         client: &mut C,
-        message: &PgWireFrontendMessage,
+        message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
@@ -136,22 +139,28 @@ impl StartupHandler for PgAuthStartupHandler {
     {
         match message {
             PgWireFrontendMessage::Startup(ref startup) => {
+                // check ssl requirement
                 if !client.is_secure() && self.force_tls {
-                    let error_info = ErrorInfo::new(
-                        "FATAL".to_owned(),
-                        "28000".to_owned(),
-                        "No encryption".to_owned(),
-                    );
-                    let error = ErrorResponse::from(error_info);
-
-                    client
-                        .feed(PgWireBackendMessage::ErrorResponse(error))
-                        .await?;
-                    client.close().await?;
+                    send_error(client, "FATAL", "28000", "No encryption".to_owned()).await?;
                     return Ok(());
                 }
+
                 auth::save_startup_parameters_to_metadata(client, startup);
-                if self.with_pwd {
+
+                // check if db is valid
+                match resolve_db_info(Exclusive::new(client), self.query_handler.clone()).await? {
+                    DbResolution::Resolved(catalog, schema) => {
+                        let metadata = client.metadata_mut();
+                        let _ = metadata.insert(super::METADATA_CATALOG.to_owned(), catalog);
+                        let _ = metadata.insert(super::METADATA_SCHEMA.to_owned(), schema);
+                    }
+                    DbResolution::NotFound(msg) => {
+                        send_error(client, "FATAL", "3D000", msg).await?;
+                        return Ok(());
+                    }
+                }
+
+                if self.login_verifier.user_provider.is_some() {
                     client.set_state(PgWireConnectionState::AuthenticationInProgress);
                     client
                         .send(PgWireBackendMessage::Authentication(
@@ -159,29 +168,87 @@ impl StartupHandler for PgAuthStartupHandler {
                         ))
                         .await?;
                 } else {
-                    auth::finish_authentication(client, &self.param_provider).await;
+                    self.session.set_user_info(userinfo_by_name(
+                        client.metadata().get(super::METADATA_USER).cloned(),
+                    ));
+                    set_client_info(client, &self.session);
+                    auth::finish_authentication(client, self.param_provider.as_ref()).await;
                 }
             }
-            PgWireFrontendMessage::Password(ref pwd) => {
-                let login_info = LoginInfo::from_client_info(client);
-                if let Ok(true) = self.verifier.verify_pwd(pwd.password(), login_info).await {
-                    auth::finish_authentication(client, &self.param_provider).await
-                } else {
-                    let error_info = ErrorInfo::new(
-                        "FATAL".to_owned(),
-                        "28P01".to_owned(),
-                        "Password authentication failed".to_owned(),
-                    );
-                    let error = ErrorResponse::from(error_info);
+            PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
+                // the newer version of pgwire has a few variant password
+                // message like cleartext/md5 password, saslresponse, etc. Here
+                // we must manually coerce it into password
+                let pwd = pwd.into_password()?;
 
-                    client
-                        .feed(PgWireBackendMessage::ErrorResponse(error))
-                        .await?;
-                    client.close().await?;
+                let login_info = LoginInfo::from_client_info(client);
+
+                // do authenticate
+                let auth_result = self.login_verifier.auth(&login_info, pwd.password()).await;
+
+                if let Ok(Some(user_info)) = auth_result {
+                    self.session.set_user_info(user_info);
+                    set_client_info(client, &self.session);
+                    auth::finish_authentication(client, self.param_provider.as_ref()).await;
+                } else {
+                    return send_error(
+                        client,
+                        "FATAL",
+                        "28P01",
+                        "password authentication failed".to_owned(),
+                    )
+                    .await;
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+}
+
+async fn send_error<C>(client: &mut C, level: &str, code: &str, message: String) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let error = ErrorResponse::from(ErrorInfo::new(level.to_owned(), code.to_owned(), message));
+    client
+        .feed(PgWireBackendMessage::ErrorResponse(error))
+        .await?;
+    client.close().await?;
+    Ok(())
+}
+
+enum DbResolution {
+    Resolved(String, String),
+    NotFound(String),
+}
+
+/// A function extracted to resolve lifetime and readability issues:
+async fn resolve_db_info<C>(
+    client: Exclusive<&mut C>,
+    query_handler: ServerSqlQueryHandlerRef,
+) -> PgWireResult<DbResolution>
+where
+    C: ClientInfo + Unpin + Send,
+{
+    let db_ref = client.into_inner().metadata().get(super::METADATA_DATABASE);
+    if let Some(db) = db_ref {
+        let (catalog, schema) = parse_catalog_and_schema_from_db_string(db);
+        if query_handler
+            .is_valid_schema(catalog, schema)
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+        {
+            Ok(DbResolution::Resolved(
+                catalog.to_owned(),
+                schema.to_owned(),
+            ))
+        } else {
+            Ok(DbResolution::NotFound(format!("Database not found: {db}")))
+        }
+    } else {
+        Ok(DbResolution::NotFound("Database not specified".to_owned()))
     }
 }

@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,19 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use api::v1::column::SemanticType;
-use api::v1::{column, Column, ColumnDataType, InsertExpr};
-use common_catalog::consts::DEFAULT_SCHEMA_NAME;
-use common_grpc::writer::Precision;
-use table::requests::InsertRequest;
+use api::v1::{column, Column, ColumnDataType, InsertRequest as GrpcInsertRequest, SemanticType};
 
 use crate::error::{self, Result};
-use crate::line_writer::LineWriter;
 
 pub const OPENTSDB_TIMESTAMP_COLUMN_NAME: &str = "greptime_timestamp";
-pub const OPENTSDB_VALUE_COLUMN_NAME: &str = "greptime_value";
+pub const OPENTSDB_FIELD_COLUMN_NAME: &str = "greptime_value";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DataPoint {
     metric: String,
     ts_millis: i64,
@@ -48,7 +43,7 @@ impl DataPoint {
         // OpenTSDB command is case sensitive, verified in real OpenTSDB.
         if cmd != "put" {
             return error::InvalidQuerySnafu {
-                reason: format!("unknown command {}.", cmd),
+                reason: format!("unknown command {cmd}."),
             }
             .fail();
         }
@@ -89,7 +84,7 @@ impl DataPoint {
             let tag = token.split('=').collect::<Vec<&str>>();
             if tag.len() != 2 || tag[0].is_empty() || tag[1].is_empty() {
                 return error::InvalidQuerySnafu {
-                    reason: format!("put: invalid tag: {}", token),
+                    reason: format!("put: invalid tag: {token}"),
                 }
                 .fail();
             }
@@ -97,7 +92,7 @@ impl DataPoint {
             let tagv = tag[1].to_string();
             if tags.iter().any(|(t, _)| t == &tagk) {
                 return error::InvalidQuerySnafu {
-                    reason: format!("put: illegal argument: duplicate tag: {}", tagk),
+                    reason: format!("put: illegal argument: duplicate tag: {tagk}"),
                 }
                 .fail();
             }
@@ -120,6 +115,10 @@ impl DataPoint {
         &self.tags
     }
 
+    pub fn tags_mut(&mut self) -> &mut Vec<(String, String)> {
+        &mut self.tags
+    }
+
     pub fn ts_millis(&self) -> i64 {
         self.ts_millis
     }
@@ -128,41 +127,23 @@ impl DataPoint {
         self.value
     }
 
-    pub fn as_insert_request(&self) -> InsertRequest {
-        let mut line_writer = LineWriter::with_lines(DEFAULT_SCHEMA_NAME, self.metric.clone(), 1);
-        line_writer.write_ts(
-            OPENTSDB_TIMESTAMP_COLUMN_NAME,
-            (self.ts_millis(), Precision::MILLISECOND),
-        );
-
-        line_writer.write_f64(OPENTSDB_VALUE_COLUMN_NAME, self.value);
-
-        for (tagk, tagv) in self.tags.iter() {
-            line_writer.write_tag(tagk, tagv);
-        }
-        line_writer.commit();
-        line_writer.finish()
-    }
-
-    // TODO(fys): will remove in the future.
-    pub fn as_grpc_insert(&self) -> InsertExpr {
-        let schema_name = DEFAULT_SCHEMA_NAME.to_string();
+    pub fn as_grpc_insert(&self) -> GrpcInsertRequest {
         let mut columns = Vec::with_capacity(2 + self.tags.len());
 
         let ts_column = Column {
             column_name: OPENTSDB_TIMESTAMP_COLUMN_NAME.to_string(),
             values: Some(column::Values {
-                ts_millis_values: vec![self.ts_millis],
+                timestamp_millisecond_values: vec![self.ts_millis],
                 ..Default::default()
             }),
             semantic_type: SemanticType::Timestamp as i32,
-            datatype: ColumnDataType::Timestamp as i32,
+            datatype: ColumnDataType::TimestampMillisecond as i32,
             ..Default::default()
         };
         columns.push(ts_column);
 
-        let value_column = Column {
-            column_name: OPENTSDB_VALUE_COLUMN_NAME.to_string(),
+        let field_column = Column {
+            column_name: OPENTSDB_FIELD_COLUMN_NAME.to_string(),
             values: Some(column::Values {
                 f64_values: vec![self.value],
                 ..Default::default()
@@ -171,7 +152,7 @@ impl DataPoint {
             datatype: ColumnDataType::Float64 as i32,
             ..Default::default()
         };
-        columns.push(value_column);
+        columns.push(field_column);
 
         for (tagk, tagv) in self.tags.iter() {
             columns.push(Column {
@@ -186,10 +167,8 @@ impl DataPoint {
             });
         }
 
-        InsertExpr {
-            schema_name,
+        GrpcInsertRequest {
             table_name: self.metric.clone(),
-            region_number: 0,
             columns,
             row_count: 1,
         }
@@ -210,13 +189,6 @@ impl DataPoint {
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
-
-    use common_time::timestamp::TimeUnit;
-    use common_time::Timestamp;
-    use datatypes::value::Value;
-    use datatypes::vectors::Vector;
-
     use super::*;
 
     #[test]
@@ -277,43 +249,6 @@ mod test {
     }
 
     #[test]
-    fn test_as_insert_request() {
-        let data_point = DataPoint {
-            metric: "my_metric_1".to_string(),
-            ts_millis: 1000,
-            value: 1.0,
-            tags: vec![
-                ("tagk1".to_string(), "tagv1".to_string()),
-                ("tagk2".to_string(), "tagv2".to_string()),
-            ],
-        };
-        let insert_request = data_point.as_insert_request();
-        assert_eq!("my_metric_1", insert_request.table_name);
-        let columns = insert_request.columns_values;
-        assert_eq!(4, columns.len());
-        let ts = columns.get(OPENTSDB_TIMESTAMP_COLUMN_NAME).unwrap();
-        let expected = vec![datatypes::prelude::Value::Timestamp(Timestamp::new(
-            1000,
-            TimeUnit::Millisecond,
-        ))];
-        assert_vector(&expected, ts);
-        let val = columns.get(OPENTSDB_VALUE_COLUMN_NAME).unwrap();
-        assert_vector(&[1.0.into()], val);
-        let tagk1 = columns.get("tagk1").unwrap();
-        assert_vector(&["tagv1".into()], tagk1);
-        let tagk2 = columns.get("tagk2").unwrap();
-        assert_vector(&["tagv2".into()], tagk2);
-    }
-
-    fn assert_vector(expected: &[Value], vector: &Arc<dyn Vector>) {
-        for (idx, expected) in expected.iter().enumerate() {
-            let val = vector.get(idx);
-            assert_eq!(*expected, val);
-        }
-    }
-
-    // TODO(fys): will remove in the future.
-    #[test]
     fn test_as_grpc_insert() {
         let data_point = DataPoint {
             metric: "my_metric_1".to_string(),
@@ -336,11 +271,15 @@ mod test {
 
         assert_eq!(columns[0].column_name, OPENTSDB_TIMESTAMP_COLUMN_NAME);
         assert_eq!(
-            columns[0].values.as_ref().unwrap().ts_millis_values,
+            columns[0]
+                .values
+                .as_ref()
+                .unwrap()
+                .timestamp_millisecond_values,
             vec![1000]
         );
 
-        assert_eq!(columns[1].column_name, OPENTSDB_VALUE_COLUMN_NAME);
+        assert_eq!(columns[1].column_name, OPENTSDB_FIELD_COLUMN_NAME);
         assert_eq!(columns[1].values.as_ref().unwrap().f64_values, vec![1.0]);
 
         assert_eq!(columns[2].column_name, "tagk1");

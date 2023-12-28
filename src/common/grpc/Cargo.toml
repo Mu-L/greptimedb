@@ -1,30 +1,36 @@
 [package]
 name = "common-grpc"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-api = { path = "../../api" }
+api.workspace = true
+arrow-flight.workspace = true
 async-trait = "0.1"
-common-base = { path = "../base" }
-common-error = { path = "../error" }
-common-query = { path = "../query" }
-common-recordbatch = { path = "../recordbatch" }
-common-runtime = { path = "../runtime" }
-dashmap = "5.4"
-datafusion = { git = "https://github.com/apache/arrow-datafusion.git", branch = "arrow2", features = [
-    "simd",
-] }
-datatypes = { path = "../../datatypes" }
-snafu = { version = "0.7", features = ["backtraces"] }
-tokio = { version = "1.0", features = ["full"] }
-tonic = "0.8"
+backtrace = "0.3"
+common-base.workspace = true
+common-error.workspace = true
+common-macro.workspace = true
+common-recordbatch.workspace = true
+common-runtime.workspace = true
+common-telemetry.workspace = true
+common-time.workspace = true
+dashmap.workspace = true
+datafusion.workspace = true
+datatypes.workspace = true
+flatbuffers = "23.1"
+futures = "0.3"
+lazy_static.workspace = true
+prost.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tonic.workspace = true
 tower = "0.4"
 
 [dev-dependencies]
 criterion = "0.4"
-rand = "0.8"
+rand.workspace = true
 
 [[bench]]
 name = "bench_main"

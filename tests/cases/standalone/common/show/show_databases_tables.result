@@ -1,0 +1,30 @@
+show databases;
+
++-----------------------+
+| Schemas               |
++-----------------------+
+| greptime_private      |
+| illegal-database      |
+| information_schema    |
+| public                |
+| test_public_schema    |
+| upper_case_table_name |
++-----------------------+
+
+use information_schema;
+
+Affected Rows: 0
+
+show tables;
+
++-------------------+
+| Tables            |
++-------------------+
+| build_info        |
+| column_privileges |
+| column_statistics |
+| columns           |
+| engines           |
+| tables            |
++-------------------+
+

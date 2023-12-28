@@ -51,13 +51,26 @@ get_os_type
 get_arch_type
 
 if [ -n "${OS_TYPE}" ] && [ -n "${ARCH_TYPE}" ]; then
-    echo "Downloading ${BIN}, OS: ${OS_TYPE}, Arch: ${ARCH_TYPE}, Version: ${VERSION}"
-
+    # Use the latest nightly version.
     if [ "${VERSION}" = "latest" ]; then
-        wget "https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/releases/latest/download/${BIN}-${OS_TYPE}-${ARCH_TYPE}.tgz"
-    else
-        wget "https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/releases/download/${VERSION}/${BIN}-${OS_TYPE}-${ARCH_TYPE}.tgz"
+        VERSION=$(curl -s -XGET "https://api.github.com/repos/${GITHUB_ORG}/${GITHUB_REPO}/releases" | grep tag_name | grep nightly | cut -d: -f 2 | sed 's/.*"\(.*\)".*/\1/' | uniq | sort -r | head -n 1)
+        if [ -z "${VERSION}" ]; then
+            echo "Failed to get the latest version."
+            exit 1
+        fi
     fi
 
-    tar xvf ${BIN}-${OS_TYPE}-${ARCH_TYPE}.tgz && rm ${BIN}-${OS_TYPE}-${ARCH_TYPE}.tgz && echo "Run '${BIN} --help' to get started"
+    echo "Downloading ${BIN}, OS: ${OS_TYPE}, Arch: ${ARCH_TYPE}, Version: ${VERSION}"
+    PACKAGE_NAME="${BIN}-${OS_TYPE}-${ARCH_TYPE}-${VERSION}.tar.gz"
+
+    if [ -n "${PACKAGE_NAME}" ]; then
+      wget "https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/releases/download/${VERSION}/${PACKAGE_NAME}"
+
+      # Extract the binary and clean the rest.
+      tar xvf "${PACKAGE_NAME}" && \
+      mv "${PACKAGE_NAME%.tar.gz}/${BIN}" "${PWD}" && \
+      rm -r "${PACKAGE_NAME}" && \
+      rm -r "${PACKAGE_NAME%.tar.gz}" && \
+      echo "Run './${BIN} --help' to get started"
+    fi
 fi

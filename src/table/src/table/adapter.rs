@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,36 +13,50 @@
 // limitations under the License.
 
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use common_query::logical_plan::Expr;
-use common_query::physical_plan::{DfPhysicalPlanAdapter, PhysicalPlanAdapter, PhysicalPlanRef};
+use common_query::physical_plan::DfPhysicalPlanAdapter;
 use common_query::DfPhysicalPlan;
-use common_telemetry::debug;
+use common_recordbatch::OrderOption;
 use datafusion::arrow::datatypes::SchemaRef as DfSchemaRef;
-use datafusion::datasource::datasource::TableProviderFilterPushDown as DfTableProviderFilterPushDown;
 use datafusion::datasource::{TableProvider, TableType as DfTableType};
 use datafusion::error::Result as DfResult;
-use datafusion::logical_plan::Expr as DfExpr;
-use datatypes::schema::{SchemaRef as TableSchemaRef, SchemaRef};
-use snafu::prelude::*;
+use datafusion::execution::context::SessionState;
+use datafusion_expr::expr::Expr as DfExpr;
+use datafusion_expr::TableProviderFilterPushDown as DfTableProviderFilterPushDown;
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::PhysicalSortExpr;
+use store_api::storage::ScanRequest;
 
-use crate::error::{self, Result};
-use crate::metadata::TableInfoRef;
-use crate::table::{FilterPushDownType, Table, TableRef, TableType};
+use super::scan::StreamScanAdapter;
+use crate::table::{TableRef, TableType};
 
-/// Greptime Table ->  datafusion TableProvider
+/// Adapt greptime's [TableRef] to DataFusion's [TableProvider].
 pub struct DfTableProviderAdapter {
     table: TableRef,
+    scan_req: Arc<Mutex<ScanRequest>>,
 }
 
 impl DfTableProviderAdapter {
     pub fn new(table: TableRef) -> Self {
-        Self { table }
+        Self {
+            table,
+            scan_req: Arc::default(),
+        }
     }
 
     pub fn table(&self) -> TableRef {
         self.table.clone()
+    }
+
+    pub fn with_ordering_hint(&self, order_opts: &[OrderOption]) {
+        self.scan_req.lock().unwrap().output_ordering = Some(order_opts.to_vec());
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn get_scan_req(&self) -> ScanRequest {
+        self.scan_req.lock().unwrap().clone()
     }
 }
 
@@ -66,125 +80,55 @@ impl TableProvider for DfTableProviderAdapter {
 
     async fn scan(
         &self,
-        projection: &Option<Vec<usize>>,
+        _ctx: &SessionState,
+        projection: Option<&Vec<usize>>,
         filters: &[DfExpr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn DfPhysicalPlan>> {
         let filters: Vec<Expr> = filters.iter().map(Clone::clone).map(Into::into).collect();
-        let inner = self.table.scan(projection, &filters, limit).await?;
-        Ok(Arc::new(DfPhysicalPlanAdapter(inner)))
-    }
+        let request = {
+            let mut request = self.scan_req.lock().unwrap();
+            request.filters = filters;
+            request.projection = projection.cloned();
+            request.limit = limit;
+            request.clone()
+        };
+        let stream = self.table.scan_to_stream(request).await?;
 
-    fn supports_filter_pushdown(&self, filter: &DfExpr) -> DfResult<DfTableProviderFilterPushDown> {
-        let p = self
-            .table
-            .supports_filter_pushdown(&filter.clone().into())?;
-        match p {
-            FilterPushDownType::Unsupported => Ok(DfTableProviderFilterPushDown::Unsupported),
-            FilterPushDownType::Inexact => Ok(DfTableProviderFilterPushDown::Inexact),
-            FilterPushDownType::Exact => Ok(DfTableProviderFilterPushDown::Exact),
+        // build sort physical expr
+        let schema = stream.schema();
+        let sort_expr = stream.output_ordering().map(|order_opts| {
+            order_opts
+                .iter()
+                .map(|order_opt| {
+                    let col_index = schema.column_index_by_name(&order_opt.name).unwrap();
+                    let col_expr = Arc::new(Column::new(&order_opt.name, col_index));
+                    PhysicalSortExpr {
+                        expr: col_expr,
+                        options: order_opt.options,
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let mut stream_adapter = StreamScanAdapter::new(stream);
+        if let Some(sort_expr) = sort_expr {
+            stream_adapter = stream_adapter.with_output_ordering(sort_expr);
         }
-    }
-}
-
-/// Datafusion TableProvider ->  greptime Table
-pub struct TableAdapter {
-    schema: TableSchemaRef,
-    table_provider: Arc<dyn TableProvider>,
-}
-
-impl TableAdapter {
-    pub fn new(table_provider: Arc<dyn TableProvider>) -> Result<Self> {
-        Ok(Self {
-            schema: Arc::new(
-                table_provider
-                    .schema()
-                    .try_into()
-                    .context(error::SchemaConversionSnafu)?,
-            ),
-            table_provider,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl Table for TableAdapter {
-    fn as_any(&self) -> &dyn Any {
-        self
+        Ok(Arc::new(DfPhysicalPlanAdapter(Arc::new(stream_adapter))))
     }
 
-    fn schema(&self) -> TableSchemaRef {
-        self.schema.clone()
-    }
-
-    fn table_info(&self) -> TableInfoRef {
-        unreachable!("Should not call table_info of TableAdaptor directly")
-    }
-
-    fn table_type(&self) -> TableType {
-        match self.table_provider.table_type() {
-            DfTableType::Base => TableType::Base,
-            DfTableType::View => TableType::View,
-            DfTableType::Temporary => TableType::Temporary,
-        }
-    }
-
-    async fn scan(
+    fn supports_filters_pushdown(
         &self,
-        projection: &Option<Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<PhysicalPlanRef> {
-        let filters: Vec<DfExpr> = filters.iter().map(|e| e.df_expr().clone()).collect();
-        debug!("TableScan filter size: {}", filters.len());
-        let execution_plan = self
-            .table_provider
-            .scan(projection, &filters, limit)
-            .await
-            .context(error::DatafusionSnafu)?;
-        let schema: SchemaRef = Arc::new(
-            execution_plan
-                .schema()
-                .try_into()
-                .context(error::SchemaConversionSnafu)?,
-        );
-        Ok(Arc::new(PhysicalPlanAdapter::new(schema, execution_plan)))
-    }
-
-    fn supports_filter_pushdown(&self, filter: &Expr) -> Result<FilterPushDownType> {
-        match self
-            .table_provider
-            .supports_filter_pushdown(filter.df_expr())
-            .context(error::DatafusionSnafu)?
-        {
-            DfTableProviderFilterPushDown::Unsupported => Ok(FilterPushDownType::Unsupported),
-            DfTableProviderFilterPushDown::Inexact => Ok(FilterPushDownType::Inexact),
-            DfTableProviderFilterPushDown::Exact => Ok(FilterPushDownType::Exact),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use datafusion::arrow;
-    use datafusion::datasource::empty::EmptyTable;
-    use datafusion_common::field_util::SchemaExt;
-
-    use super::*;
-    use crate::metadata::TableType::Base;
-
-    #[test]
-    #[should_panic]
-    fn test_table_adaptor_info() {
-        let df_table = Arc::new(EmptyTable::new(Arc::new(arrow::datatypes::Schema::empty())));
-        let table_adapter = TableAdapter::new(df_table).unwrap();
-        let _ = table_adapter.table_info();
-    }
-
-    #[test]
-    fn test_table_adaptor_type() {
-        let df_table = Arc::new(EmptyTable::new(Arc::new(arrow::datatypes::Schema::empty())));
-        let table_adapter = TableAdapter::new(df_table).unwrap();
-        assert_eq!(Base, table_adapter.table_type());
+        filters: &[&DfExpr],
+    ) -> DfResult<Vec<DfTableProviderFilterPushDown>> {
+        let filters = filters
+            .iter()
+            .map(|&x| x.clone().into())
+            .collect::<Vec<_>>();
+        Ok(self
+            .table
+            .supports_filters_pushdown(&filters.iter().collect::<Vec<_>>())
+            .map(|v| v.into_iter().map(Into::into).collect::<Vec<_>>())?)
     }
 }

@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,17 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![feature(generic_associated_types)]
-#![feature(assert_matches)]
+#![feature(let_chains)]
 
 pub mod arrow_array;
 pub mod data_type;
+pub mod duration;
 pub mod error;
+pub mod interval;
 pub mod macros;
 pub mod prelude;
-mod scalars;
+pub mod scalars;
 pub mod schema;
 pub mod serialize;
+pub mod time;
+pub mod timestamp;
 pub mod type_id;
 pub mod types;
 pub mod value;

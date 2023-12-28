@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,16 +20,20 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use api::v1::RowInsertRequests;
 use async_trait::async_trait;
 use common_runtime::Runtime;
 use common_telemetry::logging::error;
 use futures::StreamExt;
 use tokio::sync::broadcast;
 
+use self::codec::DataPoint;
 use crate::error::Result;
 use crate::opentsdb::connection::Connection;
 use crate::opentsdb::handler::Handler;
+use crate::prom_store::{FIELD_COLUMN_NAME, TIMESTAMP_COLUMN_NAME};
 use crate::query_handler::OpentsdbProtocolHandlerRef;
+use crate::row_writer::{self, MultiTableData};
 use crate::server::{AbortableStream, BaseTcpServer, Server};
 use crate::shutdown::Shutdown;
 
@@ -81,10 +85,13 @@ impl OpentsdbServer {
             async move {
                 match stream {
                     Ok(stream) => {
+                        if let Err(e) = stream.set_nodelay(true) {
+                            error!(e; "Failed to set TCP nodelay");
+                        }
                         let connection = Connection::new(stream);
                         let mut handler = Handler::new(query_handler, connection, shutdown);
 
-                        let _ = io_runtime.spawn(async move {
+                        let _handle = io_runtime.spawn(async move {
                             if let Err(e) = handler.run().await {
                                 error!(e; "Unexpected error when handling OpenTSDB connection");
                             }
@@ -96,6 +103,8 @@ impl OpentsdbServer {
         })
     }
 }
+
+pub const OPENTSDB_SERVER: &str = "OPENTSDB_SERVER";
 
 #[async_trait]
 impl Server for OpentsdbServer {
@@ -113,8 +122,46 @@ impl Server for OpentsdbServer {
         let (stream, addr) = self.base_server.bind(listening).await?;
 
         let io_runtime = self.base_server.io_runtime();
-        let join_handle = tokio::spawn(self.accept(io_runtime, stream));
+        let join_handle = common_runtime::spawn_read(self.accept(io_runtime, stream));
         self.base_server.start_with(join_handle).await?;
         Ok(addr)
     }
+    fn name(&self) -> &str {
+        OPENTSDB_SERVER
+    }
+}
+
+pub fn data_point_to_grpc_row_insert_requests(
+    data_points: Vec<DataPoint>,
+) -> Result<(RowInsertRequests, usize)> {
+    let mut multi_table_data = MultiTableData::new();
+
+    for mut data_point in data_points {
+        let tags: Vec<(String, String)> = std::mem::take(data_point.tags_mut());
+        let table_name = data_point.metric();
+        let value = data_point.value();
+        let timestamp = data_point.ts_millis();
+        // length of tags + 2 extra columns for greptime_timestamp and the value
+        let num_columns = tags.len() + 2;
+
+        let table_data = multi_table_data.get_or_default_table_data(table_name, num_columns, 1);
+        let mut one_row = table_data.alloc_one_row();
+
+        // tags
+        row_writer::write_tags(table_data, tags.into_iter(), &mut one_row)?;
+
+        // value
+        row_writer::write_f64(table_data, FIELD_COLUMN_NAME, value, &mut one_row)?;
+        // timestamp
+        row_writer::write_ts_millis(
+            table_data,
+            TIMESTAMP_COLUMN_NAME,
+            Some(timestamp),
+            &mut one_row,
+        )?;
+
+        table_data.add_row(one_row);
+    }
+
+    Ok(multi_table_data.into_row_insert_requests())
 }

@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,14 +16,14 @@
 #[macro_export]
 macro_rules! log {
     // log!(target: "my_target", Level::INFO, "a {} event", "log");
-    (target: $target:expr, $lvl:expr, $($arg:tt)+) => {
-        $crate::logging::event!(target: $target, $lvl, $($arg)+)
-    };
+    (target: $target:expr, $lvl:expr, $($arg:tt)+) => {{
+        $crate::tracing::event!(target: $target, $lvl, $($arg)+)
+    }};
 
     // log!(Level::INFO, "a log event")
-    ($lvl:expr, $($arg:tt)+) => {
-        $crate::logging::event!($lvl, $($arg)+)
-    };
+    ($lvl:expr, $($arg:tt)+) => {{
+        $crate::tracing::event!($lvl, $($arg)+)
+    }};
 }
 
 /// Logs a message at the error level.
@@ -31,104 +31,50 @@ macro_rules! log {
 macro_rules! error {
     // error!(target: "my_target", "a {} event", "log")
     (target: $target:expr, $($arg:tt)+) => ({
-        $crate::log!(target: $target, $crate::logging::Level::ERROR, $($arg)+)
+        $crate::log!(target: $target, $crate::tracing::Level::ERROR, $($arg)+)
     });
 
     // error!(e; target: "my_target", "a {} event", "log")
     ($e:expr; target: $target:expr, $($arg:tt)+) => ({
-        use $crate::common_error::ext::ErrorExt;
-        use std::error::Error;
-        match ($e.source(), $e.backtrace_opt()) {
-            (Some(source), Some(backtrace)) => {
-                $crate::log!(
-                    target: $target,
-                    $crate::logging::Level::ERROR,
-                    err.msg = %$e,
-                    err.code = %$e.status_code(),
-                    err.source = source,
-                    err.backtrace = %backtrace,
-                    $($arg)+
-                )
-            },
-            (Some(source), None) => {
-                $crate::log!(
-                    target: $target,
-                    $crate::logging::Level::ERROR,
-                    err.msg = %$e,
-                    err.code = %$e.status_code(),
-                    err.source = source,
-                    $($arg)+
-                )
-            },
-            (None, Some(backtrace)) => {
-                $crate::log!(
-                    target: $target,
-                    $crate::logging::Level::ERROR,
-                    err.msg = %$e,
-                    err.code = %$e.status_code(),
-                    err.backtrace = %backtrace,
-                    $($arg)+
-                )
-            },
-            (None, None) => {
-                $crate::log!(
-                    target: $target,
-                    $crate::logging::Level::ERROR,
-                    err.msg = %$e,
-                    err.code = %$e.status_code(),
-                    $($arg)+
-                )
-            }
-        }
+        $crate::log!(
+            target: $target,
+            $crate::tracing::Level::ERROR,
+            err = ?$e,
+            $($arg)+
+        )
+    });
+
+    // error!(%e; target: "my_target", "a {} event", "log")
+    (%$e:expr; target: $target:expr, $($arg:tt)+) => ({
+        $crate::log!(
+            target: $target,
+            $crate::tracing::Level::ERROR,
+            err = %$e,
+            $($arg)+
+        )
     });
 
     // error!(e; "a {} event", "log")
     ($e:expr; $($arg:tt)+) => ({
-        use std::error::Error;
-        use $crate::common_error::ext::ErrorExt;
-        match ($e.source(), $e.backtrace_opt()) {
-            (Some(source), Some(backtrace)) => {
-                $crate::log!(
-                    $crate::logging::Level::ERROR,
-                    err.msg = %$e,
-                    err.code = %$e.status_code(),
-                    err.source = source,
-                    err.backtrace = %backtrace,
-                    $($arg)+
-                )
-            },
-            (Some(source), None) => {
-                $crate::log!(
-                    $crate::logging::Level::ERROR,
-                    err.msg = %$e,
-                    err.code = %$e.status_code(),
-                    err.source = source,
-                    $($arg)+
-                )
-            },
-            (None, Some(backtrace)) => {
-                $crate::log!(
-                    $crate::logging::Level::ERROR,
-                    err.msg = %$e,
-                    err.code = %$e.status_code(),
-                    err.backtrace = %backtrace,
-                    $($arg)+
-                )
-            },
-            (None, None) => {
-                $crate::log!(
-                    $crate::logging::Level::ERROR,
-                    err.msg = %$e,
-                    err.code = %$e.status_code(),
-                    $($arg)+
-                )
-            }
-        }
+        $crate::log!(
+            $crate::tracing::Level::ERROR,
+            err = ?$e,
+            $($arg)+
+        )
+    });
+
+    // error!(%e; "a {} event", "log")
+    (%$e:expr; $($arg:tt)+) => ({
+        $crate::log!(
+            $crate::tracing::Level::ERROR,
+            err = %$e,
+            $($arg)+
+        )
     });
 
     // error!("a {} event", "log")
     ($($arg:tt)+) => ({
-        $crate::log!($crate::logging::Level::ERROR, $($arg)+)
+        $crate::log!($crate::tracing::Level::ERROR, $($arg)+)
     });
 }
 
@@ -137,12 +83,30 @@ macro_rules! error {
 macro_rules! warn {
     // warn!(target: "my_target", "a {} event", "log")
     (target: $target:expr, $($arg:tt)+) => {
-        $crate::log!(target: $target, $crate::logging::Level::WARN, $($arg)+)
+        $crate::log!(target: $target, $crate::tracing::Level::WARN, $($arg)+)
     };
+
+    // warn!(e; "a {} event", "log")
+    ($e:expr; $($arg:tt)+) => ({
+        $crate::log!(
+            $crate::tracing::Level::WARN,
+            err = ?$e,
+            $($arg)+
+        )
+    });
+
+    // warn!(%e; "a {} event", "log")
+    (%$e:expr; $($arg:tt)+) => ({
+        $crate::log!(
+            $crate::tracing::Level::WARN,
+            err = %$e,
+            $($arg)+
+        )
+    });
 
     // warn!("a {} event", "log")
     ($($arg:tt)+) => {
-        $crate::log!($crate::logging::Level::WARN, $($arg)+)
+        $crate::log!($crate::tracing::Level::WARN, $($arg)+)
     };
 }
 
@@ -151,12 +115,12 @@ macro_rules! warn {
 macro_rules! info {
     // info!(target: "my_target", "a {} event", "log")
     (target: $target:expr, $($arg:tt)+) => {
-        $crate::log!(target: $target, $crate::logging::Level::INFO, $($arg)+)
+        $crate::log!(target: $target, $crate::tracing::Level::INFO, $($arg)+)
     };
 
     // info!("a {} event", "log")
     ($($arg:tt)+) => {
-        $crate::log!($crate::logging::Level::INFO, $($arg)+)
+        $crate::log!($crate::tracing::Level::INFO, $($arg)+)
     };
 }
 
@@ -165,12 +129,12 @@ macro_rules! info {
 macro_rules! debug {
     // debug!(target: "my_target", "a {} event", "log")
     (target: $target:expr, $($arg:tt)+) => {
-        $crate::log!(target: $target, $crate::logging::Level::DEBUG, $($arg)+)
+        $crate::log!(target: $target, $crate::tracing::Level::DEBUG, $($arg)+)
     };
 
     // debug!("a {} event", "log")
     ($($arg:tt)+) => {
-        $crate::log!($crate::logging::Level::DEBUG, $($arg)+)
+        $crate::log!($crate::tracing::Level::DEBUG, $($arg)+)
     };
 }
 
@@ -179,21 +143,20 @@ macro_rules! debug {
 macro_rules! trace {
     // trace!(target: "my_target", "a {} event", "log")
     (target: $target:expr, $($arg:tt)+) => {
-        $crate::log!(target: $target, $crate::logging::Level::TRACE, $($arg)+)
+        $crate::log!(target: $target, $crate::tracing::Level::TRACE, $($arg)+)
     };
 
     // trace!("a {} event", "log")
     ($($arg:tt)+) => {
-        $crate::log!($crate::logging::Level::TRACE, $($arg)+)
+        $crate::log!($crate::tracing::Level::TRACE, $($arg)+)
     };
 }
 
 #[cfg(test)]
 mod tests {
     use common_error::mock::MockError;
-    use common_error::prelude::*;
-
-    use crate::logging::Level;
+    use common_error::status_code::StatusCode;
+    use tracing::Level;
 
     macro_rules! all_log_macros {
         ($($arg:tt)*) => {
@@ -259,12 +222,11 @@ mod tests {
         error!(target: "my_target", "hello {}", "world");
         // Supports both owned and reference type.
         error!(err; target: "my_target", "hello {}", "world");
+        error!(%err; target: "my_target", "hello {}", "world");
         error!(err_ref; target: "my_target", "hello {}", "world");
         error!(err_ref2; "hello {}", "world");
+        error!(%err_ref2; "hello {}", "world");
         error!("hello {}", "world");
-
-        let err = MockError::with_backtrace(StatusCode::Internal);
-        error!(err; "Error with backtrace hello {}", "world");
 
         let root_err = MockError::with_source(err);
         error!(root_err; "Error with source hello {}", "world");

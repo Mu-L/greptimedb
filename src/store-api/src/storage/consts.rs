@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,19 +14,7 @@
 
 //! Constants.
 
-use crate::storage::descriptors::{ColumnFamilyId, ColumnId};
-
-// ---------- Reserved column family ids ---------------------------------------
-
-/// Column family Id for row key columns.
-///
-/// This is a virtual column family, actually row key columns are not
-/// stored in any column family.
-pub const KEY_CF_ID: ColumnFamilyId = 0;
-/// Id for default column family.
-pub const DEFAULT_CF_ID: ColumnFamilyId = 1;
-
-// -----------------------------------------------------------------------------
+use crate::storage::descriptors::ColumnId;
 
 // ---------- Reserved column ids ----------------------------------------------
 
@@ -37,6 +25,8 @@ enum ReservedColumnType {
     Version = 0,
     Sequence,
     OpType,
+    Tsid,
+    TableId,
 }
 
 /// Column id reserved by the engine.
@@ -66,34 +56,50 @@ impl ReservedColumnId {
     pub const fn op_type() -> ColumnId {
         Self::BASE | ReservedColumnType::OpType as ColumnId
     }
+
+    /// Id for storing TSID column.
+    ///
+    /// Used by: metric engine
+    pub const fn tsid() -> ColumnId {
+        Self::BASE | ReservedColumnType::Tsid as ColumnId
+    }
+
+    /// Id for storing logical table id column.
+    ///
+    /// Used by: metric engine
+    pub const fn table_id() -> ColumnId {
+        Self::BASE | ReservedColumnType::TableId as ColumnId
+    }
+
+    /// Test if the column id is reserved.
+    pub fn is_reserved(column_id: ColumnId) -> bool {
+        column_id & Self::BASE != 0
+    }
 }
 
 // -----------------------------------------------------------------------------
 
 // ---------- Names reserved for internal columns and engine -------------------
 
-/// Name of version column.
-pub const VERSION_COLUMN_NAME: &str = "__version";
-
-/// Names for default column family.
-pub const DEFAULT_CF_NAME: &str = "default";
-
 /// Name for reserved column: sequence
 pub const SEQUENCE_COLUMN_NAME: &str = "__sequence";
-
-/// Name for time index constraint name.
-pub const TIME_INDEX_NAME: &str = "__time_index";
 
 /// Name for reserved column: op_type
 pub const OP_TYPE_COLUMN_NAME: &str = "__op_type";
 
-// -----------------------------------------------------------------------------
+/// Name for reserved column: primary_key
+pub const PRIMARY_KEY_COLUMN_NAME: &str = "__primary_key";
 
-// ---------- Default options --------------------------------------------------
+/// Internal Column Name
+static INTERNAL_COLUMN_VEC: [&str; 3] = [
+    SEQUENCE_COLUMN_NAME,
+    OP_TYPE_COLUMN_NAME,
+    PRIMARY_KEY_COLUMN_NAME,
+];
 
-pub const READ_BATCH_SIZE: usize = 256;
-
-pub const WRITE_ROW_GROUP_SIZE: usize = 4096;
+pub fn is_internal_column(name: &str) -> bool {
+    INTERNAL_COLUMN_VEC.contains(&name)
+}
 
 // -----------------------------------------------------------------------------
 
@@ -106,5 +112,19 @@ mod tests {
         assert_eq!(0x80000000, ReservedColumnId::version());
         assert_eq!(0x80000001, ReservedColumnId::sequence());
         assert_eq!(0x80000002, ReservedColumnId::op_type());
+    }
+
+    #[test]
+    fn test_is_internal_column() {
+        // contain internal column names
+        assert!(is_internal_column(SEQUENCE_COLUMN_NAME));
+        assert!(is_internal_column(OP_TYPE_COLUMN_NAME));
+        assert!(is_internal_column(PRIMARY_KEY_COLUMN_NAME));
+
+        // don't contain internal column names
+        assert!(!is_internal_column("my__column"));
+        assert!(!is_internal_column("my__sequence"));
+        assert!(!is_internal_column("my__op_type"));
+        assert!(!is_internal_column("my__primary_key"));
     }
 }

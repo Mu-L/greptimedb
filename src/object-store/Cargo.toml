@@ -1,16 +1,29 @@
 [package]
 name = "object-store"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-futures = { version = "0.3" }
-opendal = { version = "0.22", features = ["layers-tracing", "layers-metrics"] }
-tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+bytes.workspace = true
+common-error.workspace = true
+common-macro.workspace = true
+common-runtime.workspace = true
+common-telemetry.workspace = true
+futures.workspace = true
+lazy_static.workspace = true
+md5 = "0.7"
+moka = { workspace = true, features = ["future"] }
+opendal = { version = "0.40", features = [
+    "layers-tracing",
+] }
+prometheus.workspace = true
+snafu.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 anyhow = "1.0"
-common-telemetry = { path = "../common/telemetry" }
-tempdir = "0.3"
-uuid = { version = "1", features = ["serde", "v4"] }
+common-telemetry.workspace = true
+common-test-util.workspace = true
+tokio.workspace = true

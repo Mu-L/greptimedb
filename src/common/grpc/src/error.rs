@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,17 +13,28 @@
 // limitations under the License.
 
 use std::any::Any;
+use std::io;
 
-use common_error::prelude::{ErrorExt, StatusCode};
-use snafu::{Backtrace, ErrorCompat, Snafu};
+use common_error::ext::ErrorExt;
+use common_error::status_code::StatusCode;
+use common_macro::stack_trace_debug;
+use snafu::{Location, Snafu};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub))]
+#[stack_trace_debug]
 pub enum Error {
-    #[snafu(display("Missing required field in protobuf, field: {}", field))]
-    MissingField { field: String, backtrace: Backtrace },
+    #[snafu(display("Invalid client tls config, {}", msg))]
+    InvalidTlsConfig { msg: String },
+
+    #[snafu(display("Invalid config file path"))]
+    InvalidConfigFilePath {
+        #[snafu(source)]
+        error: io::Error,
+        location: Location,
+    },
 
     #[snafu(display(
         "Write type mismatch, column name: {}, expected: {}, actual: {}",
@@ -35,100 +46,64 @@ pub enum Error {
         column_name: String,
         expected: String,
         actual: String,
-        backtrace: Backtrace,
+        location: Location,
     },
 
-    #[snafu(display("Failed to create gRPC channel, source: {}", source))]
+    #[snafu(display("Failed to create gRPC channel"))]
     CreateChannel {
-        source: tonic::transport::Error,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: tonic::transport::Error,
+        location: Location,
     },
 
-    #[snafu(display("Failed to collect RecordBatches, source: {}", source))]
-    CollectRecordBatches {
-        #[snafu(backtrace)]
+    #[snafu(display("Failed to create RecordBatch"))]
+    CreateRecordBatch {
+        location: Location,
         source: common_recordbatch::error::Error,
     },
 
     #[snafu(display("Failed to convert Arrow type: {}", from))]
-    Conversion { from: String, backtrace: Backtrace },
+    Conversion { from: String, location: Location },
 
-    #[snafu(display("Column datatype error, source: {}", source))]
-    ColumnDataType {
-        #[snafu(backtrace)]
-        source: api::error::Error,
+    #[snafu(display("Failed to decode FlightData"))]
+    DecodeFlightData {
+        #[snafu(source)]
+        error: api::DecodeError,
+        location: Location,
     },
+
+    #[snafu(display("Invalid FlightData, reason: {}", reason))]
+    InvalidFlightData { reason: String, location: Location },
+
+    #[snafu(display("Failed to convert Arrow Schema"))]
+    ConvertArrowSchema {
+        location: Location,
+        source: datatypes::error::Error,
+    },
+
+    #[snafu(display("Not supported: {}", feat))]
+    NotSupported { feat: String },
 }
 
 impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         match self {
-            Error::MissingField { .. } | Error::TypeMismatch { .. } => StatusCode::InvalidArguments,
-            Error::CreateChannel { .. } | Error::Conversion { .. } => StatusCode::Internal,
-            Error::CollectRecordBatches { source } => source.status_code(),
-            Error::ColumnDataType { source } => source.status_code(),
-        }
-    }
+            Error::InvalidTlsConfig { .. }
+            | Error::InvalidConfigFilePath { .. }
+            | Error::TypeMismatch { .. }
+            | Error::InvalidFlightData { .. }
+            | Error::NotSupported { .. } => StatusCode::InvalidArguments,
 
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
+            Error::CreateChannel { .. }
+            | Error::Conversion { .. }
+            | Error::DecodeFlightData { .. } => StatusCode::Internal,
+
+            Error::CreateRecordBatch { source, .. } => source.status_code(),
+            Error::ConvertArrowSchema { source, .. } => source.status_code(),
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
         self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use snafu::{OptionExt, ResultExt};
-
-    use super::*;
-
-    type StdResult<E> = std::result::Result<(), E>;
-
-    fn throw_none_option() -> Option<String> {
-        None
-    }
-
-    #[test]
-    fn test_missing_field_error() {
-        let e = throw_none_option()
-            .context(MissingFieldSnafu { field: "test" })
-            .err()
-            .unwrap();
-
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::InvalidArguments);
-    }
-
-    #[test]
-    fn test_type_mismatch_error() {
-        let e = throw_none_option()
-            .context(TypeMismatchSnafu {
-                column_name: "",
-                expected: "",
-                actual: "",
-            })
-            .err()
-            .unwrap();
-
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::InvalidArguments);
-    }
-
-    #[test]
-    fn test_create_channel_error() {
-        fn throw_tonic_error() -> StdResult<tonic::transport::Error> {
-            tonic::transport::Endpoint::new("http//http").map(|_| ())
-        }
-
-        let e = throw_tonic_error()
-            .context(CreateChannelSnafu)
-            .err()
-            .unwrap();
-
-        assert!(e.backtrace_opt().is_some());
-        assert_eq!(e.status_code(), StatusCode::Internal);
     }
 }

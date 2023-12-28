@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,23 +15,28 @@
 use futures::TryStreamExt;
 
 use crate::error::Result;
-use crate::{RecordBatch, SendableRecordBatchStream};
+use crate::{RecordBatch, RecordBatches, SendableRecordBatchStream};
 
+/// Collect all the items from the stream into a vector of [`RecordBatch`].
 pub async fn collect(stream: SendableRecordBatchStream) -> Result<Vec<RecordBatch>> {
     stream.try_collect::<Vec<_>>().await
 }
 
+/// Collect all the items from the stream into [RecordBatches].
+pub async fn collect_batches(stream: SendableRecordBatchStream) -> Result<RecordBatches> {
+    let schema = stream.schema();
+    let batches = stream.try_collect::<Vec<_>>().await?;
+    RecordBatches::try_new(schema, batches)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::mem;
     use std::pin::Pin;
     use std::sync::Arc;
 
-    use datafusion_common::field_util::SchemaExt;
-    use datafusion_common::record_batch::RecordBatch as DfRecordBatch;
-    use datatypes::arrow::array::UInt32Array;
-    use datatypes::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-    use datatypes::schema::{Schema, SchemaRef};
+    use datatypes::prelude::*;
+    use datatypes::schema::{ColumnSchema, Schema, SchemaRef};
+    use datatypes::vectors::UInt32Vector;
     use futures::task::{Context, Poll};
     use futures::Stream;
 
@@ -53,7 +58,7 @@ mod tests {
         type Item = Result<RecordBatch>;
 
         fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            let batch = mem::replace(&mut self.batch, None);
+            let batch = self.batch.take();
 
             if let Some(batch) = batch {
                 Poll::Ready(Some(Ok(batch)))
@@ -65,12 +70,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_collect() {
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        let column_schemas = vec![ColumnSchema::new(
             "number",
-            DataType::UInt32,
+            ConcreteDataType::uint32_datatype(),
             false,
-        )]));
-        let schema = Arc::new(Schema::try_from(arrow_schema.clone()).unwrap());
+        )];
+
+        let schema = Arc::new(Schema::try_new(column_schemas).unwrap());
 
         let stream = MockRecordBatchStream {
             schema: schema.clone(),
@@ -81,24 +87,23 @@ mod tests {
         assert_eq!(0, batches.len());
 
         let numbers: Vec<u32> = (0..10).collect();
-        let df_batch = DfRecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(UInt32Array::from_slice(&numbers))],
-        )
-        .unwrap();
-
-        let batch = RecordBatch {
-            schema: schema.clone(),
-            df_recordbatch: df_batch,
-        };
+        let columns = [Arc::new(UInt32Vector::from_vec(numbers)) as _];
+        let batch = RecordBatch::new(schema.clone(), columns).unwrap();
 
         let stream = MockRecordBatchStream {
-            schema: Arc::new(Schema::try_from(arrow_schema).unwrap()),
+            schema: schema.clone(),
             batch: Some(batch.clone()),
         };
         let batches = collect(Box::pin(stream)).await.unwrap();
         assert_eq!(1, batches.len());
-
         assert_eq!(batch, batches[0]);
+
+        let stream = MockRecordBatchStream {
+            schema: schema.clone(),
+            batch: Some(batch.clone()),
+        };
+        let batches = collect_batches(Box::pin(stream)).await.unwrap();
+        let expect_batches = RecordBatches::try_new(schema.clone(), vec![batch]).unwrap();
+        assert_eq!(expect_batches, batches);
     }
 }

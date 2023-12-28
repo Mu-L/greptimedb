@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,10 +14,13 @@
 
 use std::cmp::Ordering;
 
+use crate::util::div_ceil;
+use crate::Timestamp;
+
 /// Unix timestamp in millisecond resolution.
 ///
 /// Negative timestamp is allowed, which represents timestamp before '1970-01-01T00:00:00'.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct TimestampMillis(i64);
 
 impl TimestampMillis {
@@ -77,22 +80,48 @@ impl PartialOrd<TimestampMillis> for i64 {
     }
 }
 
-pub trait BucketAligned {
-    /// Returns the timestamp aligned by `bucket_duration` in milliseconds or
-    /// `None` if overflow occurred.
+pub trait BucketAligned: Sized {
+    /// Aligns the value by `bucket_duration` or `None` if underflow occurred.
     ///
     /// # Panics
     /// Panics if `bucket_duration <= 0`.
-    fn align_by_bucket(self, bucket_duration: i64) -> Option<TimestampMillis>;
+    fn align_by_bucket(self, bucket_duration: i64) -> Option<Self>;
+
+    /// Aligns the value by `bucket_duration` to ceil or `None` if overflow occurred.
+    ///
+    /// # Panics
+    /// Panics if `bucket_duration <= 0`.
+    fn align_to_ceil_by_bucket(self, bucket_duration: i64) -> Option<Self>;
 }
 
-impl<T: Into<i64>> BucketAligned for T {
-    fn align_by_bucket(self, bucket_duration: i64) -> Option<TimestampMillis> {
+impl BucketAligned for i64 {
+    fn align_by_bucket(self, bucket_duration: i64) -> Option<Self> {
         assert!(bucket_duration > 0, "{}", bucket_duration);
-        self.into()
-            .checked_div_euclid(bucket_duration)
+        self.checked_div_euclid(bucket_duration)
             .and_then(|val| val.checked_mul(bucket_duration))
-            .map(TimestampMillis)
+    }
+
+    fn align_to_ceil_by_bucket(self, bucket_duration: i64) -> Option<Self> {
+        assert!(bucket_duration > 0, "{}", bucket_duration);
+        div_ceil(self, bucket_duration).checked_mul(bucket_duration)
+    }
+}
+
+impl BucketAligned for Timestamp {
+    fn align_by_bucket(self, bucket_duration: i64) -> Option<Self> {
+        assert!(bucket_duration > 0, "{}", bucket_duration);
+        let unit = self.unit();
+        self.value()
+            .align_by_bucket(bucket_duration)
+            .map(|val| Timestamp::new(val, unit))
+    }
+
+    fn align_to_ceil_by_bucket(self, bucket_duration: i64) -> Option<Self> {
+        assert!(bucket_duration > 0, "{}", bucket_duration);
+        let unit = self.unit();
+        self.value()
+            .align_to_ceil_by_bucket(bucket_duration)
+            .map(|val| Timestamp::new(val, unit))
     }
 }
 
@@ -121,24 +150,81 @@ mod tests {
     #[test]
     fn test_align_by_bucket() {
         let bucket = 100;
-        assert_eq!(0, TimestampMillis::new(0).align_by_bucket(bucket).unwrap());
-        assert_eq!(0, TimestampMillis::new(1).align_by_bucket(bucket).unwrap());
-        assert_eq!(0, TimestampMillis::new(99).align_by_bucket(bucket).unwrap());
         assert_eq!(
-            100,
-            TimestampMillis::new(100).align_by_bucket(bucket).unwrap()
+            Timestamp::new_millisecond(0),
+            Timestamp::new_millisecond(0)
+                .align_by_bucket(bucket)
+                .unwrap()
         );
         assert_eq!(
-            100,
-            TimestampMillis::new(199).align_by_bucket(bucket).unwrap()
+            Timestamp::new_millisecond(0),
+            Timestamp::new_millisecond(1)
+                .align_by_bucket(bucket)
+                .unwrap()
+        );
+        assert_eq!(
+            Timestamp::new_millisecond(0),
+            Timestamp::new_millisecond(99)
+                .align_by_bucket(bucket)
+                .unwrap()
+        );
+        assert_eq!(
+            Timestamp::new_millisecond(100),
+            Timestamp::new_millisecond(100)
+                .align_by_bucket(bucket)
+                .unwrap()
+        );
+        assert_eq!(
+            Timestamp::new_millisecond(100),
+            Timestamp::new_millisecond(199)
+                .align_by_bucket(bucket)
+                .unwrap()
         );
 
-        assert_eq!(0, TimestampMillis::MAX.align_by_bucket(i64::MAX).unwrap());
         assert_eq!(
-            i64::MAX,
-            TimestampMillis::INF.align_by_bucket(i64::MAX).unwrap()
+            Timestamp::new_millisecond(0),
+            Timestamp::new_millisecond(i64::MAX - 1)
+                .align_by_bucket(i64::MAX)
+                .unwrap()
         );
 
-        assert_eq!(None, TimestampMillis::MIN.align_by_bucket(bucket));
+        assert_eq!(
+            Timestamp::new_millisecond(i64::MAX),
+            Timestamp::new_millisecond(i64::MAX)
+                .align_by_bucket(i64::MAX)
+                .unwrap()
+        );
+
+        assert_eq!(
+            None,
+            Timestamp::new_millisecond(i64::MIN).align_by_bucket(bucket)
+        );
+    }
+
+    #[test]
+    fn test_align_to_ceil() {
+        assert_eq!(None, i64::MAX.align_to_ceil_by_bucket(10));
+        assert_eq!(
+            Some(i64::MAX - (i64::MAX % 10)),
+            (i64::MAX - (i64::MAX % 10)).align_to_ceil_by_bucket(10)
+        );
+        assert_eq!(Some(i64::MAX), i64::MAX.align_to_ceil_by_bucket(1));
+        assert_eq!(Some(i64::MAX), i64::MAX.align_to_ceil_by_bucket(1));
+        assert_eq!(Some(i64::MAX), i64::MAX.align_to_ceil_by_bucket(i64::MAX));
+
+        assert_eq!(
+            Some(i64::MIN - (i64::MIN % 10)),
+            i64::MIN.align_to_ceil_by_bucket(10)
+        );
+        assert_eq!(Some(i64::MIN), i64::MIN.align_to_ceil_by_bucket(1));
+
+        assert_eq!(Some(3), 1i64.align_to_ceil_by_bucket(3));
+        assert_eq!(Some(3), 3i64.align_to_ceil_by_bucket(3));
+        assert_eq!(Some(6), 4i64.align_to_ceil_by_bucket(3));
+        assert_eq!(Some(0), 0i64.align_to_ceil_by_bucket(3));
+        assert_eq!(Some(0), (-1i64).align_to_ceil_by_bucket(3));
+        assert_eq!(Some(0), (-2i64).align_to_ceil_by_bucket(3));
+        assert_eq!(Some(-3), (-3i64).align_to_ceil_by_bucket(3));
+        assert_eq!(Some(-3), (-4i64).align_to_ceil_by_bucket(3));
     }
 }

@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,88 +14,167 @@
 
 use std::any::Any;
 
-use common_error::ext::BoxedError;
-use common_error::prelude::{ErrorExt, Snafu};
-use snafu::{Backtrace, ErrorCompat};
+use common_config::wal::KafkaWalTopic;
+use common_error::ext::ErrorExt;
+use common_macro::stack_trace_debug;
+use common_runtime::error::Error as RuntimeError;
+use snafu::{Location, Snafu};
 
-#[derive(Debug, Snafu)]
+use crate::kafka::NamespaceImpl as KafkaNamespace;
+
+#[derive(Snafu)]
 #[snafu(visibility(pub))]
+#[stack_trace_debug]
 pub enum Error {
-    #[snafu(display("Failed to encode entry, source: {}", source))]
-    Encode { source: common_base::buffer::Error },
-
-    #[snafu(display("Failed to decode entry, remain size: {}", size))]
-    Decode { size: usize, backtrace: Backtrace },
-
-    #[snafu(display("No enough data to decode, try again"))]
-    DecodeAgain,
-
-    #[snafu(display("Failed to append entry, source: {}", source))]
-    Append {
-        #[snafu(backtrace)]
-        source: BoxedError,
+    #[snafu(display("Failed to start log store gc task"))]
+    StartGcTask {
+        location: Location,
+        source: RuntimeError,
     },
 
-    #[snafu(display("Failed to wait for log file write complete, source: {}", source))]
-    Write { source: tokio::task::JoinError },
-
-    #[snafu(display("Entry corrupted, msg: {}", msg))]
-    Corrupted { msg: String, backtrace: Backtrace },
-
-    #[snafu(display("IO error, source: {}", source))]
-    Io {
-        source: std::io::Error,
-        backtrace: Backtrace,
+    #[snafu(display("Failed to stop log store gc task"))]
+    StopGcTask {
+        location: Location,
+        source: RuntimeError,
     },
 
-    #[snafu(display("Failed to create path {}, source: {}", path, source))]
-    CreateDir {
-        path: String,
-        source: std::io::Error,
-        backtrace: Backtrace,
+    #[snafu(display("Failed to add entry to LogBatch"))]
+    AddEntryLogBatch {
+        #[snafu(source)]
+        error: raft_engine::Error,
+        location: Location,
     },
 
-    #[snafu(display("Failed to read path {}, source: {}", path, source))]
-    ReadPath {
-        path: String,
-        source: std::io::Error,
-        backtrace: Backtrace,
+    #[snafu(display("Failed to perform raft-engine operation"))]
+    RaftEngine {
+        #[snafu(source)]
+        error: raft_engine::Error,
+        location: Location,
     },
 
-    #[snafu(display("Failed to open log file {}, source: {}", file_name, source))]
-    OpenLog {
-        file_name: String,
-        source: std::io::Error,
-        backtrace: Backtrace,
+    #[snafu(display("Log store not started yet"))]
+    IllegalState { location: Location },
+
+    #[snafu(display("Namespace is illegal: {}", ns))]
+    IllegalNamespace { ns: u64, location: Location },
+
+    #[snafu(display(
+        "Failed to fetch entries from namespace: {}, start: {}, end: {}, max size: {}",
+        ns,
+        start,
+        end,
+        max_size,
+    ))]
+    FetchEntry {
+        ns: u64,
+        start: u64,
+        end: u64,
+        max_size: usize,
+        #[snafu(source)]
+        error: raft_engine::Error,
+        location: Location,
     },
 
-    #[snafu(display("File name {} illegal", file_name))]
-    FileNameIllegal {
-        file_name: String,
-        backtrace: Backtrace,
+    #[snafu(display(
+        "Cannot override compacted entry, namespace: {}, first index: {}, attempt index: {}",
+        namespace,
+        first_index,
+        attempt_index
+    ))]
+    OverrideCompactedEntry {
+        namespace: u64,
+        first_index: u64,
+        attempt_index: u64,
+        location: Location,
     },
 
-    #[snafu(display("Internal error, msg: {}", msg))]
-    Internal { msg: String, backtrace: Backtrace },
+    #[snafu(display(
+        "Failed to build a Kafka client, broker endpoints: {:?}",
+        broker_endpoints
+    ))]
+    BuildClient {
+        broker_endpoints: Vec<String>,
+        location: Location,
+        #[snafu(source)]
+        error: rskafka::client::error::Error,
+    },
 
-    #[snafu(display("End of LogFile"))]
-    Eof,
+    #[snafu(display(
+        "Failed to build a Kafka partition client, topic: {}, partition: {}",
+        topic,
+        partition
+    ))]
+    BuildPartitionClient {
+        topic: String,
+        partition: i32,
+        location: Location,
+        #[snafu(source)]
+        error: rskafka::client::error::Error,
+    },
 
-    #[snafu(display("File duplicate on start: {}", msg))]
-    DuplicateFile { msg: String },
+    #[snafu(display(
+        "Failed to get a Kafka topic client, topic: {}, source: {}",
+        topic,
+        error
+    ))]
+    GetClient {
+        topic: KafkaWalTopic,
+        location: Location,
+        error: String,
+    },
 
-    #[snafu(display("Log file suffix is illegal: {}", suffix))]
-    SuffixIllegal { suffix: String },
+    #[snafu(display("Failed to encode a record meta"))]
+    EncodeMeta {
+        location: Location,
+        #[snafu(source)]
+        error: serde_json::Error,
+    },
 
-    #[snafu(display("Failed while waiting for write to finish, source: {}", source))]
-    WaitWrite { source: tokio::task::JoinError },
+    #[snafu(display("Failed to decode a record meta"))]
+    DecodeMeta {
+        location: Location,
+        #[snafu(source)]
+        error: serde_json::Error,
+    },
+
+    #[snafu(display("Missing required key in a record"))]
+    MissingKey { location: Location },
+
+    #[snafu(display("Missing required value in a record"))]
+    MissingValue { location: Location },
+
+    #[snafu(display("Cannot build a record from empty entries"))]
+    EmptyEntries { location: Location },
+
+    #[snafu(display("Failed to produce records to Kafka, topic: {}", topic))]
+    ProduceRecord {
+        topic: KafkaWalTopic,
+        location: Location,
+        #[snafu(source)]
+        error: rskafka::client::producer::Error,
+    },
+
+    #[snafu(display("Failed to read a record from Kafka, ns: {}", ns))]
+    ConsumeRecord {
+        ns: KafkaNamespace,
+        location: Location,
+        #[snafu(source)]
+        error: rskafka::client::error::Error,
+    },
+
+    #[snafu(display("Failed to get the latest offset, ns: {}", ns))]
+    GetOffset {
+        ns: KafkaNamespace,
+        location: Location,
+        #[snafu(source)]
+        error: rskafka::client::error::Error,
+    },
+
+    #[snafu(display("Failed to do a cast"))]
+    Cast { location: Location },
 }
 
 impl ErrorExt for Error {
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }

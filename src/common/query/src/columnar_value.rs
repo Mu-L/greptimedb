@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -33,7 +33,7 @@ impl ColumnarValue {
         match self {
             ColumnarValue::Vector(vector) => vector.data_type(),
             ColumnarValue::Scalar(scalar_value) => {
-                ConcreteDataType::from_arrow_type(&scalar_value.get_datatype())
+                ConcreteDataType::from_arrow_type(&scalar_value.data_type())
             }
         }
     }

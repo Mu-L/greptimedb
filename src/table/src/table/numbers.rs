@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,102 +12,103 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use common_query::physical_plan::PhysicalPlanRef;
+use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use common_error::ext::BoxedError;
 use common_recordbatch::error::Result as RecordBatchResult;
-use common_recordbatch::{RecordBatch, RecordBatchStream};
-use datafusion_common::record_batch::RecordBatch as DfRecordBatch;
+use common_recordbatch::{RecordBatch, RecordBatchStream, SendableRecordBatchStream};
+use datafusion::arrow::record_batch::RecordBatch as DfRecordBatch;
 use datatypes::arrow::array::UInt32Array;
 use datatypes::data_type::ConcreteDataType;
 use datatypes::schema::{ColumnSchema, SchemaBuilder, SchemaRef};
 use futures::task::{Context, Poll};
 use futures::Stream;
+use store_api::data_source::DataSource;
+use store_api::storage::ScanRequest;
 
-use crate::error::Result;
-use crate::metadata::{TableId, TableInfoBuilder, TableInfoRef, TableMetaBuilder, TableType};
-use crate::table::scan::SimpleTableScan;
-use crate::table::{Expr, Table};
+use crate::metadata::{
+    FilterPushDownType, TableId, TableInfoBuilder, TableInfoRef, TableMetaBuilder, TableType,
+};
+use crate::thin_table::{ThinTable, ThinTableAdapter};
+use crate::TableRef;
+
+const NUMBER_COLUMN: &str = "number";
+
+pub const NUMBERS_TABLE_NAME: &str = "numbers";
 
 /// numbers table for test
 #[derive(Debug, Clone)]
-pub struct NumbersTable {
-    table_id: TableId,
-    schema: SchemaRef,
-}
+pub struct NumbersTable;
 
 impl NumbersTable {
-    pub fn new(table_id: TableId) -> Self {
+    pub fn table(table_id: TableId) -> TableRef {
+        Self::table_with_name(table_id, NUMBERS_TABLE_NAME.to_string())
+    }
+
+    pub fn table_with_name(table_id: TableId, name: String) -> TableRef {
+        let thin_table = ThinTable::new(
+            Self::table_info(table_id, name, "test_engine".to_string()),
+            FilterPushDownType::Unsupported,
+        );
+        let data_source = Arc::new(NumbersDataSource::new(Self::schema()));
+        Arc::new(ThinTableAdapter::new(thin_table, data_source))
+    }
+
+    pub fn schema() -> SchemaRef {
         let column_schemas = vec![ColumnSchema::new(
-            "number",
+            NUMBER_COLUMN,
             ConcreteDataType::uint32_datatype(),
             false,
         )];
-        Self {
-            table_id,
-            schema: Arc::new(
-                SchemaBuilder::try_from_columns(column_schemas)
-                    .unwrap()
-                    .build()
-                    .unwrap(),
-            ),
-        }
+        let schema = SchemaBuilder::try_from_columns(column_schemas)
+            .unwrap()
+            .build()
+            .unwrap();
+        Arc::new(schema)
+    }
+
+    pub fn table_info(table_id: TableId, name: String, engine: String) -> TableInfoRef {
+        let table_meta = TableMetaBuilder::default()
+            .schema(Self::schema())
+            .region_numbers(vec![0])
+            .primary_key_indices(vec![0])
+            .next_column_id(1)
+            .engine(engine)
+            .build()
+            .unwrap();
+        let table_info = TableInfoBuilder::default()
+            .table_id(table_id)
+            .name(name)
+            .catalog_name(DEFAULT_CATALOG_NAME)
+            .schema_name(DEFAULT_SCHEMA_NAME)
+            .table_version(0)
+            .table_type(TableType::Temporary)
+            .meta(table_meta)
+            .build()
+            .unwrap();
+        Arc::new(table_info)
     }
 }
 
-impl Default for NumbersTable {
-    fn default() -> Self {
-        NumbersTable::new(1)
+struct NumbersDataSource {
+    schema: SchemaRef,
+}
+
+impl NumbersDataSource {
+    pub fn new(schema: SchemaRef) -> Self {
+        Self { schema }
     }
 }
 
-#[async_trait::async_trait]
-impl Table for NumbersTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn table_info(&self) -> TableInfoRef {
-        Arc::new(
-            TableInfoBuilder::default()
-                .table_id(self.table_id)
-                .name("numbers")
-                .catalog_name("greptime")
-                .schema_name("public")
-                .table_version(0)
-                .table_type(TableType::Base)
-                .meta(
-                    TableMetaBuilder::default()
-                        .schema(self.schema.clone())
-                        .region_numbers(vec![0])
-                        .primary_key_indices(vec![0])
-                        .next_column_id(1)
-                        .build()
-                        .unwrap(),
-                )
-                .build()
-                .unwrap(),
-        )
-    }
-
-    async fn scan(
-        &self,
-        _projection: &Option<Vec<usize>>,
-        _filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<PhysicalPlanRef> {
-        let stream = Box::pin(NumbersStream {
-            limit: limit.unwrap_or(100) as u32,
+impl DataSource for NumbersDataSource {
+    fn get_stream(&self, request: ScanRequest) -> Result<SendableRecordBatchStream, BoxedError> {
+        Ok(Box::pin(NumbersStream {
+            limit: request.limit.unwrap_or(100) as u32,
             schema: self.schema.clone(),
             already_run: false,
-        });
-        Ok(Arc::new(SimpleTableScan::new(stream)))
+        }))
     }
 }
 
@@ -135,13 +136,13 @@ impl Stream for NumbersStream {
         let numbers: Vec<u32> = (0..self.limit).collect();
         let batch = DfRecordBatch::try_new(
             self.schema.arrow_schema().clone(),
-            vec![Arc::new(UInt32Array::from_slice(&numbers))],
+            vec![Arc::new(UInt32Array::from(numbers))],
         )
         .unwrap();
 
-        Poll::Ready(Some(Ok(RecordBatch {
-            schema: self.schema.clone(),
-            df_recordbatch: batch,
-        })))
+        Poll::Ready(Some(RecordBatch::try_from_df_record_batch(
+            self.schema.clone(),
+            batch,
+        )))
     }
 }

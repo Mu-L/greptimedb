@@ -1,10 +1,10 @@
-// Copyright 2022 Greptime Team
+// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,21 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use snafu::{ensure, ResultExt};
+use snafu::ResultExt;
+use sqlparser::ast::Ident;
 use sqlparser::dialect::Dialect;
 use sqlparser::keywords::Keyword;
-use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::{Token, Tokenizer};
+use sqlparser::parser::{Parser, ParserError, ParserOptions};
+use sqlparser::tokenizer::{Token, TokenWithLocation};
 
-use crate::error::{
-    self, InvalidDatabaseNameSnafu, InvalidTableNameSnafu, Result, SyntaxSnafu, TokenizerSnafu,
-};
-use crate::statements::describe::DescribeTable;
-use crate::statements::drop::DropTable;
-use crate::statements::explain::Explain;
-use crate::statements::show::{ShowCreateTable, ShowDatabases, ShowKind, ShowTables};
+use crate::ast::{Expr, ObjectName};
+use crate::error::{self, Result, SyntaxSnafu};
+use crate::parsers::tql_parser;
 use crate::statements::statement::Statement;
-use crate::statements::table_idents_to_full_name;
+use crate::statements::transform_statements;
 
 /// GrepTime SQL parser context, a simple wrapper for Datafusion SQL parser.
 pub struct ParserContext<'a> {
@@ -38,14 +35,12 @@ impl<'a> ParserContext<'a> {
     /// Parses SQL with given dialect
     pub fn create_with_dialect(sql: &'a str, dialect: &dyn Dialect) -> Result<Vec<Statement>> {
         let mut stmts: Vec<Statement> = Vec::new();
-        let mut tokenizer = Tokenizer::new(dialect, sql);
 
-        let tokens: Vec<Token> = tokenizer.tokenize().context(TokenizerSnafu { sql })?;
-
-        let mut parser_ctx = ParserContext {
-            sql,
-            parser: Parser::new(tokens, dialect),
-        };
+        let parser = Parser::new(dialect)
+            .with_options(ParserOptions::new().with_trailing_commas(true))
+            .try_with_sql(sql)
+            .context(SyntaxSnafu)?;
+        let mut parser_ctx = ParserContext { sql, parser };
 
         let mut expecting_statement_delimiter = false;
         loop {
@@ -66,31 +61,47 @@ impl<'a> ParserContext<'a> {
             expecting_statement_delimiter = true;
         }
 
+        transform_statements(&mut stmts)?;
+
         Ok(stmts)
+    }
+
+    pub fn parse_function(sql: &'a str, dialect: &dyn Dialect) -> Result<Expr> {
+        let mut parser = Parser::new(dialect)
+            .with_options(ParserOptions::new().with_trailing_commas(true))
+            .try_with_sql(sql)
+            .context(SyntaxSnafu)?;
+
+        let function_name = parser.parse_identifier().context(SyntaxSnafu)?;
+        parser
+            .parse_function(ObjectName(vec![function_name]))
+            .context(SyntaxSnafu)
     }
 
     /// Parses parser context to a set of statements.
     pub fn parse_statement(&mut self) -> Result<Statement> {
-        match self.parser.peek_token() {
+        match self.parser.peek_token().token {
             Token::Word(w) => {
                 match w.keyword {
                     Keyword::CREATE => {
-                        self.parser.next_token();
+                        let _ = self.parser.next_token();
                         self.parse_create()
                     }
 
                     Keyword::EXPLAIN => {
-                        self.parser.next_token();
+                        let _ = self.parser.next_token();
                         self.parse_explain()
                     }
 
                     Keyword::SHOW => {
-                        self.parser.next_token();
+                        let _ = self.parser.next_token();
                         self.parse_show()
                     }
 
+                    Keyword::DELETE => self.parse_delete(),
+
                     Keyword::DESCRIBE | Keyword::DESC => {
-                        self.parser.next_token();
+                        let _ = self.parser.next_token();
                         self.parse_describe()
                     }
 
@@ -102,19 +113,14 @@ impl<'a> ParserContext<'a> {
 
                     Keyword::DROP => self.parse_drop(),
 
-                    // TODO(LFC): Use "Keyword::USE" when we can upgrade to newer version of crate sqlparser.
-                    Keyword::NoKeyword if w.value.to_lowercase() == "use" => {
-                        self.parser.next_token();
+                    Keyword::COPY => self.parse_copy(),
 
-                        let database_name =
-                            self.parser
-                                .parse_identifier()
-                                .context(error::UnexpectedSnafu {
-                                    sql: self.sql,
-                                    expected: "a database name",
-                                    actual: self.peek_token_as_string(),
-                                })?;
-                        Ok(Statement::Use(database_name.value))
+                    Keyword::TRUNCATE => self.parse_truncate(),
+
+                    Keyword::NoKeyword
+                        if w.value.to_uppercase() == tql_parser::TQL && w.quote_style.is_none() =>
+                    {
+                        self.parse_tql()
                     }
 
                     // todo(hl) support more statements.
@@ -135,201 +141,16 @@ impl<'a> ParserContext<'a> {
         .fail()
     }
 
-    /// Parses SHOW statements
-    /// todo(hl) support `show settings`/`show create`/`show users` etc.
-    fn parse_show(&mut self) -> Result<Statement> {
-        if self.consume_token("DATABASES") || self.consume_token("SCHEMAS") {
-            self.parse_show_databases()
-        } else if self.matches_keyword(Keyword::TABLES) {
-            self.parser.next_token();
-            self.parse_show_tables()
-        } else if self.consume_token("CREATE") {
-            if self.consume_token("TABLE") {
-                self.parse_show_create_table()
-            } else {
-                self.unsupported(self.peek_token_as_string())
-            }
-        } else {
-            self.unsupported(self.peek_token_as_string())
-        }
-    }
-
-    /// Parse SHOW CREATE TABLE statement
-    fn parse_show_create_table(&mut self) -> Result<Statement> {
-        let table_name =
-            self.parser
-                .parse_object_name()
-                .with_context(|_| error::UnexpectedSnafu {
-                    sql: self.sql,
-                    expected: "a table name",
-                    actual: self.peek_token_as_string(),
-                })?;
-        ensure!(
-            !table_name.0.is_empty(),
-            InvalidTableNameSnafu {
-                name: table_name.to_string(),
-            }
-        );
-        Ok(Statement::ShowCreateTable(ShowCreateTable {
-            table_name: table_name.to_string(),
-        }))
-    }
-
-    fn parse_show_tables(&mut self) -> Result<Statement> {
-        let database = match self.parser.peek_token() {
-            Token::EOF | Token::SemiColon => {
-                return Ok(Statement::ShowTables(ShowTables {
-                    kind: ShowKind::All,
-                    database: None,
-                }));
-            }
-
-            // SHOW TABLES [in | FROM] [DATABASE]
-            Token::Word(w) => match w.keyword {
-                Keyword::IN | Keyword::FROM => {
-                    self.parser.next_token();
-                    let db_name = self.parser.parse_object_name().with_context(|_| {
-                        error::UnexpectedSnafu {
-                            sql: self.sql,
-                            expected: "a database name",
-                            actual: self.peek_token_as_string(),
-                        }
-                    })?;
-
-                    ensure!(
-                        db_name.0.len() == 1,
-                        InvalidDatabaseNameSnafu {
-                            name: db_name.to_string(),
-                        }
-                    );
-
-                    Some(db_name.to_string())
-                }
-
-                _ => None,
-            },
-            _ => None,
-        };
-
-        let kind = match self.parser.peek_token() {
-            Token::EOF | Token::SemiColon => ShowKind::All,
-            // SHOW TABLES [WHERE | LIKE] [EXPR]
-            Token::Word(w) => match w.keyword {
-                Keyword::LIKE => {
-                    self.parser.next_token();
-                    ShowKind::Like(self.parser.parse_identifier().with_context(|_| {
-                        error::UnexpectedSnafu {
-                            sql: self.sql,
-                            expected: "LIKE",
-                            actual: self.peek_token_as_string(),
-                        }
-                    })?)
-                }
-                Keyword::WHERE => {
-                    self.parser.next_token();
-                    ShowKind::Where(self.parser.parse_expr().with_context(|_| {
-                        error::UnexpectedSnafu {
-                            sql: self.sql,
-                            expected: "some valid expression",
-                            actual: self.peek_token_as_string(),
-                        }
-                    })?)
-                }
-                _ => return self.unsupported(self.peek_token_as_string()),
-            },
-            _ => return self.unsupported(self.peek_token_as_string()),
-        };
-
-        Ok(Statement::ShowTables(ShowTables { kind, database }))
-    }
-
-    /// Parses DESCRIBE statements
-    fn parse_describe(&mut self) -> Result<Statement> {
-        if self.matches_keyword(Keyword::TABLE) {
-            self.parser.next_token();
-            self.parse_describe_table()
-        } else {
-            self.unsupported(self.peek_token_as_string())
-        }
-    }
-
-    fn parse_describe_table(&mut self) -> Result<Statement> {
-        let table_idents =
-            self.parser
-                .parse_object_name()
-                .with_context(|_| error::UnexpectedSnafu {
-                    sql: self.sql,
-                    expected: "a table name",
-                    actual: self.peek_token_as_string(),
-                })?;
-        ensure!(
-            !table_idents.0.is_empty(),
-            InvalidTableNameSnafu {
-                name: table_idents.to_string(),
-            }
-        );
-        let (catalog_name, schema_name, table_name) = table_idents_to_full_name(&table_idents)?;
-        Ok(Statement::DescribeTable(DescribeTable {
-            catalog_name,
-            schema_name,
-            table_name,
-        }))
-    }
-
-    fn parse_explain(&mut self) -> Result<Statement> {
-        let explain_statement =
-            self.parser
-                .parse_explain(false)
-                .with_context(|_| error::UnexpectedSnafu {
-                    sql: self.sql,
-                    expected: "a query statement",
-                    actual: self.peek_token_as_string(),
-                })?;
-
-        Ok(Statement::Explain(Explain::try_from(explain_statement)?))
-    }
-
-    fn parse_drop(&mut self) -> Result<Statement> {
-        self.parser.next_token();
-        if !self.matches_keyword(Keyword::TABLE) {
-            return self.unsupported(self.peek_token_as_string());
-        }
-        self.parser.next_token();
-
-        let table_ident =
-            self.parser
-                .parse_object_name()
-                .with_context(|_| error::UnexpectedSnafu {
-                    sql: self.sql,
-                    expected: "a table name",
-                    actual: self.peek_token_as_string(),
-                })?;
-        ensure!(
-            !table_ident.0.is_empty(),
-            InvalidTableNameSnafu {
-                name: table_ident.to_string()
-            }
-        );
-
-        let (catalog_name, schema_name, table_name) = table_idents_to_full_name(&table_ident)?;
-        Ok(Statement::DropTable(DropTable {
-            catalog_name,
-            schema_name,
-            table_name,
-        }))
-    }
-
     // Report unexpected token
-    pub(crate) fn expected<T>(&self, expected: &str, found: Token) -> Result<T> {
+    pub(crate) fn expected<T>(&self, expected: &str, found: TokenWithLocation) -> Result<T> {
         Err(ParserError::ParserError(format!(
-            "Expected {}, found: {}",
-            expected, found
+            "Expected {expected}, found: {found}",
         )))
-        .context(SyntaxSnafu { sql: self.sql })
+        .context(SyntaxSnafu)
     }
 
     pub fn matches_keyword(&mut self, expected: Keyword) -> bool {
-        match self.parser.peek_token() {
+        match self.parser.peek_token().token {
             Token::Word(w) => w.keyword == expected,
             _ => false,
         }
@@ -337,7 +158,7 @@ impl<'a> ParserContext<'a> {
 
     pub fn consume_token(&mut self, expected: &str) -> bool {
         if self.peek_token_as_string().to_uppercase() == *expected.to_uppercase() {
-            self.parser.next_token();
+            let _ = self.parser.next_token();
             true
         } else {
             false
@@ -349,275 +170,87 @@ impl<'a> ParserContext<'a> {
         self.parser.peek_token().to_string()
     }
 
-    /// Parses `SHOW DATABASES` statement.
-    pub fn parse_show_databases(&mut self) -> Result<Statement> {
-        let tok = self.parser.next_token();
-        match &tok {
-            Token::EOF | Token::SemiColon => {
-                Ok(Statement::ShowDatabases(ShowDatabases::new(ShowKind::All)))
+    /// Canonicalize the identifier to lowercase if it's not quoted.
+    pub fn canonicalize_identifier(ident: Ident) -> Ident {
+        if ident.quote_style.is_some() {
+            ident
+        } else {
+            Ident {
+                value: ident.value.to_lowercase(),
+                quote_style: None,
             }
-            Token::Word(w) => match w.keyword {
-                Keyword::LIKE => Ok(Statement::ShowDatabases(ShowDatabases::new(
-                    ShowKind::Like(self.parser.parse_identifier().with_context(|_| {
-                        error::UnexpectedSnafu {
-                            sql: self.sql,
-                            expected: "LIKE",
-                            actual: tok.to_string(),
-                        }
-                    })?),
-                ))),
-                Keyword::WHERE => Ok(Statement::ShowDatabases(ShowDatabases::new(
-                    ShowKind::Where(self.parser.parse_expr().with_context(|_| {
-                        error::UnexpectedSnafu {
-                            sql: self.sql,
-                            expected: "some valid expression",
-                            actual: self.peek_token_as_string(),
-                        }
-                    })?),
-                ))),
-                _ => self.unsupported(self.peek_token_as_string()),
-            },
-            _ => self.unsupported(self.peek_token_as_string()),
         }
+    }
+
+    /// Like [canonicalize_identifier] but for [ObjectName].
+    pub fn canonicalize_object_name(object_name: ObjectName) -> ObjectName {
+        ObjectName(
+            object_name
+                .0
+                .into_iter()
+                .map(Self::canonicalize_identifier)
+                .collect(),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches::assert_matches;
 
-    use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
-    use sqlparser::ast::{Query as SpQuery, Statement as SpStatement};
-    use sqlparser::dialect::GenericDialect;
+    use datatypes::prelude::ConcreteDataType;
 
     use super::*;
+    use crate::dialect::GreptimeDbDialect;
+    use crate::statements::create::CreateTable;
+    use crate::statements::sql_data_type_to_concrete_data_type;
+
+    fn test_timestamp_precision(sql: &str, expected_type: ConcreteDataType) {
+        match ParserContext::create_with_dialect(sql, &GreptimeDbDialect {})
+            .unwrap()
+            .pop()
+            .unwrap()
+        {
+            Statement::CreateTable(CreateTable { columns, .. }) => {
+                let ts_col = columns.first().unwrap();
+                assert_eq!(
+                    expected_type,
+                    sql_data_type_to_concrete_data_type(&ts_col.data_type).unwrap()
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
 
     #[test]
-    pub fn test_show_database_all() {
-        let sql = "SHOW DATABASES";
-        let result = ParserContext::create_with_dialect(sql, &GenericDialect {});
-        let stmts = result.unwrap();
-        assert_eq!(1, stmts.len());
-
-        assert_matches!(
-            &stmts[0],
-            Statement::ShowDatabases(ShowDatabases {
-                kind: ShowKind::All
-            })
+    pub fn test_create_table_with_precision() {
+        test_timestamp_precision(
+            "create table demo (ts timestamp time index, cnt int);",
+            ConcreteDataType::timestamp_millisecond_datatype(),
+        );
+        test_timestamp_precision(
+            "create table demo (ts timestamp(0) time index, cnt int);",
+            ConcreteDataType::timestamp_second_datatype(),
+        );
+        test_timestamp_precision(
+            "create table demo (ts timestamp(3) time index, cnt int);",
+            ConcreteDataType::timestamp_millisecond_datatype(),
+        );
+        test_timestamp_precision(
+            "create table demo (ts timestamp(6) time index, cnt int);",
+            ConcreteDataType::timestamp_microsecond_datatype(),
+        );
+        test_timestamp_precision(
+            "create table demo (ts timestamp(9) time index, cnt int);",
+            ConcreteDataType::timestamp_nanosecond_datatype(),
         );
     }
 
     #[test]
-    pub fn test_show_database_like() {
-        let sql = "SHOW DATABASES LIKE test_database";
-        let result = ParserContext::create_with_dialect(sql, &GenericDialect {});
-        let stmts = result.unwrap();
-        assert_eq!(1, stmts.len());
-
-        assert_matches!(
-            &stmts[0],
-            Statement::ShowDatabases(ShowDatabases {
-                kind: ShowKind::Like(sqlparser::ast::Ident {
-                    value: _,
-                    quote_style: None,
-                })
-            })
+    #[should_panic]
+    pub fn test_create_table_with_invalid_precision() {
+        test_timestamp_precision(
+            "create table demo (ts timestamp(1) time index, cnt int);",
+            ConcreteDataType::timestamp_millisecond_datatype(),
         );
-    }
-
-    #[test]
-    pub fn test_show_database_where() {
-        let sql = "SHOW DATABASES WHERE Database LIKE '%whatever1%' OR Database LIKE '%whatever2%'";
-        let result = ParserContext::create_with_dialect(sql, &GenericDialect {});
-        let stmts = result.unwrap();
-        assert_eq!(1, stmts.len());
-
-        assert_matches!(
-            &stmts[0],
-            Statement::ShowDatabases(ShowDatabases {
-                kind: ShowKind::Where(sqlparser::ast::Expr::BinaryOp {
-                    left: _,
-                    right: _,
-                    op: sqlparser::ast::BinaryOperator::Or,
-                })
-            })
-        );
-    }
-
-    #[test]
-    pub fn test_show_tables_all() {
-        let sql = "SHOW TABLES";
-        let result = ParserContext::create_with_dialect(sql, &GenericDialect {});
-        let stmts = result.unwrap();
-        assert_eq!(1, stmts.len());
-
-        assert_matches!(
-            &stmts[0],
-            Statement::ShowTables(ShowTables {
-                kind: ShowKind::All,
-                database: None,
-            })
-        );
-    }
-
-    #[test]
-    pub fn test_show_tables_like() {
-        let sql = "SHOW TABLES LIKE test_table";
-        let result = ParserContext::create_with_dialect(sql, &GenericDialect {});
-        let stmts = result.unwrap();
-        assert_eq!(1, stmts.len());
-
-        assert_matches!(
-            &stmts[0],
-            Statement::ShowTables(ShowTables {
-                kind: ShowKind::Like(sqlparser::ast::Ident {
-                    value: _,
-                    quote_style: None,
-                }),
-                database: None,
-            })
-        );
-
-        let sql = "SHOW TABLES in test_db LIKE test_table";
-        let result = ParserContext::create_with_dialect(sql, &GenericDialect {});
-        let stmts = result.unwrap();
-        assert_eq!(1, stmts.len());
-
-        assert_matches!(
-            &stmts[0],
-            Statement::ShowTables(ShowTables {
-                kind: ShowKind::Like(sqlparser::ast::Ident {
-                    value: _,
-                    quote_style: None,
-                }),
-                database: Some(_),
-            })
-        );
-    }
-
-    #[test]
-    pub fn test_show_tables_where() {
-        let sql = "SHOW TABLES where name like test_table";
-        let result = ParserContext::create_with_dialect(sql, &GenericDialect {});
-        let stmts = result.unwrap();
-        assert_eq!(1, stmts.len());
-
-        assert_matches!(
-            &stmts[0],
-            Statement::ShowTables(ShowTables {
-                kind: ShowKind::Where(sqlparser::ast::Expr::BinaryOp {
-                    left: _,
-                    right: _,
-                    op: sqlparser::ast::BinaryOperator::Like,
-                }),
-                database: None,
-            })
-        );
-
-        let sql = "SHOW TABLES in test_db where name LIKE test_table";
-        let result = ParserContext::create_with_dialect(sql, &GenericDialect {});
-        let stmts = result.unwrap();
-        assert_eq!(1, stmts.len());
-
-        assert_matches!(
-            &stmts[0],
-            Statement::ShowTables(ShowTables {
-                kind: ShowKind::Where(sqlparser::ast::Expr::BinaryOp {
-                    left: _,
-                    right: _,
-                    op: sqlparser::ast::BinaryOperator::Like,
-                }),
-                database: Some(_),
-            })
-        );
-    }
-
-    #[test]
-    pub fn test_explain() {
-        let sql = "EXPLAIN select * from foo";
-        let result = ParserContext::create_with_dialect(sql, &GenericDialect {});
-        let stmts = result.unwrap();
-        assert_eq!(1, stmts.len());
-
-        let select = sqlparser::ast::Select {
-            distinct: false,
-            top: None,
-            projection: vec![sqlparser::ast::SelectItem::Wildcard],
-            from: vec![sqlparser::ast::TableWithJoins {
-                relation: sqlparser::ast::TableFactor::Table {
-                    name: sqlparser::ast::ObjectName(vec![sqlparser::ast::Ident::new("foo")]),
-                    alias: None,
-                    args: vec![],
-                    with_hints: vec![],
-                },
-                joins: vec![],
-            }],
-            lateral_views: vec![],
-            selection: None,
-            group_by: vec![],
-            cluster_by: vec![],
-            distribute_by: vec![],
-            sort_by: vec![],
-            having: None,
-        };
-
-        let sp_statement = SpStatement::Query(Box::new(SpQuery {
-            with: None,
-            body: sqlparser::ast::SetExpr::Select(Box::new(select)),
-            order_by: vec![],
-            limit: None,
-            offset: None,
-            fetch: None,
-            lock: None,
-        }));
-
-        let explain = Explain::try_from(SpStatement::Explain {
-            describe_alias: false,
-            analyze: false,
-            verbose: false,
-            statement: Box::new(sp_statement),
-        })
-        .unwrap();
-
-        assert_eq!(stmts[0], Statement::Explain(explain))
-    }
-
-    #[test]
-    pub fn test_drop_table() {
-        let sql = "DROP TABLE foo";
-        let result = ParserContext::create_with_dialect(sql, &GenericDialect {});
-        let mut stmts = result.unwrap();
-        assert_eq!(
-            stmts.pop().unwrap(),
-            Statement::DropTable(DropTable {
-                catalog_name: DEFAULT_CATALOG_NAME.to_string(),
-                schema_name: DEFAULT_SCHEMA_NAME.to_string(),
-                table_name: "foo".to_string()
-            })
-        );
-
-        let sql = "DROP TABLE my_schema.foo";
-        let result = ParserContext::create_with_dialect(sql, &GenericDialect {});
-        let mut stmts = result.unwrap();
-        assert_eq!(
-            stmts.pop().unwrap(),
-            Statement::DropTable(DropTable {
-                catalog_name: DEFAULT_CATALOG_NAME.to_string(),
-                schema_name: "my_schema".to_string(),
-                table_name: "foo".to_string()
-            })
-        );
-
-        let sql = "DROP TABLE my_catalog.my_schema.foo";
-        let result = ParserContext::create_with_dialect(sql, &GenericDialect {});
-        let mut stmts = result.unwrap();
-        assert_eq!(
-            stmts.pop().unwrap(),
-            Statement::DropTable(DropTable {
-                catalog_name: "my_catalog".to_string(),
-                schema_name: "my_schema".to_string(),
-                table_name: "foo".to_string()
-            })
-        )
     }
 }
