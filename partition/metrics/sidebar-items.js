@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["METRIC_TABLE_ROUTE_GET"]};
