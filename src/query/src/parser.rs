@@ -20,24 +20,28 @@ use std::time::{Duration, SystemTime};
 use chrono::DateTime;
 use common_error::ext::{BoxedError, PlainError};
 use common_error::status_code::StatusCode;
+use common_telemetry::tracing;
 use promql_parser::parser::ast::{Extension as NodeExtension, ExtensionExpr};
+use promql_parser::parser::value::ValueType;
 use promql_parser::parser::Expr::Extension;
-use promql_parser::parser::{EvalStmt, Expr, ValueType};
+use promql_parser::parser::{EvalStmt, Expr};
+use session::context::QueryContextRef;
 use snafu::{OptionExt, ResultExt};
 use sql::dialect::GreptimeDbDialect;
-use sql::parser::ParserContext;
+use sql::parser::{ParseOptions, ParserContext};
 use sql::statements::statement::Statement;
 
 use crate::error::{
     AddSystemTimeOverflowSnafu, MultipleStatementsSnafu, ParseFloatSnafu, ParseTimestampSnafu,
     QueryParseSnafu, Result, UnimplementedSnafu,
 };
-use crate::metrics::{METRIC_PARSE_PROMQL_ELAPSED, METRIC_PARSE_SQL_ELAPSED};
+use crate::metrics::{PARSE_PROMQL_ELAPSED, PARSE_SQL_ELAPSED};
 
-const DEFAULT_LOOKBACK: u64 = 5 * 60; // 5m
 pub const DEFAULT_LOOKBACK_STRING: &str = "5m";
 pub const EXPLAIN_NODE_NAME: &str = "EXPLAIN";
+pub const EXPLAIN_VERBOSE_NODE_NAME: &str = "EXPLAIN VERBOSE";
 pub const ANALYZE_NODE_NAME: &str = "ANALYZE";
+pub const ANALYZE_VERBOSE_NODE_NAME: &str = "ANALYZE VERBOSE";
 
 #[derive(Debug, Clone)]
 pub enum QueryStatement {
@@ -74,8 +78,14 @@ impl QueryStatement {
             ANALYZE_NODE_NAME => Some(NodeExtension {
                 expr: Arc::new(AnalyzeExpr { expr: expr.clone() }),
             }),
+            ANALYZE_VERBOSE_NODE_NAME => Some(NodeExtension {
+                expr: Arc::new(AnalyzeVerboseExpr { expr: expr.clone() }),
+            }),
             EXPLAIN_NODE_NAME => Some(NodeExtension {
                 expr: Arc::new(ExplainExpr { expr: expr.clone() }),
+            }),
+            EXPLAIN_VERBOSE_NODE_NAME => Some(NodeExtension {
+                expr: Arc::new(ExplainVerboseExpr { expr: expr.clone() }),
             }),
             _ => None,
         }
@@ -88,6 +98,7 @@ pub struct PromQuery {
     pub start: String,
     pub end: String,
     pub step: String,
+    pub lookback: String,
 }
 
 impl Default for PromQuery {
@@ -97,20 +108,22 @@ impl Default for PromQuery {
             start: String::from("0"),
             end: String::from("0"),
             step: String::from("5m"),
+            lookback: String::from(DEFAULT_LOOKBACK_STRING),
         }
     }
 }
 
+/// Query language parser, supports parsing SQL and PromQL
 pub struct QueryLanguageParser {}
 
 impl QueryLanguageParser {
-    pub fn parse_sql(sql: &str) -> Result<QueryStatement> {
-        let _timer = METRIC_PARSE_SQL_ELAPSED.start_timer();
-        let mut statement = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {})
-            .map_err(BoxedError::new)
-            .context(QueryParseSnafu {
-                query: sql.to_string(),
-            })?;
+    /// Try to parse SQL with GreptimeDB dialect, return the statement when success.
+    pub fn parse_sql(sql: &str, _query_ctx: &QueryContextRef) -> Result<QueryStatement> {
+        let _timer = PARSE_SQL_ELAPSED.start_timer();
+        let mut statement =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .map_err(BoxedError::new)
+                .context(QueryParseSnafu { query: sql })?;
         if statement.len() != 1 {
             MultipleStatementsSnafu {
                 query: sql.to_string(),
@@ -121,8 +134,10 @@ impl QueryLanguageParser {
         }
     }
 
-    pub fn parse_promql(query: &PromQuery) -> Result<QueryStatement> {
-        let _timer = METRIC_PARSE_PROMQL_ELAPSED.start_timer();
+    /// Try to parse PromQL, return the statement when success.
+    #[tracing::instrument(skip_all)]
+    pub fn parse_promql(query: &PromQuery, _query_ctx: &QueryContextRef) -> Result<QueryStatement> {
+        let _timer = PARSE_PROMQL_ELAPSED.start_timer();
 
         let expr = promql_parser::parser::parse(&query.query)
             .map_err(|msg| BoxedError::new(PlainError::new(msg, StatusCode::InvalidArguments)))
@@ -152,13 +167,22 @@ impl QueryLanguageParser {
                 query: &query.query,
             })?;
 
+        let lookback_delta = query
+            .lookback
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .or_else(|_| promql_parser::util::parse_duration(&query.lookback))
+            .map_err(|msg| BoxedError::new(PlainError::new(msg, StatusCode::InvalidArguments)))
+            .context(QueryParseSnafu {
+                query: &query.query,
+            })?;
+
         let eval_stmt = EvalStmt {
             expr,
             start,
             end,
             interval: step,
-            // TODO(ruihang): provide a way to adjust this parameter.
-            lookback_delta: Duration::from_secs(DEFAULT_LOOKBACK),
+            lookback_delta,
         };
 
         Ok(QueryStatement::Promql(eval_stmt))
@@ -232,17 +256,31 @@ macro_rules! define_node_ast_extension {
 }
 
 define_node_ast_extension!(Analyze, AnalyzeExpr, Expr, ANALYZE_NODE_NAME);
+define_node_ast_extension!(
+    AnalyzeVerbose,
+    AnalyzeVerboseExpr,
+    Expr,
+    ANALYZE_VERBOSE_NODE_NAME
+);
 define_node_ast_extension!(Explain, ExplainExpr, Expr, EXPLAIN_NODE_NAME);
+define_node_ast_extension!(
+    ExplainVerbose,
+    ExplainVerboseExpr,
+    Expr,
+    EXPLAIN_VERBOSE_NODE_NAME
+);
 
 #[cfg(test)]
 mod test {
+    use session::context::QueryContext;
+
     use super::*;
 
     // Detailed logic tests are covered in the parser crate.
     #[test]
     fn parse_sql_simple() {
         let sql = "select * from t1";
-        let stmt = QueryLanguageParser::parse_sql(sql).unwrap();
+        let stmt = QueryLanguageParser::parse_sql(sql, &QueryContext::arc()).unwrap();
         let expected = String::from("Sql(Query(Query { \
             inner: Query { \
                 with: None, body: Select(Select { \
@@ -268,9 +306,9 @@ mod test {
             sort_by: [], \
             having: None, \
             named_window: [], \
-            qualify: None \
-            }), order_by: [], limit: None, offset: None, fetch: None, locks: [] } }))");
-
+            qualify: None, \
+            value_table_mode: None \
+            }), order_by: [], limit: None, limit_by: [], offset: None, fetch: None, locks: [], for_clause: None } }))");
         assert_eq!(format!("{stmt:?}"), expected);
     }
 
@@ -326,6 +364,7 @@ mod test {
             start: "2022-02-13T17:14:00Z".to_string(),
             end: "2023-02-13T17:14:00Z".to_string(),
             step: "1d".to_string(),
+            lookback: "5m".to_string(),
         };
 
         #[cfg(not(windows))]
@@ -334,8 +373,7 @@ mod test {
             Promql(EvalStmt { \
                 expr: VectorSelector(VectorSelector { \
                     name: Some(\"http_request\"), \
-                    matchers: Matchers { \
-                        matchers: [] }, \
+                    matchers: Matchers { matchers: [], or_matchers: [] }, \
                     offset: None, at: None }), \
                 start: SystemTime { tv_sec: 1644772440, tv_nsec: 0 }, \
                 end: SystemTime { tv_sec: 1676308440, tv_nsec: 0 }, \
@@ -351,7 +389,7 @@ mod test {
             Promql(EvalStmt { \
                 expr: VectorSelector(VectorSelector { \
                     name: Some(\"http_request\"), \
-                    matchers: Matchers { matchers: [] }, \
+                    matchers: Matchers { matchers: [], or_matchers: [] }, \
                     offset: None, at: None }), \
                 start: SystemTime { intervals: 132892460400000000 }, \
                 end: SystemTime { intervals: 133207820400000000 }, \
@@ -360,7 +398,7 @@ mod test {
             })",
         );
 
-        let result = QueryLanguageParser::parse_promql(&promql).unwrap();
+        let result = QueryLanguageParser::parse_promql(&promql, &QueryContext::arc()).unwrap();
         assert_eq!(format!("{result:?}"), expected);
     }
 }

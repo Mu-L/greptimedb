@@ -12,41 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use api::v1::region::{
-    region_request, DropRequest as PbDropRegionRequest, RegionRequest, RegionRequestHeader,
-};
-use async_trait::async_trait;
-use common_error::ext::ErrorExt;
-use common_error::status_code::StatusCode;
-use common_procedure::error::{FromJsonSnafu, ToJsonSnafu};
-use common_procedure::{
-    Context as ProcedureContext, LockKey, Procedure, Result as ProcedureResult, Status,
-};
-use common_telemetry::tracing_context::TracingContext;
-use common_telemetry::{debug, info};
-use futures::future::join_all;
-use serde::{Deserialize, Serialize};
-use snafu::{ensure, OptionExt, ResultExt};
-use store_api::storage::RegionId;
-use strum::AsRefStr;
-use table::engine::TableReference;
-use table::metadata::{RawTableInfo, TableId};
+pub(crate) mod executor;
+mod metadata;
 
-use super::utils::handle_retry_error;
-use crate::cache_invalidator::Context;
-use crate::ddl::utils::handle_operate_region_error;
+use async_trait::async_trait;
+use common_error::ext::BoxedError;
+use common_procedure::error::{ExternalSnafu, FromJsonSnafu, ToJsonSnafu};
+use common_procedure::{
+    Context as ProcedureContext, Error as ProcedureError, LockKey, Procedure,
+    Result as ProcedureResult, Status,
+};
+use common_telemetry::info;
+use common_telemetry::tracing::warn;
+use serde::{Deserialize, Serialize};
+use snafu::{OptionExt, ResultExt};
+use strum::AsRefStr;
+use table::metadata::TableId;
+use table::table_reference::TableReference;
+
+use self::executor::DropTableExecutor;
+use crate::ddl::utils::handle_retry_error;
 use crate::ddl::DdlContext;
 use crate::error::{self, Result};
-use crate::key::table_info::TableInfoValue;
-use crate::key::table_name::TableNameKey;
 use crate::key::table_route::TableRouteValue;
-use crate::key::DeserializedValueWithBytes;
-use crate::metrics;
+use crate::lock_key::{CatalogLock, SchemaLock, TableLock};
 use crate::region_keeper::OperatingRegionGuard;
 use crate::rpc::ddl::DropTableTask;
-use crate::rpc::router::{
-    find_leader_regions, find_leaders, operating_leader_regions, RegionRoute,
-};
+use crate::rpc::router::{operating_leader_regions, RegionRoute};
+use crate::{metrics, ClusterId};
 
 pub struct DropTableProcedure {
     /// The context of procedure runtime.
@@ -54,73 +47,52 @@ pub struct DropTableProcedure {
     /// The serializable data.
     pub data: DropTableData,
     /// The guards of opening regions.
-    pub dropping_regions: Vec<OperatingRegionGuard>,
+    pub(crate) dropping_regions: Vec<OperatingRegionGuard>,
+    /// The drop table executor.
+    executor: DropTableExecutor,
 }
 
-#[allow(dead_code)]
 impl DropTableProcedure {
     pub const TYPE_NAME: &'static str = "metasrv-procedure::DropTable";
 
-    pub fn new(
-        cluster_id: u64,
-        task: DropTableTask,
-        table_route_value: DeserializedValueWithBytes<TableRouteValue>,
-        table_info_value: DeserializedValueWithBytes<TableInfoValue>,
-        context: DdlContext,
-    ) -> Self {
+    pub fn new(cluster_id: ClusterId, task: DropTableTask, context: DdlContext) -> Self {
+        let data = DropTableData::new(cluster_id, task);
+        let executor = data.build_executor();
         Self {
             context,
-            data: DropTableData::new(cluster_id, task, table_route_value, table_info_value),
+            data,
             dropping_regions: vec![],
+            executor,
         }
     }
 
     pub fn from_json(json: &str, context: DdlContext) -> ProcedureResult<Self> {
-        let data = serde_json::from_str(json).context(FromJsonSnafu)?;
+        let data: DropTableData = serde_json::from_str(json).context(FromJsonSnafu)?;
+        let executor = data.build_executor();
+
         Ok(Self {
             context,
             data,
             dropping_regions: vec![],
+            executor,
         })
     }
 
-    async fn on_prepare(&mut self) -> Result<Status> {
-        let table_ref = &self.data.table_ref();
-
-        let exist = self
-            .context
-            .table_metadata_manager
-            .table_name_manager()
-            .exists(TableNameKey::new(
-                table_ref.catalog,
-                table_ref.schema,
-                table_ref.table,
-            ))
-            .await?;
-
-        if !exist && self.data.task.drop_if_exists {
-            return Ok(Status::Done);
+    pub(crate) async fn on_prepare<'a>(&mut self) -> Result<Status> {
+        if self.executor.on_prepare(&self.context).await?.stop() {
+            return Ok(Status::done());
         }
-
-        ensure!(
-            exist,
-            error::TableNotFoundSnafu {
-                table_name: table_ref.to_string()
-            }
-        );
-
-        self.data.state = DropTableState::RemoveMetadata;
+        self.fill_table_metadata().await?;
+        self.data.state = DropTableState::DeleteMetadata;
 
         Ok(Status::executing(true))
     }
 
     /// Register dropping regions if doesn't exist.
     fn register_dropping_regions(&mut self) -> Result<()> {
-        let region_routes = self.data.region_routes();
+        let dropping_regions = operating_leader_regions(&self.data.physical_region_routes);
 
-        let dropping_regions = operating_leader_regions(region_routes);
-
-        if self.dropping_regions.len() == dropping_regions.len() {
+        if !self.dropping_regions.is_empty() {
             return Ok(());
         }
 
@@ -143,99 +115,59 @@ impl DropTableProcedure {
     }
 
     /// Removes the table metadata.
-    async fn on_remove_metadata(&mut self) -> Result<Status> {
+    pub(crate) async fn on_delete_metadata(&mut self) -> Result<Status> {
+        self.register_dropping_regions()?;
         // NOTES: If the meta server is crashed after the `RemoveMetadata`,
         // Corresponding regions of this table on the Datanode will be closed automatically.
         // Then any future dropping operation will fail.
 
         // TODO(weny): Considers introducing a RegionStatus to indicate the region is dropping.
-
-        let table_metadata_manager = &self.context.table_metadata_manager;
-        let table_info_value = &self.data.table_info_value;
-        let table_route_value = &self.data.table_route_value;
         let table_id = self.data.table_id();
-
-        table_metadata_manager
-            .delete_table_metadata(table_info_value, table_route_value)
+        let table_route_value = &TableRouteValue::new(
+            self.data.task.table_id,
+            // Safety: checked
+            self.data.physical_table_id.unwrap(),
+            self.data.physical_region_routes.clone(),
+        );
+        // Deletes table metadata logically.
+        self.executor
+            .on_delete_metadata(&self.context, table_route_value)
             .await?;
-
         info!("Deleted table metadata for table {table_id}");
-
         self.data.state = DropTableState::InvalidateTableCache;
-
         Ok(Status::executing(true))
     }
 
     /// Broadcasts invalidate table cache instruction.
     async fn on_broadcast(&mut self) -> Result<Status> {
-        let ctx = Context {
-            subject: Some("Invalidate table cache by dropping table".to_string()),
-        };
-
-        let cache_invalidator = &self.context.cache_invalidator;
-
-        cache_invalidator
-            .invalidate_table_name(&ctx, self.data.table_ref().into())
-            .await?;
-
-        cache_invalidator
-            .invalidate_table_id(&ctx, self.data.table_id())
-            .await?;
-
+        self.executor.invalidate_table_cache(&self.context).await?;
         self.data.state = DropTableState::DatanodeDropRegions;
 
         Ok(Status::executing(true))
     }
 
-    pub async fn on_datanode_drop_regions(&self) -> Result<Status> {
-        let table_id = self.data.table_id();
+    pub async fn on_datanode_drop_regions(&mut self) -> Result<Status> {
+        self.executor
+            .on_drop_regions(&self.context, &self.data.physical_region_routes)
+            .await?;
+        self.data.state = DropTableState::DeleteTombstone;
+        Ok(Status::executing(true))
+    }
 
-        let region_routes = &self.data.region_routes();
-        let leaders = find_leaders(region_routes);
-        let mut drop_region_tasks = Vec::with_capacity(leaders.len());
+    /// Deletes metadata tombstone.
+    async fn on_delete_metadata_tombstone(&mut self) -> Result<Status> {
+        let table_route_value = &TableRouteValue::new(
+            self.data.task.table_id,
+            // Safety: checked
+            self.data.physical_table_id.unwrap(),
+            self.data.physical_region_routes.clone(),
+        );
+        self.executor
+            .on_delete_metadata_tombstone(&self.context, table_route_value)
+            .await?;
 
-        for datanode in leaders {
-            let requester = self.context.datanode_manager.datanode(&datanode).await;
-
-            let regions = find_leader_regions(region_routes, &datanode);
-            let region_ids = regions
-                .iter()
-                .map(|region_number| RegionId::new(table_id, *region_number))
-                .collect::<Vec<_>>();
-
-            for region_id in region_ids {
-                debug!("Dropping region {region_id} on Datanode {datanode:?}");
-
-                let request = RegionRequest {
-                    header: Some(RegionRequestHeader {
-                        tracing_context: TracingContext::from_current_span().to_w3c(),
-                        ..Default::default()
-                    }),
-                    body: Some(region_request::Body::Drop(PbDropRegionRequest {
-                        region_id: region_id.as_u64(),
-                    })),
-                };
-
-                let datanode = datanode.clone();
-                let requester = requester.clone();
-
-                drop_region_tasks.push(async move {
-                    if let Err(err) = requester.handle(request).await {
-                        if err.status_code() != StatusCode::RegionNotFound {
-                            return Err(handle_operate_region_error(datanode)(err));
-                        }
-                    }
-                    Ok(())
-                });
-            }
-        }
-
-        join_all(drop_region_tasks)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Status::Done)
+        self.dropping_regions.clear();
+        Ok(Status::done())
     }
 }
 
@@ -245,18 +177,35 @@ impl Procedure for DropTableProcedure {
         Self::TYPE_NAME
     }
 
+    fn recover(&mut self) -> ProcedureResult<()> {
+        // Only registers regions if the metadata is deleted.
+        let register_operating_regions = matches!(
+            self.data.state,
+            DropTableState::DeleteMetadata
+                | DropTableState::InvalidateTableCache
+                | DropTableState::DatanodeDropRegions
+        );
+        if register_operating_regions {
+            self.register_dropping_regions()
+                .map_err(BoxedError::new)
+                .context(ExternalSnafu)?;
+        }
+
+        Ok(())
+    }
+
     async fn execute(&mut self, _ctx: &ProcedureContext) -> ProcedureResult<Status> {
         let state = &self.data.state;
-
         let _timer = metrics::METRIC_META_PROCEDURE_DROP_TABLE
             .with_label_values(&[state.as_ref()])
             .start_timer();
 
         match self.data.state {
             DropTableState::Prepare => self.on_prepare().await,
-            DropTableState::RemoveMetadata => self.on_remove_metadata().await,
+            DropTableState::DeleteMetadata => self.on_delete_metadata().await,
             DropTableState::InvalidateTableCache => self.on_broadcast().await,
             DropTableState::DatanodeDropRegions => self.on_datanode_drop_regions().await,
+            DropTableState::DeleteTombstone => self.on_delete_metadata_tombstone().await,
         }
         .map_err(handle_retry_error)
     }
@@ -267,38 +216,59 @@ impl Procedure for DropTableProcedure {
 
     fn lock_key(&self) -> LockKey {
         let table_ref = &self.data.table_ref();
-        let key = common_catalog::format_full_table_name(
-            table_ref.catalog,
-            table_ref.schema,
-            table_ref.table,
+        let table_id = self.data.table_id();
+        let lock_key = vec![
+            CatalogLock::Read(table_ref.catalog).into(),
+            SchemaLock::read(table_ref.catalog, table_ref.schema).into(),
+            TableLock::Write(table_id).into(),
+        ];
+
+        LockKey::new(lock_key)
+    }
+
+    fn rollback_supported(&self) -> bool {
+        !matches!(self.data.state, DropTableState::Prepare) && self.data.allow_rollback
+    }
+
+    async fn rollback(&mut self, _: &ProcedureContext) -> ProcedureResult<()> {
+        warn!(
+            "Rolling back the drop table procedure, table: {}",
+            self.data.table_id()
         );
 
-        LockKey::single(key)
+        let table_route_value = &TableRouteValue::new(
+            self.data.task.table_id,
+            // Safety: checked
+            self.data.physical_table_id.unwrap(),
+            self.data.physical_region_routes.clone(),
+        );
+        self.executor
+            .on_restore_metadata(&self.context, table_route_value)
+            .await
+            .map_err(ProcedureError::external)
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DropTableData {
     pub state: DropTableState,
-    pub cluster_id: u64,
+    pub cluster_id: ClusterId,
     pub task: DropTableTask,
-    pub table_route_value: DeserializedValueWithBytes<TableRouteValue>,
-    pub table_info_value: DeserializedValueWithBytes<TableInfoValue>,
+    pub physical_region_routes: Vec<RegionRoute>,
+    pub physical_table_id: Option<TableId>,
+    #[serde(default)]
+    pub allow_rollback: bool,
 }
 
 impl DropTableData {
-    pub fn new(
-        cluster_id: u64,
-        task: DropTableTask,
-        table_route_value: DeserializedValueWithBytes<TableRouteValue>,
-        table_info_value: DeserializedValueWithBytes<TableInfoValue>,
-    ) -> Self {
+    pub fn new(cluster_id: ClusterId, task: DropTableTask) -> Self {
         Self {
             state: DropTableState::Prepare,
             cluster_id,
             task,
-            table_info_value,
-            table_route_value,
+            physical_region_routes: vec![],
+            physical_table_id: None,
+            allow_rollback: false,
         }
     }
 
@@ -306,27 +276,31 @@ impl DropTableData {
         self.task.table_ref()
     }
 
-    fn region_routes(&self) -> &Vec<RegionRoute> {
-        self.table_route_value.region_routes()
-    }
-
-    fn table_info(&self) -> &RawTableInfo {
-        &self.table_info_value.table_info
-    }
-
     fn table_id(&self) -> TableId {
-        self.table_info().ident.table_id
+        self.task.table_id
+    }
+
+    fn build_executor(&self) -> DropTableExecutor {
+        DropTableExecutor::new(
+            self.cluster_id,
+            self.task.table_name(),
+            self.task.table_id,
+            self.task.drop_if_exists,
+        )
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, AsRefStr)]
+/// The state of drop table.
+#[derive(Debug, Serialize, Deserialize, AsRefStr, PartialEq)]
 pub enum DropTableState {
     /// Prepares to drop the table
     Prepare,
-    /// Removes metadata
-    RemoveMetadata,
+    /// Deletes metadata logically
+    DeleteMetadata,
     /// Invalidates Table Cache
     InvalidateTableCache,
     /// Drops regions on Datanode
     DatanodeDropRegions,
+    /// Deletes metadata tombstone permanently
+    DeleteTombstone,
 }

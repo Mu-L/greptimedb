@@ -21,7 +21,7 @@ use crate::statements::delete::Delete;
 use crate::statements::statement::Statement;
 
 /// DELETE statement parser implementation
-impl<'a> ParserContext<'a> {
+impl ParserContext<'_> {
     pub(crate) fn parse_delete(&mut self) -> Result<Statement> {
         let _ = self.parser.next_token();
         let spstatement = self.parser.parse_delete().context(error::SyntaxSnafu)?;
@@ -31,7 +31,6 @@ impl<'a> ParserContext<'a> {
                 Ok(Statement::Delete(Box::new(Delete { inner: spstatement })))
             }
             unexp => error::UnsupportedSnafu {
-                sql: self.sql.to_string(),
                 keyword: unexp.to_string(),
             }
             .fail(),
@@ -45,11 +44,14 @@ mod tests {
 
     use super::*;
     use crate::dialect::GreptimeDbDialect;
+    use crate::parser::ParseOptions;
 
     #[test]
     pub fn test_parse_insert() {
         let sql = r"delete from my_table where k1 = xxx and k2 = xxx and timestamp = xxx;";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).unwrap();
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
         assert_eq!(1, result.len());
         assert_matches!(result[0], Statement::Delete { .. })
     }
@@ -57,7 +59,8 @@ mod tests {
     #[test]
     pub fn test_parse_invalid_insert() {
         let sql = r"delete my_table where "; // intentionally a bad sql
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         assert!(result.is_err(), "result is: {result:?}");
     }
 }

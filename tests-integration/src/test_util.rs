@@ -21,26 +21,29 @@ use std::time::Duration;
 use auth::UserProviderRef;
 use axum::Router;
 use catalog::kvbackend::KvBackendCatalogManager;
+use common_base::secrets::ExposeSecret;
+use common_config::Configurable;
 use common_meta::key::catalog_name::CatalogNameKey;
 use common_meta::key::schema_name::SchemaNameKey;
-use common_query::Output;
-use common_recordbatch::util;
-use common_runtime::Builder as RuntimeBuilder;
+use common_runtime::runtime::BuilderBuild;
+use common_runtime::{Builder as RuntimeBuilder, Runtime};
+use common_telemetry::warn;
 use common_test_util::ports;
 use common_test_util::temp_dir::{create_temp_dir, TempDir};
+use common_wal::config::DatanodeWalConfig;
 use datanode::config::{
     AzblobConfig, DatanodeOptions, FileConfig, GcsConfig, ObjectStoreConfig, OssConfig, S3Config,
     StorageConfig,
 };
-use frontend::frontend::TomlSerializable;
 use frontend::instance::Instance;
 use frontend::service_config::{MysqlOptions, PostgresOptions};
+use futures::future::BoxFuture;
 use object_store::services::{Azblob, Gcs, Oss, S3};
 use object_store::test_util::TempFolder;
 use object_store::ObjectStore;
-use secrecy::ExposeSecret;
+use servers::grpc::builder::GrpcServerBuilder;
 use servers::grpc::greptime_handler::GreptimeRequestHandler;
-use servers::grpc::{GrpcServer, GrpcServerConfig};
+use servers::grpc::{GrpcOptions, GrpcServer, GrpcServerConfig};
 use servers::http::{HttpOptions, HttpServerBuilder};
 use servers::metrics_handler::MetricsHandler;
 use servers::mysql::server::{MysqlServer, MysqlSpawnConfig, MysqlSpawnRef};
@@ -48,10 +51,13 @@ use servers::postgres::PostgresServer;
 use servers::query_handler::grpc::ServerGrpcQueryHandlerAdapter;
 use servers::query_handler::sql::{ServerSqlQueryHandlerAdapter, SqlQueryHandler};
 use servers::server::Server;
+use servers::tls::ReloadableTlsServerConfig;
 use servers::Mode;
 use session::context::QueryContext;
 
 use crate::standalone::{GreptimeDbStandalone, GreptimeDbStandaloneBuilder};
+
+pub const PEER_PLACEHOLDER_ADDR: &str = "127.0.0.1:3001";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum StorageType {
@@ -155,16 +161,17 @@ pub fn get_test_store_config(store_type: &StorageType) -> (ObjectStoreConfig, Te
                 bucket: env::var("GT_GCS_BUCKET").unwrap(),
                 scope: env::var("GT_GCS_SCOPE").unwrap(),
                 credential_path: env::var("GT_GCS_CREDENTIAL_PATH").unwrap().into(),
+                credential: env::var("GT_GCS_CREDENTIAL").unwrap().into(),
                 endpoint: env::var("GT_GCS_ENDPOINT").unwrap(),
                 ..Default::default()
             };
 
-            let mut builder = Gcs::default();
-            builder
+            let builder = Gcs::default()
                 .root(&gcs_config.root)
                 .bucket(&gcs_config.bucket)
                 .scope(&gcs_config.scope)
                 .credential_path(gcs_config.credential_path.expose_secret())
+                .credential(gcs_config.credential.expose_secret())
                 .endpoint(&gcs_config.endpoint);
 
             let config = ObjectStoreConfig::Gcs(gcs_config);
@@ -181,8 +188,7 @@ pub fn get_test_store_config(store_type: &StorageType) -> (ObjectStoreConfig, Te
                 ..Default::default()
             };
 
-            let mut builder = Azblob::default();
-            let _ = builder
+            let mut builder = Azblob::default()
                 .root(&azblob_config.root)
                 .endpoint(&azblob_config.endpoint)
                 .account_name(azblob_config.account_name.expose_secret())
@@ -190,8 +196,8 @@ pub fn get_test_store_config(store_type: &StorageType) -> (ObjectStoreConfig, Te
                 .container(&azblob_config.container);
 
             if let Ok(sas_token) = env::var("GT_AZBLOB_SAS_TOKEN") {
-                let _ = builder.sas_token(&sas_token);
-            }
+                builder = builder.sas_token(&sas_token);
+            };
 
             let config = ObjectStoreConfig::Azblob(azblob_config);
 
@@ -209,8 +215,7 @@ pub fn get_test_store_config(store_type: &StorageType) -> (ObjectStoreConfig, Te
                 ..Default::default()
             };
 
-            let mut builder = Oss::default();
-            let _ = builder
+            let builder = Oss::default()
                 .root(&oss_config.root)
                 .endpoint(&oss_config.endpoint)
                 .access_key_id(oss_config.access_key_id.expose_secret())
@@ -228,21 +233,23 @@ pub fn get_test_store_config(store_type: &StorageType) -> (ObjectStoreConfig, Te
 
             if *store_type == StorageType::S3WithCache {
                 s3_config.cache.cache_path = Some("/tmp/greptimedb_cache".to_string());
+            } else {
+                // An empty string means disabling.
+                s3_config.cache.cache_path = Some("".to_string());
             }
 
-            let mut builder = S3::default();
-            let _ = builder
+            let mut builder = S3::default()
                 .root(&s3_config.root)
                 .access_key_id(s3_config.access_key_id.expose_secret())
                 .secret_access_key(s3_config.secret_access_key.expose_secret())
                 .bucket(&s3_config.bucket);
 
             if s3_config.endpoint.is_some() {
-                let _ = builder.endpoint(s3_config.endpoint.as_ref().unwrap());
-            }
+                builder = builder.endpoint(s3_config.endpoint.as_ref().unwrap());
+            };
             if s3_config.region.is_some() {
-                let _ = builder.region(s3_config.region.as_ref().unwrap());
-            }
+                builder = builder.region(s3_config.region.as_ref().unwrap());
+            };
 
             let config = ObjectStoreConfig::S3(s3_config);
 
@@ -294,9 +301,11 @@ impl TestGuard {
 }
 
 pub fn create_tmp_dir_and_datanode_opts(
+    mode: Mode,
     default_store_type: StorageType,
     store_provider_types: Vec<StorageType>,
     name: &str,
+    wal_config: DatanodeWalConfig,
 ) -> (DatanodeOptions, TestGuard) {
     let home_tmp_dir = create_temp_dir(&format!("gt_data_{name}"));
     let home_dir = home_tmp_dir.path().to_str().unwrap().to_string();
@@ -314,7 +323,7 @@ pub fn create_tmp_dir_and_datanode_opts(
         store_providers.push(store);
         storage_guards.push(StorageGuard(data_tmp_dir))
     }
-    let opts = create_datanode_opts(default_store, store_providers, home_dir);
+    let opts = create_datanode_opts(mode, default_store, store_providers, home_dir, wal_config);
 
     (
         opts,
@@ -326,9 +335,11 @@ pub fn create_tmp_dir_and_datanode_opts(
 }
 
 pub(crate) fn create_datanode_opts(
+    mode: Mode,
     default_store: ObjectStoreConfig,
     providers: Vec<ObjectStoreConfig>,
     home_dir: String,
+    wal_config: DatanodeWalConfig,
 ) -> DatanodeOptions {
     DatanodeOptions {
         node_id: Some(0),
@@ -337,9 +348,12 @@ pub(crate) fn create_datanode_opts(
             data_home: home_dir,
             providers,
             store: default_store,
-            ..Default::default()
         },
-        mode: Mode::Standalone,
+        grpc: GrpcOptions::default()
+            .with_addr(PEER_PLACEHOLDER_ADDR)
+            .with_hostname(PEER_PLACEHOLDER_ADDR),
+        mode,
+        wal: wal_config,
         ..Default::default()
     }
 }
@@ -379,11 +393,8 @@ pub async fn setup_test_http_app(store_type: StorageType, name: &str) -> (Router
     };
     let http_server = HttpServerBuilder::new(http_opts)
         .with_sql_handler(ServerSqlQueryHandlerAdapter::arc(instance.instance.clone()))
-        .with_grpc_handler(ServerGrpcQueryHandlerAdapter::arc(
-            instance.instance.clone(),
-        ))
         .with_metrics_handler(MetricsHandler)
-        .with_greptime_config_options(instance.datanode_opts.to_toml_string())
+        .with_greptime_config_options(instance.opts.datanode_options().to_toml().unwrap())
         .build();
     (http_server.build(http_server.make_app()), instance.guard)
 }
@@ -411,16 +422,14 @@ pub async fn setup_test_http_app_with_frontend_and_user_provider(
 
     let mut http_server = HttpServerBuilder::new(http_opts);
 
-    http_server
+    http_server = http_server
         .with_sql_handler(ServerSqlQueryHandlerAdapter::arc(instance.instance.clone()))
-        .with_grpc_handler(ServerGrpcQueryHandlerAdapter::arc(
-            instance.instance.clone(),
-        ))
-        .with_script_handler(instance.instance.clone())
-        .with_greptime_config_options(instance.mix_options.to_toml().unwrap());
+        .with_log_ingest_handler(instance.instance.clone(), None, None)
+        .with_otlp_handler(instance.instance.clone())
+        .with_greptime_config_options(instance.opts.to_toml().unwrap());
 
     if let Some(user_provider) = user_provider {
-        http_server.with_user_provider(user_provider);
+        http_server = http_server.with_user_provider(user_provider);
     }
 
     let http_server = http_server.build();
@@ -448,13 +457,12 @@ pub async fn setup_test_prom_app_with_frontend(
         ..Default::default()
     };
     let frontend_ref = instance.instance.clone();
+    let is_strict_mode = true;
     let http_server = HttpServerBuilder::new(http_opts)
         .with_sql_handler(ServerSqlQueryHandlerAdapter::arc(frontend_ref.clone()))
-        .with_grpc_handler(ServerGrpcQueryHandlerAdapter::arc(frontend_ref.clone()))
-        .with_script_handler(frontend_ref.clone())
-        .with_prom_handler(frontend_ref.clone())
+        .with_prom_handler(frontend_ref.clone(), true, is_strict_mode)
         .with_prometheus_handler(frontend_ref)
-        .with_greptime_config_options(instance.datanode_opts.to_toml_string())
+        .with_greptime_config_options(instance.opts.datanode_options().to_toml().unwrap())
         .build();
     let app = http_server.build(http_server.make_app());
     (app, instance.guard)
@@ -483,30 +491,31 @@ pub async fn setup_grpc_server_with(
 ) -> (String, TestGuard, Arc<GrpcServer>) {
     let instance = setup_standalone_instance(name, store_type).await;
 
-    let runtime = Arc::new(
-        RuntimeBuilder::default()
-            .worker_threads(2)
-            .thread_name("grpc-handlers")
-            .build()
-            .unwrap(),
-    );
+    let runtime: Runtime = RuntimeBuilder::default()
+        .worker_threads(2)
+        .thread_name("grpc-handlers")
+        .build()
+        .unwrap();
 
     let fe_instance_ref = instance.instance.clone();
-    let flight_handler = Arc::new(GreptimeRequestHandler::new(
+
+    let greptime_request_handler = GreptimeRequestHandler::new(
         ServerGrpcQueryHandlerAdapter::arc(fe_instance_ref.clone()),
         user_provider.clone(),
-        runtime.clone(),
-    ));
+        Some(runtime.clone()),
+    );
 
-    let fe_grpc_server = Arc::new(GrpcServer::new(
-        grpc_config,
-        Some(ServerGrpcQueryHandlerAdapter::arc(fe_instance_ref.clone())),
-        Some(fe_instance_ref.clone()),
-        Some(flight_handler),
-        None,
-        user_provider,
-        runtime,
-    ));
+    let flight_handler = Arc::new(greptime_request_handler.clone());
+
+    let grpc_config = grpc_config.unwrap_or_default();
+    let grpc_builder = GrpcServerBuilder::new(grpc_config.clone(), runtime)
+        .database_handler(greptime_request_handler)
+        .flight_handler(flight_handler)
+        .prometheus_handler(fe_instance_ref.clone(), user_provider)
+        .with_tls_config(grpc_config.tls)
+        .unwrap();
+
+    let fe_grpc_server = Arc::new(grpc_builder.build());
 
     let fe_grpc_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
     let fe_grpc_addr = fe_grpc_server
@@ -519,16 +528,6 @@ pub async fn setup_grpc_server_with(
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     (fe_grpc_addr, instance.guard, fe_grpc_server)
-}
-
-pub async fn check_output_stream(output: Output, expected: &str) {
-    let recordbatches = match output {
-        Output::Stream(stream) => util::collect_batches(stream).await.unwrap(),
-        Output::RecordBatches(recordbatches) => recordbatches,
-        _ => unreachable!(),
-    };
-    let pretty_print = recordbatches.pretty_print().unwrap();
-    assert_eq!(pretty_print, expected, "actual: \n{}", pretty_print);
 }
 
 pub async fn setup_mysql_server(
@@ -545,13 +544,11 @@ pub async fn setup_mysql_server_with_user_provider(
 ) -> (String, TestGuard, Arc<Box<dyn Server>>) {
     let instance = setup_standalone_instance(name, store_type).await;
 
-    let runtime = Arc::new(
-        RuntimeBuilder::default()
-            .worker_threads(2)
-            .thread_name("mysql-runtime")
-            .build()
-            .unwrap(),
-    );
+    let runtime = RuntimeBuilder::default()
+        .worker_threads(2)
+        .thread_name("mysql-runtime")
+        .build()
+        .unwrap();
 
     let fe_mysql_addr = format!("127.0.0.1:{}", ports::get_port());
 
@@ -568,7 +565,10 @@ pub async fn setup_mysql_server_with_user_provider(
         )),
         Arc::new(MysqlSpawnConfig::new(
             false,
-            opts.tls.setup().unwrap().map(Arc::new),
+            Arc::new(
+                ReloadableTlsServerConfig::try_new(opts.tls.clone())
+                    .expect("Failed to load certificates and keys"),
+            ),
             opts.reject_no_database.unwrap_or(false),
         )),
     ));
@@ -599,13 +599,11 @@ pub async fn setup_pg_server_with_user_provider(
 ) -> (String, TestGuard, Arc<Box<dyn Server>>) {
     let instance = setup_standalone_instance(name, store_type).await;
 
-    let runtime = Arc::new(
-        RuntimeBuilder::default()
-            .worker_threads(2)
-            .thread_name("pg-runtime")
-            .build()
-            .unwrap(),
-    );
+    let runtime = RuntimeBuilder::default()
+        .worker_threads(2)
+        .thread_name("pg-runtime")
+        .build()
+        .unwrap();
 
     let fe_pg_addr = format!("127.0.0.1:{}", ports::get_port());
 
@@ -614,9 +612,15 @@ pub async fn setup_pg_server_with_user_provider(
         addr: fe_pg_addr.clone(),
         ..Default::default()
     };
+    let tls_server_config = Arc::new(
+        ReloadableTlsServerConfig::try_new(opts.tls.clone())
+            .expect("Failed to load certificates and keys"),
+    );
+
     let fe_pg_server = Arc::new(Box::new(PostgresServer::new(
         ServerSqlQueryHandlerAdapter::arc(fe_instance_ref),
-        opts.tls.clone(),
+        opts.tls.should_force_tls(),
+        tls_server_config,
         runtime,
         user_provider,
     )) as Box<dyn Server>);
@@ -655,4 +659,23 @@ pub(crate) async fn prepare_another_catalog_and_schema(instance: &Instance) {
         )
         .await
         .unwrap();
+}
+
+pub async fn run_test_with_kafka_wal<F>(test: F)
+where
+    F: FnOnce(Vec<String>) -> BoxFuture<'static, ()>,
+{
+    let _ = dotenv::dotenv();
+    let endpoints = env::var("GT_KAFKA_ENDPOINTS").unwrap_or_default();
+    if endpoints.is_empty() {
+        warn!("The endpoints is empty, skipping the test");
+        return;
+    }
+
+    let endpoints = endpoints
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect::<Vec<_>>();
+
+    test(endpoints).await
 }

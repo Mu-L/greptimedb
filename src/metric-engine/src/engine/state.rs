@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 
 use snafu::OptionExt;
+use store_api::metadata::ColumnMetadata;
 use store_api::storage::RegionId;
 
 use crate::error::{PhysicalRegionNotFoundSnafu, Result};
@@ -35,6 +36,10 @@ pub(crate) struct MetricEngineState {
     /// Cache for the columns of physical regions.
     /// The region id in key is the data region id.
     physical_columns: HashMap<RegionId, HashSet<String>>,
+    /// Cache for the column metadata of logical regions.
+    /// The column order is the same with the order in the metadata, which is
+    /// alphabetically ordered on column name.
+    logical_columns: HashMap<RegionId, Vec<ColumnMetadata>>,
 }
 
 impl MetricEngineState {
@@ -80,12 +85,25 @@ impl MetricEngineState {
             .insert(logical_region_id, physical_region_id);
     }
 
+    /// Replace the logical columns of the logical region with given columns.
+    pub fn set_logical_columns(
+        &mut self,
+        logical_region_id: RegionId,
+        columns: Vec<ColumnMetadata>,
+    ) {
+        self.logical_columns.insert(logical_region_id, columns);
+    }
+
     pub fn get_physical_region_id(&self, logical_region_id: RegionId) -> Option<RegionId> {
         self.logical_regions.get(&logical_region_id).copied()
     }
 
     pub fn physical_columns(&self) -> &HashMap<RegionId, HashSet<String>> {
         &self.physical_columns
+    }
+
+    pub fn logical_columns(&self) -> &HashMap<RegionId, Vec<ColumnMetadata>> {
+        &self.logical_columns
     }
 
     pub fn physical_regions(&self) -> &HashMap<RegionId, HashSet<RegionId>> {
@@ -114,5 +132,31 @@ impl MetricEngineState {
         self.physical_regions.remove(&physical_region_id);
         self.physical_columns.remove(&physical_region_id);
         Ok(())
+    }
+
+    /// Remove all data that are related to the logical region id.
+    pub fn remove_logical_region(&mut self, logical_region_id: RegionId) -> Result<()> {
+        let physical_region_id = self.logical_regions.remove(&logical_region_id).context(
+            PhysicalRegionNotFoundSnafu {
+                region_id: logical_region_id,
+            },
+        )?;
+
+        self.physical_regions
+            .get_mut(&physical_region_id)
+            .unwrap() // Safety: physical_region_id is got from physical_regions
+            .remove(&logical_region_id);
+
+        self.logical_columns.remove(&logical_region_id);
+
+        Ok(())
+    }
+
+    pub fn invalid_logical_column_cache(&mut self, logical_region_id: RegionId) {
+        self.logical_columns.remove(&logical_region_id);
+    }
+
+    pub fn is_logical_region_exist(&self, logical_region_id: RegionId) -> bool {
+        self.logical_regions().contains_key(&logical_region_id)
     }
 }

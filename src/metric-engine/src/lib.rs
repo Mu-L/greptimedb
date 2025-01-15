@@ -50,8 +50,9 @@
 //!              └─────────────────────┘
 //! ```
 
+#![feature(let_chains)]
+
 mod data_region;
-#[allow(unused)]
 pub mod engine;
 pub mod error;
 mod metadata_region;

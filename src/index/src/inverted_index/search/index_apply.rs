@@ -15,24 +15,42 @@
 mod predicates_apply;
 
 use async_trait::async_trait;
+use common_base::BitVec;
 pub use predicates_apply::PredicatesIndexApplier;
 
 use crate::inverted_index::error::Result;
 use crate::inverted_index::format::reader::InvertedIndexReader;
 
+/// The output of an apply operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApplyOutput {
+    /// Bitmap of indices that match the predicates.
+    pub matched_segment_ids: BitVec,
+
+    /// The total number of rows in the index.
+    pub total_row_count: usize,
+
+    /// The number of rows in each segment.
+    pub segment_row_count: usize,
+}
+
 /// A trait for processing and transforming indices obtained from an inverted index.
 ///
 /// Applier instances are reusable and work with various `InvertedIndexReader` instances,
 /// avoiding repeated compilation of fixed predicates such as regex patterns.
+#[mockall::automock]
 #[async_trait]
-pub trait IndexApplier {
+pub trait IndexApplier: Send + Sync {
     /// Applies the predefined predicates to the data read by the given index reader, returning
     /// a list of relevant indices (e.g., post IDs, group IDs, row IDs).
-    async fn apply(
+    async fn apply<'a>(
         &self,
         context: SearchContext,
-        reader: &mut dyn InvertedIndexReader,
-    ) -> Result<Vec<usize>>;
+        reader: &mut (dyn InvertedIndexReader + 'a),
+    ) -> Result<ApplyOutput>;
+
+    /// Returns the memory usage of the applier.
+    fn memory_usage(&self) -> usize;
 }
 
 /// A context for searching the inverted index.

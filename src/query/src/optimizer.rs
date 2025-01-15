@@ -12,6 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod order_hint;
+pub mod count_wildcard;
+pub mod parallelize_scan;
+pub mod remove_duplicate;
+pub mod scan_hint;
 pub mod string_normalization;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub mod type_conversion;
+pub mod windowed_sort;
+
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::Result;
+use datafusion_expr::LogicalPlan;
+
+use crate::QueryEngineContext;
+
+/// [`ExtensionAnalyzerRule`]s transform [`LogicalPlan`]s in some way to make
+/// the plan valid prior to the rest of the DataFusion optimization process.
+/// It's an extension of datafusion [`AnalyzerRule`]s but accepts [`QueryEngineContext`] as the second parameter.
+pub trait ExtensionAnalyzerRule {
+    /// Rewrite `plan`
+    fn analyze(
+        &self,
+        plan: LogicalPlan,
+        ctx: &QueryEngineContext,
+        config: &ConfigOptions,
+    ) -> Result<LogicalPlan>;
+}

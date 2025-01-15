@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use common_error::ext::BoxedError;
 use snafu::ResultExt;
 
 use crate::error::{self, Result};
@@ -44,13 +45,14 @@ impl UpdateMetadata {
             .await
             .context(error::TableMetadataManagerSnafu)
         {
-            debug_assert!(ctx.remove_table_route_value());
-            return error::RetryLaterSnafu {
-                reason: format!("Failed to update the table route during the rollback downgraded leader region, error: {err}")
-            }.fail();
+            ctx.remove_table_route_value();
+            return Err(BoxedError::new(err)).context(error::RetryLaterWithSourceSnafu {
+                reason: format!("Failed to update the table route during the rollback downgraded leader region: {region_id}"),
+            });
         }
 
-        debug_assert!(ctx.remove_table_route_value());
+        ctx.register_failure_detectors().await;
+        ctx.remove_table_route_value();
 
         Ok(())
     }
@@ -59,10 +61,11 @@ impl UpdateMetadata {
 #[cfg(test)]
 mod tests {
     use std::assert_matches::assert_matches;
+    use std::sync::Arc;
 
     use common_meta::key::test_utils::new_test_table_info;
     use common_meta::peer::Peer;
-    use common_meta::rpc::router::{Region, RegionRoute, RegionStatus};
+    use common_meta::rpc::router::{LeaderState, Region, RegionRoute};
     use store_api::storage::RegionId;
 
     use crate::error::Error;
@@ -70,6 +73,7 @@ mod tests {
     use crate::procedure::region_migration::test_util::{self, TestingEnv};
     use crate::procedure::region_migration::update_metadata::UpdateMetadata;
     use crate::procedure::region_migration::{ContextFactory, PersistentContext, State};
+    use crate::region::supervisor::RegionFailureDetectorControl;
 
     fn new_persistent_context() -> PersistentContext {
         test_util::new_persistent_context(1, 2, RegionId::new(1024, 1))
@@ -97,6 +101,8 @@ mod tests {
 
         let env = TestingEnv::new();
         let mut ctx = env.context_factory().new_context(persistent_context);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        ctx.region_failure_detector_controller = Arc::new(RegionFailureDetectorControl::new(tx));
         let table_id = ctx.region_id().table_id();
 
         let table_info = new_test_table_info(1024, vec![1, 2, 3]).into();
@@ -104,13 +110,13 @@ mod tests {
             RegionRoute {
                 region: Region::new_test(RegionId::new(1024, 1)),
                 leader_peer: Some(from_peer.clone()),
-                leader_status: Some(RegionStatus::Downgraded),
+                leader_state: Some(LeaderState::Downgrading),
                 ..Default::default()
             },
             RegionRoute {
                 region: Region::new_test(RegionId::new(1024, 2)),
                 leader_peer: Some(Peer::empty(4)),
-                leader_status: Some(RegionStatus::Downgraded),
+                leader_state: Some(LeaderState::Downgrading),
                 ..Default::default()
             },
             RegionRoute {
@@ -122,8 +128,8 @@ mod tests {
 
         let expected_region_routes = {
             let mut region_routes = region_routes.clone();
-            region_routes[0].leader_status = None;
-            region_routes[1].leader_status = None;
+            region_routes[0].leader_state = None;
+            region_routes[1].leader_state = None;
             region_routes
         };
 
@@ -133,7 +139,8 @@ mod tests {
         let table_metadata_manager = env.table_metadata_manager();
         let old_table_route = table_metadata_manager
             .table_route_manager()
-            .get(table_id)
+            .table_route_storage()
+            .get_with_raw_bytes(table_id)
             .await
             .unwrap()
             .unwrap();
@@ -157,20 +164,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(ctx.volatile_ctx.table_route.is_none());
-        assert_matches!(err, Error::RetryLater { .. });
         assert!(err.is_retryable());
-        assert!(err.to_string().contains("Failed to update the table route"));
-
+        assert!(format!("{err:?}").contains("Failed to update the table route"));
+        assert_eq!(rx.len(), 0);
         state.rollback_downgraded_region(&mut ctx).await.unwrap();
+        let event = rx.try_recv().unwrap();
+        let detecting_regions = event.into_region_failure_detectors();
+        assert_eq!(
+            detecting_regions,
+            vec![(
+                ctx.persistent_ctx.cluster_id,
+                from_peer.id,
+                ctx.persistent_ctx.region_id
+            )]
+        );
 
         let table_route = table_metadata_manager
             .table_route_manager()
+            .table_route_storage()
             .get(table_id)
             .await
             .unwrap()
-            .unwrap()
-            .into_inner();
-        assert_eq!(&expected_region_routes, table_route.region_routes());
+            .unwrap();
+        assert_eq!(
+            &expected_region_routes,
+            table_route.region_routes().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -188,13 +207,13 @@ mod tests {
             RegionRoute {
                 region: Region::new_test(RegionId::new(1024, 1)),
                 leader_peer: Some(from_peer.clone()),
-                leader_status: Some(RegionStatus::Downgraded),
+                leader_state: Some(LeaderState::Downgrading),
                 ..Default::default()
             },
             RegionRoute {
                 region: Region::new_test(RegionId::new(1024, 2)),
                 leader_peer: Some(Peer::empty(4)),
-                leader_status: Some(RegionStatus::Downgraded),
+                leader_state: Some(LeaderState::Downgrading),
                 ..Default::default()
             },
             RegionRoute {
@@ -206,7 +225,7 @@ mod tests {
 
         let expected_region_routes = {
             let mut region_routes = region_routes.clone();
-            region_routes[0].leader_status = None;
+            region_routes[0].leader_state = None;
             region_routes
         };
 
@@ -226,11 +245,14 @@ mod tests {
 
         let table_route = table_metadata_manager
             .table_route_manager()
+            .table_route_storage()
             .get(table_id)
             .await
             .unwrap()
-            .unwrap()
-            .into_inner();
-        assert_eq!(&expected_region_routes, table_route.region_routes());
+            .unwrap();
+        assert_eq!(
+            &expected_region_routes,
+            table_route.region_routes().unwrap()
+        );
     }
 }

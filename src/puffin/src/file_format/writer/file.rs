@@ -19,25 +19,28 @@ use async_trait::async_trait;
 use futures::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use snafu::ResultExt;
 
-use crate::blob_metadata::{BlobMetadata, BlobMetadataBuilder};
+use crate::blob_metadata::{BlobMetadata, BlobMetadataBuilder, CompressionCodec};
 use crate::error::{CloseSnafu, FlushSnafu, Result, WriteSnafu};
 use crate::file_format::writer::footer::FooterWriter;
-use crate::file_format::writer::{Blob, PuffinAsyncWriter, PuffinSyncWriter};
+use crate::file_format::writer::{AsyncWriter, Blob, SyncWriter};
 use crate::file_format::MAGIC;
 
 /// Puffin file writer, implements both [`PuffinSyncWriter`] and [`PuffinAsyncWriter`]
 pub struct PuffinFileWriter<W> {
-    /// The writer to write to
+    /// The writer to write to.
     writer: W,
 
-    /// The properties of the file
+    /// The properties of the file.
     properties: HashMap<String, String>,
 
-    /// The metadata of the blobs
+    /// The metadata of the blobs.
     blob_metadata: Vec<BlobMetadata>,
 
-    /// The offset of the next blob
-    next_blob_offset: u64,
+    /// The number of bytes written.
+    written_bytes: u64,
+
+    /// Whether the footer payload should be LZ4 compressed.
+    footer_lz4_compressed: bool,
 }
 
 impl<W> PuffinFileWriter<W> {
@@ -46,83 +49,108 @@ impl<W> PuffinFileWriter<W> {
             writer,
             properties: HashMap::new(),
             blob_metadata: Vec::new(),
-            next_blob_offset: 0,
+            written_bytes: 0,
+            footer_lz4_compressed: false,
         }
     }
 
     fn create_blob_metadata(
         &self,
         typ: String,
+        compression_codec: Option<CompressionCodec>,
         properties: HashMap<String, String>,
         size: u64,
     ) -> BlobMetadata {
         BlobMetadataBuilder::default()
             .blob_type(typ)
             .properties(properties)
-            .offset(self.next_blob_offset as _)
+            .compression_codec(compression_codec)
+            .offset(self.written_bytes as _)
             .length(size as _)
             .build()
             .expect("Required fields are not set")
     }
 }
 
-impl<W: io::Write> PuffinSyncWriter for PuffinFileWriter<W> {
+impl<W: io::Write> SyncWriter for PuffinFileWriter<W> {
     fn set_properties(&mut self, properties: HashMap<String, String>) {
         self.properties = properties;
     }
 
-    fn add_blob<R: io::Read>(&mut self, mut blob: Blob<R>) -> Result<()> {
+    fn add_blob<R: io::Read>(&mut self, mut blob: Blob<R>) -> Result<u64> {
         self.write_header_if_needed_sync()?;
 
-        let size = io::copy(&mut blob.data, &mut self.writer).context(WriteSnafu)?;
+        let size = io::copy(&mut blob.compressed_data, &mut self.writer).context(WriteSnafu)?;
 
-        let blob_metadata = self.create_blob_metadata(blob.blob_type, blob.properties, size);
+        let blob_metadata = self.create_blob_metadata(
+            blob.blob_type,
+            blob.compression_codec,
+            blob.properties,
+            size,
+        );
         self.blob_metadata.push(blob_metadata);
 
-        self.next_blob_offset += size;
-        Ok(())
+        self.written_bytes += size;
+        Ok(size)
     }
 
-    fn finish(&mut self) -> Result<()> {
+    fn set_footer_lz4_compressed(&mut self, lz4_compressed: bool) {
+        self.footer_lz4_compressed = lz4_compressed;
+    }
+
+    fn finish(&mut self) -> Result<u64> {
         self.write_header_if_needed_sync()?;
         self.write_footer_sync()?;
-        self.writer.flush().context(FlushSnafu)
+        self.writer.flush().context(FlushSnafu)?;
+
+        Ok(self.written_bytes)
     }
 }
 
 #[async_trait]
-impl<W: AsyncWrite + Unpin + Send> PuffinAsyncWriter for PuffinFileWriter<W> {
+impl<W: AsyncWrite + Unpin + Send> AsyncWriter for PuffinFileWriter<W> {
     fn set_properties(&mut self, properties: HashMap<String, String>) {
         self.properties = properties;
     }
 
-    async fn add_blob<R: AsyncRead + Send>(&mut self, blob: Blob<R>) -> Result<()> {
+    async fn add_blob<R: AsyncRead + Send>(&mut self, blob: Blob<R>) -> Result<u64> {
         self.write_header_if_needed_async().await?;
 
-        let size = futures::io::copy(blob.data, &mut self.writer)
+        let size = futures::io::copy(blob.compressed_data, &mut self.writer)
             .await
             .context(WriteSnafu)?;
 
-        let blob_metadata = self.create_blob_metadata(blob.blob_type, blob.properties, size);
+        let blob_metadata = self.create_blob_metadata(
+            blob.blob_type,
+            blob.compression_codec,
+            blob.properties,
+            size,
+        );
         self.blob_metadata.push(blob_metadata);
 
-        self.next_blob_offset += size;
-        Ok(())
+        self.written_bytes += size;
+        Ok(size)
     }
 
-    async fn finish(&mut self) -> Result<()> {
+    fn set_footer_lz4_compressed(&mut self, lz4_compressed: bool) {
+        self.footer_lz4_compressed = lz4_compressed;
+    }
+
+    async fn finish(&mut self) -> Result<u64> {
         self.write_header_if_needed_async().await?;
         self.write_footer_async().await?;
         self.writer.flush().await.context(FlushSnafu)?;
-        self.writer.close().await.context(CloseSnafu)
+        self.writer.close().await.context(CloseSnafu)?;
+
+        Ok(self.written_bytes)
     }
 }
 
 impl<W: io::Write> PuffinFileWriter<W> {
     fn write_header_if_needed_sync(&mut self) -> Result<()> {
-        if self.next_blob_offset == 0 {
+        if self.written_bytes == 0 {
             self.writer.write_all(&MAGIC).context(WriteSnafu)?;
-            self.next_blob_offset += MAGIC.len() as u64;
+            self.written_bytes += MAGIC.len() as u64;
         }
         Ok(())
     }
@@ -131,18 +159,21 @@ impl<W: io::Write> PuffinFileWriter<W> {
         let bytes = FooterWriter::new(
             mem::take(&mut self.blob_metadata),
             mem::take(&mut self.properties),
+            self.footer_lz4_compressed,
         )
         .into_footer_bytes()?;
 
-        self.writer.write_all(&bytes).context(WriteSnafu)
+        self.writer.write_all(&bytes).context(WriteSnafu)?;
+        self.written_bytes += bytes.len() as u64;
+        Ok(())
     }
 }
 
 impl<W: AsyncWrite + Unpin> PuffinFileWriter<W> {
     async fn write_header_if_needed_async(&mut self) -> Result<()> {
-        if self.next_blob_offset == 0 {
+        if self.written_bytes == 0 {
             self.writer.write_all(&MAGIC).await.context(WriteSnafu)?;
-            self.next_blob_offset += MAGIC.len() as u64;
+            self.written_bytes += MAGIC.len() as u64;
         }
         Ok(())
     }
@@ -151,9 +182,12 @@ impl<W: AsyncWrite + Unpin> PuffinFileWriter<W> {
         let bytes = FooterWriter::new(
             mem::take(&mut self.blob_metadata),
             mem::take(&mut self.properties),
+            self.footer_lz4_compressed,
         )
         .into_footer_bytes()?;
 
-        self.writer.write_all(&bytes).await.context(WriteSnafu)
+        self.writer.write_all(&bytes).await.context(WriteSnafu)?;
+        self.written_bytes += bytes.len() as u64;
+        Ok(())
     }
 }

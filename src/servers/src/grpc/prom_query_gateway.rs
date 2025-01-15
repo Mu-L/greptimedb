@@ -25,14 +25,15 @@ use auth::UserProviderRef;
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_time::util::current_time_rfc3339;
-use promql_parser::parser::ValueType;
+use promql_parser::parser::value::ValueType;
 use query::parser::PromQuery;
 use session::context::QueryContext;
 use snafu::OptionExt;
 use tonic::{Request, Response};
 
+use super::greptime_handler::create_query_context;
 use crate::error::InvalidQuerySnafu;
-use crate::grpc::greptime_handler::{auth, create_query_context};
+use crate::grpc::greptime_handler::auth;
 use crate::grpc::TonicResult;
 use crate::http::prometheus::{retrieve_metric_name_and_result_type, PrometheusJsonResponse};
 use crate::prometheus_handler::PrometheusHandlerRef;
@@ -57,6 +58,7 @@ impl PrometheusGateway for PrometheusGatewayService {
                     start: range_query.start,
                     end: range_query.end,
                     step: range_query.step,
+                    lookback: range_query.lookback,
                 }
             }
             Promql::InstantQuery(instant_query) => {
@@ -70,12 +72,13 @@ impl PrometheusGateway for PrometheusGatewayService {
                     start: time.clone(),
                     end: time,
                     step: String::from("1s"),
+                    lookback: instant_query.lookback,
                 }
             }
         };
 
         let header = inner.header.as_ref();
-        let query_ctx = create_query_context(header);
+        let query_ctx = create_query_context(header, Default::default());
         let user_info = auth(self.user_provider.clone(), header, &query_ctx).await?;
         query_ctx.set_current_user(user_info);
 
@@ -121,11 +124,7 @@ impl PrometheusGatewayService {
             match retrieve_metric_name_and_result_type(&query.query) {
                 Ok((metric_name, result_type)) => (metric_name.unwrap_or_default(), result_type),
                 Err(err) => {
-                    return PrometheusJsonResponse::error(
-                        err.status_code().to_string(),
-                        err.output_msg(),
-                    )
-                    .0
+                    return PrometheusJsonResponse::error(err.status_code(), err.output_msg())
                 }
             };
         // range query only returns matrix
@@ -133,8 +132,6 @@ impl PrometheusGatewayService {
             result_type = ValueType::Matrix;
         };
 
-        PrometheusJsonResponse::from_query_result(result, metric_name, result_type)
-            .await
-            .0
+        PrometheusJsonResponse::from_query_result(result, metric_name, result_type).await
     }
 }

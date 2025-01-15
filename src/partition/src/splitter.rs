@@ -79,8 +79,8 @@ impl<'a> SplitReadRowHelper<'a> {
     }
 
     fn split_rows(mut self) -> Result<HashMap<RegionNumber, Rows>> {
-        let request_splits = self
-            .split_to_regions()?
+        let regions = self.split_to_regions()?;
+        let request_splits = regions
             .into_iter()
             .map(|(region_number, row_indexes)| {
                 let rows = row_indexes

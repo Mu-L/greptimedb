@@ -13,6 +13,7 @@
 // limitations under the License.
 
 // This file also contains some code from prometheus project.
+
 // Copyright 2015 The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,8 +35,9 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Float64Array, TimestampMillisecondArray};
 use datafusion::arrow::datatypes::TimeUnit;
 use datafusion::common::DataFusionError;
-use datafusion::logical_expr::{ScalarUDF, Signature, TypeSignature, Volatility};
+use datafusion::logical_expr::{ScalarUDF, Volatility};
 use datafusion::physical_plan::ColumnarValue;
+use datafusion_expr::create_udf;
 use datatypes::arrow::array::Array;
 use datatypes::arrow::datatypes::DataType;
 
@@ -48,7 +50,7 @@ pub type Rate = ExtrapolatedRate<true, true>;
 pub type Increase = ExtrapolatedRate<true, false>;
 
 /// Part of the `extrapolatedRate` in Promql,
-/// from <https://github.com/prometheus/prometheus/blob/6bdecf377cea8e856509914f35234e948c4fcb80/promql/functions.go#L66>
+/// from <https://github.com/prometheus/prometheus/blob/v0.40.1/promql/functions.go#L66>
 #[derive(Debug)]
 pub struct ExtrapolatedRate<const IS_COUNTER: bool, const IS_RATE: bool> {
     /// Range duration in millisecond
@@ -61,19 +63,23 @@ impl<const IS_COUNTER: bool, const IS_RATE: bool> ExtrapolatedRate<IS_COUNTER, I
         Self { range_length }
     }
 
-    fn input_type() -> Vec<DataType> {
-        vec![
+    fn scalar_udf_with_name(name: &str, range_length: i64) -> ScalarUDF {
+        let input_types = vec![
             // timestamp range vector
             RangeArray::convert_data_type(DataType::Timestamp(TimeUnit::Millisecond, None)),
             // value range vector
             RangeArray::convert_data_type(DataType::Float64),
             // timestamp vector
             DataType::Timestamp(TimeUnit::Millisecond, None),
-        ]
-    }
+        ];
 
-    fn return_type() -> DataType {
-        DataType::Float64
+        create_udf(
+            name,
+            input_types,
+            Arc::new(DataType::Float64),
+            Volatility::Immutable,
+            Arc::new(move |input: &_| Self::new(range_length).calc(input)) as _,
+        )
     }
 
     fn calc(&self, input: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
@@ -203,15 +209,7 @@ impl ExtrapolatedRate<false, false> {
     }
 
     pub fn scalar_udf(range_length: i64) -> ScalarUDF {
-        ScalarUDF {
-            name: Self::name().to_string(),
-            signature: Signature::new(
-                TypeSignature::Exact(Self::input_type()),
-                Volatility::Immutable,
-            ),
-            return_type: Arc::new(|_| Ok(Arc::new(Self::return_type()))),
-            fun: Arc::new(move |input| Self::new(range_length).calc(input)),
-        }
+        Self::scalar_udf_with_name(Self::name(), range_length)
     }
 }
 
@@ -222,15 +220,7 @@ impl ExtrapolatedRate<true, true> {
     }
 
     pub fn scalar_udf(range_length: i64) -> ScalarUDF {
-        ScalarUDF {
-            name: Self::name().to_string(),
-            signature: Signature::new(
-                TypeSignature::Exact(Self::input_type()),
-                Volatility::Immutable,
-            ),
-            return_type: Arc::new(|_| Ok(Arc::new(Self::return_type()))),
-            fun: Arc::new(move |input| Self::new(range_length).calc(input)),
-        }
+        Self::scalar_udf_with_name(Self::name(), range_length)
     }
 }
 
@@ -241,15 +231,7 @@ impl ExtrapolatedRate<true, false> {
     }
 
     pub fn scalar_udf(range_length: i64) -> ScalarUDF {
-        ScalarUDF {
-            name: Self::name().to_string(),
-            signature: Signature::new(
-                TypeSignature::Exact(Self::input_type()),
-                Volatility::Immutable,
-            ),
-            return_type: Arc::new(|_| Ok(Arc::new(Self::return_type()))),
-            fun: Arc::new(move |input| Self::new(range_length).calc(input)),
-        }
+        Self::scalar_udf_with_name(Self::name(), range_length)
     }
 }
 
@@ -429,7 +411,7 @@ mod test {
             ts_range,
             value_range,
             timestamps,
-            // that two `2.0` is because `duration_to_start` are shrunk to to
+            // that two `2.0` is because `duration_to_start` are shrunk to
             // `duration_to_zero`, and causes `duration_to_zero` less than
             // `extrapolation_threshold`.
             vec![2.0, 1.5, 1.5, 1.5, 2.0, 1.5, 1.5, 1.5],

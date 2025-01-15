@@ -20,15 +20,15 @@ use axum::http;
 use http_body::Body;
 use hyper::{Request, StatusCode};
 use servers::http::authorize::inner_auth;
-use session::context::QueryContextRef;
+use session::context::QueryContext;
 
 #[tokio::test]
 async fn test_http_auth() {
     // base64encode("username:password") == "dXNlcm5hbWU6cGFzc3dvcmQ="
     let req = mock_http_request(Some("Basic dXNlcm5hbWU6cGFzc3dvcmQ="), None).unwrap();
     let req = inner_auth(None, req).await.unwrap();
-    let ctx: &QueryContextRef = req.extensions().get().unwrap();
-    let user_info = ctx.current_user().unwrap();
+    let ctx: &QueryContext = req.extensions().get().unwrap();
+    let user_info = ctx.current_user();
     let default = auth::userinfo_by_name(None);
     assert_eq!(default.username(), user_info.username());
 
@@ -38,8 +38,8 @@ async fn test_http_auth() {
     // base64encode("greptime:greptime") == "Z3JlcHRpbWU6Z3JlcHRpbWU="
     let req = mock_http_request(Some("Basic Z3JlcHRpbWU6Z3JlcHRpbWU="), None).unwrap();
     let req = inner_auth(mock_user_provider.clone(), req).await.unwrap();
-    let ctx: &QueryContextRef = req.extensions().get().unwrap();
-    let user_info = ctx.current_user().unwrap();
+    let ctx: &QueryContext = req.extensions().get().unwrap();
+    let user_info = ctx.current_user();
     let default = auth::userinfo_by_name(None);
     assert_eq!(default.username(), user_info.username());
 
@@ -49,7 +49,7 @@ async fn test_http_auth() {
     let mut resp = auth_res.unwrap_err();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        b"{\"type\":\"GreptimedbV1\",\"code\":7003,\"error\":\"Not found http or grpc authorization header\"}",
+        b"{\"code\":7003,\"error\":\"Not found http or grpc authorization header\",\"execution_time_ms\":0}",
         resp.data().await.unwrap().unwrap().as_ref()
     );
 
@@ -60,7 +60,7 @@ async fn test_http_auth() {
     let mut resp = auth_res.unwrap_err();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        b"{\"type\":\"GreptimedbV1\",\"code\":7000,\"error\":\"User not found, username: username\"}",
+        b"{\"code\":7000,\"error\":\"User not found, username: username\",\"execution_time_ms\":0}",
         resp.data().await.unwrap().unwrap().as_ref(),
     );
 }
@@ -79,8 +79,8 @@ async fn test_schema_validating() {
     )
     .unwrap();
     let req = inner_auth(mock_user_provider.clone(), req).await.unwrap();
-    let ctx: &QueryContextRef = req.extensions().get().unwrap();
-    let user_info = ctx.current_user().unwrap();
+    let ctx: &QueryContext = req.extensions().get().unwrap();
+    let user_info = ctx.current_user();
     let default = auth::userinfo_by_name(None);
     assert_eq!(default.username(), user_info.username());
 
@@ -95,7 +95,7 @@ async fn test_schema_validating() {
     let mut resp = result.unwrap_err();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        b"{\"type\":\"GreptimedbV1\",\"code\":7005,\"error\":\"Access denied for user 'greptime' to database 'greptime-wrong'\"}",
+        b"{\"code\":7005,\"error\":\"Access denied for user 'greptime' to database 'greptime-wrong'\",\"execution_time_ms\":0}",
         resp.data().await.unwrap().unwrap().as_ref()
     );
 }
@@ -113,7 +113,7 @@ async fn test_whitelist_no_auth() {
     let mut resp = auth_res.unwrap_err();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        b"{\"type\":\"GreptimedbV1\",\"code\":7003,\"error\":\"Not found http or grpc authorization header\"}",
+        b"{\"code\":7003,\"error\":\"Not found http or grpc authorization header\",\"execution_time_ms\":0}",
         resp.data().await.unwrap().unwrap().as_ref()
     );
 
@@ -134,6 +134,5 @@ fn mock_http_request(
     if let Some(auth_header) = auth_header {
         req = req.header(http::header::AUTHORIZATION, auth_header);
     }
-
     Ok(req.body(()).unwrap())
 }

@@ -23,6 +23,14 @@ SELECT INTERVAL '-2 months';
 | 0 years -2 mons 0 days 0 hours 0 mins 0.000000000 secs  |
 +---------------------------------------------------------+
 
+SELECT '3 hours'::INTERVAL;
+
++-------------------------------------------------------+
+| IntervalMonthDayNano("10800000000000")                |
++-------------------------------------------------------+
+| 0 years 0 mons 0 days 3 hours 0 mins 0.000000000 secs |
++-------------------------------------------------------+
+
 SELECT INTERVAL '1 year 2 months 3 days 4 hours' + INTERVAL '1 year';
 
 +------------------------------------------------------------------------------------------------------------------+
@@ -41,15 +49,15 @@ SELECT INTERVAL '1 year 2 months 3 days 4 hours' - INTERVAL '1 year';
 
 SELECT INTERVAL '6 years' * 2;
 
-Error: 3000(PlanQuery), Failed to plan SQL: This feature is not implemented: Unsupported interval operator: Multiply
+Error: 1001(Unsupported), Failed to plan SQL: This feature is not implemented: Unsupported interval operator: Multiply
 
 SELECT INTERVAL '6 years' / 2;
 
-Error: 3000(PlanQuery), Failed to plan SQL: This feature is not implemented: Unsupported interval operator: Divide
+Error: 1001(Unsupported), Failed to plan SQL: This feature is not implemented: Unsupported interval operator: Divide
 
 SELECT INTERVAL '6 years' = INTERVAL '72 months';
 
-Error: 3000(PlanQuery), Failed to plan SQL: This feature is not implemented: Unsupported interval operator: Eq
+Error: 1001(Unsupported), Failed to plan SQL: This feature is not implemented: Unsupported interval operator: Eq
 
 SELECT arrow_typeof(INTERVAL '1 month');
 
@@ -264,6 +272,104 @@ SELECT TIMESTAMP '1992-09-20 11:30:00.123456' - interval_value as new_value from
 | 1980-09-07T23:17:48.111443988 |
 +-------------------------------+
 
+-- Interval shortened names
+SELECT INTERVAL '55h';
+
++--------------------------------------------------------+
+| IntervalMonthDayNano("198000000000000")                |
++--------------------------------------------------------+
+| 0 years 0 mons 0 days 55 hours 0 mins 0.000000000 secs |
++--------------------------------------------------------+
+
+SELECT INTERVAL '-2mon';
+
++---------------------------------------------------------+
+| IntervalMonthDayNano("-158456325028528675187087900672") |
++---------------------------------------------------------+
+| 0 years -2 mons 0 days 0 hours 0 mins 0.000000000 secs  |
++---------------------------------------------------------+
+
+SELECT INTERVAL '-1h5m';
+
++---------------------------------------------------------+
+| IntervalMonthDayNano("18446740773709551616")            |
++---------------------------------------------------------+
+| 0 years 0 mons 0 days 0 hours -55 mins 0.000000000 secs |
++---------------------------------------------------------+
+
+SELECT INTERVAL '-1h-5m';
+
++---------------------------------------------------------+
+| IntervalMonthDayNano("18446740173709551616")            |
++---------------------------------------------------------+
+| 0 years 0 mons 0 days -1 hours -5 mins 0.000000000 secs |
++---------------------------------------------------------+
+
+SELECT INTERVAL '1y2w3d4h';
+
++---------------------------------------------------------+
+| IntervalMonthDayNano("950737950484766714775589781504")  |
++---------------------------------------------------------+
+| 0 years 12 mons 17 days 4 hours 0 mins 0.000000000 secs |
++---------------------------------------------------------+
+
+SELECT '3y2mon'::INTERVAL;
+
++---------------------------------------------------------+
+| IntervalMonthDayNano("3010670175542044828554670112768") |
++---------------------------------------------------------+
+| 0 years 38 mons 0 days 0 hours 0 mins 0.000000000 secs  |
++---------------------------------------------------------+
+
+SELECT INTERVAL '7 days' - INTERVAL '1d';
+
++----------------------------------------------------------------------------------------------+
+| IntervalMonthDayNano("129127208515966861312") - IntervalMonthDayNano("18446744073709551616") |
++----------------------------------------------------------------------------------------------+
+| 0 years 0 mons 6 days 0 hours 0 mins 0.000000000 secs                                        |
++----------------------------------------------------------------------------------------------+
+
+SELECT INTERVAL '2h' + INTERVAL '1h';
+
++-------------------------------------------------------------------------------+
+| IntervalMonthDayNano("7200000000000") + IntervalMonthDayNano("3600000000000") |
++-------------------------------------------------------------------------------+
+| 0 years 0 mons 0 days 3 hours 0 mins 0.000000000 secs                         |
++-------------------------------------------------------------------------------+
+
+-- Interval ISO 8601
+SELECT INTERVAL 'p3y3m700dt133h17m36.789s';
+
++-------------------------------------------------------------+
+| IntervalMonthDayNano("163343856789000000")                  |
++-------------------------------------------------------------+
+| 0 years 0 mons 0 days 45373 hours 17 mins 36.789000000 secs |
++-------------------------------------------------------------+
+
+SELECT INTERVAL '-P3Y3M700DT133H17M36.789S';
+
++----------------------------------------------------------------+
+| IntervalMonthDayNano("18283400216920551616")                   |
++----------------------------------------------------------------+
+| 0 years 0 mons 0 days -45373 hours -17 mins -36.789000000 secs |
++----------------------------------------------------------------+
+
+SELECT 'P3Y3M700DT133H17M36.789S'::INTERVAL;
+
++-------------------------------------------------------------+
+| IntervalMonthDayNano("163343856789000000")                  |
++-------------------------------------------------------------+
+| 0 years 0 mons 0 days 45373 hours 17 mins 36.789000000 secs |
++-------------------------------------------------------------+
+
+SELECT INTERVAL '2h' + INTERVAL 'P3Y3M700DT133H17M36.789S';
+
++------------------------------------------------------------------------------------+
+| IntervalMonthDayNano("7200000000000") + IntervalMonthDayNano("163343856789000000") |
++------------------------------------------------------------------------------------+
+| 0 years 0 mons 0 days 45375 hours 17 mins 36.789000000 secs                        |
++------------------------------------------------------------------------------------+
+
 -- Interval type does not support aggregation functions.
 SELECT MIN(interval_value) from intervals;
 
@@ -277,9 +383,9 @@ This was likely caused by a bug in DataFusion's code and we would welcome that y
 
 SELECT SUM(interval_value) from intervals;
 
-Error: 3000(PlanQuery), Failed to plan SQL: Error during planning: No function matches the given name and argument types 'SUM(Interval(MonthDayNano))'. You might need to add explicit type casts.
+Error: 3000(PlanQuery), Failed to plan SQL: Error during planning: Execution error: User-defined coercion failed with Execution("Sum not supported for Interval(MonthDayNano)") and No function matches the given name and argument types 'SUM(Interval(MonthDayNano))'. You might need to add explicit type casts.
 	Candidate functions:
-	SUM(Int8/Int16/Int32/Int64/UInt8/UInt16/UInt32/UInt64/Float32/Float64)
+	SUM(UserDefined)
 
 SELECT AVG(interval_value) from intervals;
 

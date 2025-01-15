@@ -21,6 +21,7 @@ use promql::extension_plan::{
     EmptyMetric, InstantManipulate, RangeManipulate, SeriesDivide, SeriesNormalize,
 };
 
+use crate::dist_plan::merge_sort::{merge_sort_transformer, MergeSortLogicalPlan};
 use crate::dist_plan::MergeScanLogicalPlan;
 
 #[allow(dead_code)]
@@ -68,8 +69,9 @@ impl Categorizer {
                 }
 
                 // sort plan needs to consider column priority
-                // We can implement a merge-sort on partial ordered data
-                Commutativity::Unimplemented
+                // Change Sort to MergeSort which assumes the input streams are already sorted hence can be more efficient
+                // We should ensure the number of partition is not smaller than the number of region at present. Otherwise this would result in incorrect output.
+                Commutativity::ConditionalCommutative(Some(Arc::new(merge_sort_transformer)))
             }
             LogicalPlan::Join(_) => Commutativity::NonCommutative,
             LogicalPlan::CrossJoin(_) => Commutativity::NonCommutative,
@@ -107,6 +109,7 @@ impl Categorizer {
             LogicalPlan::Dml(_) => Commutativity::Unsupported,
             LogicalPlan::Ddl(_) => Commutativity::Unsupported,
             LogicalPlan::Copy(_) => Commutativity::Unsupported,
+            LogicalPlan::RecursiveQuery(_) => Commutativity::Unsupported,
         }
     }
 
@@ -117,7 +120,8 @@ impl Categorizer {
                 || name == SeriesNormalize::name()
                 || name == RangeManipulate::name()
                 || name == SeriesDivide::name()
-                || name == MergeScanLogicalPlan::name() =>
+                || name == MergeScanLogicalPlan::name()
+                || name == MergeSortLogicalPlan::name() =>
             {
                 Commutativity::Unimplemented
             }
@@ -142,27 +146,24 @@ impl Categorizer {
             | Expr::Between(_)
             | Expr::Sort(_)
             | Expr::Exists(_)
-            | Expr::ScalarFunction(_)
-            | Expr::ScalarUDF(_) => Commutativity::Commutative,
+            | Expr::InList(_)
+            | Expr::ScalarFunction(_) => Commutativity::Commutative,
 
             Expr::Like(_)
             | Expr::SimilarTo(_)
             | Expr::IsUnknown(_)
             | Expr::IsNotUnknown(_)
-            | Expr::GetIndexedField(_)
             | Expr::Case(_)
             | Expr::Cast(_)
             | Expr::TryCast(_)
             | Expr::AggregateFunction(_)
             | Expr::WindowFunction(_)
-            | Expr::AggregateUDF(_)
-            | Expr::InList(_)
             | Expr::InSubquery(_)
             | Expr::ScalarSubquery(_)
-            | Expr::Wildcard => Commutativity::Unimplemented,
+            | Expr::Wildcard { .. } => Commutativity::Unimplemented,
 
             Expr::Alias(_)
-            | Expr::QualifiedWildcard { .. }
+            | Expr::Unnest(_)
             | Expr::GroupingSet(_)
             | Expr::Placeholder(_)
             | Expr::OuterReferenceColumn(_, _) => Commutativity::Unimplemented,
@@ -178,7 +179,7 @@ impl Categorizer {
         }
         let ref_cols = ref_cols
             .into_iter()
-            .map(|c| c.flat_name())
+            .map(|c| c.name.clone())
             .collect::<HashSet<_>>();
         for col in partition_cols {
             if !ref_cols.contains(col) {

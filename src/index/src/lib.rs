@@ -13,7 +13,10 @@
 // limitations under the License.
 
 #![feature(iter_partition_in_place)]
-// TODO(zhongzc): remove once further code is added
-#![allow(dead_code)]
+#![feature(assert_matches)]
 
+pub mod bloom_filter;
+pub mod error;
+pub mod external_provider;
+pub mod fulltext_index;
 pub mod inverted_index;

@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use client::OutputData;
 use common_base::readable_size::ReadableSize;
 use common_datasource::file_format::csv::stream_to_csv;
 use common_datasource::file_format::json::stream_to_json;
@@ -29,12 +31,11 @@ use datafusion::datasource::DefaultTableSource;
 use datafusion_common::TableReference as DfTableReference;
 use datafusion_expr::LogicalPlanBuilder;
 use object_store::ObjectStore;
-use query::plan::LogicalPlan;
 use session::context::QueryContextRef;
 use snafu::{OptionExt, ResultExt};
-use table::engine::TableReference;
 use table::requests::CopyTableRequest;
 use table::table::adapter::DfTableProviderAdapter;
+use table::table_reference::TableReference;
 
 use crate::error::{self, BuildDfLogicalPlanSnafu, ExecLogicalPlanSnafu, Result};
 use crate::statement::StatementExecutor;
@@ -42,6 +43,9 @@ use crate::statement::StatementExecutor;
 // The buffer size should be greater than 5MB (minimum multipart upload size).
 /// Buffer size to flush data to object stores.
 const WRITE_BUFFER_THRESHOLD: ReadableSize = ReadableSize::mb(8);
+
+/// Default number of concurrent write, it only works on object store backend(e.g., S3).
+const WRITE_CONCURRENCY: usize = 8;
 
 impl StatementExecutor {
     async fn stream_to_file(
@@ -59,6 +63,7 @@ impl StatementExecutor {
                 object_store,
                 path,
                 threshold,
+                WRITE_CONCURRENCY,
             )
             .await
             .context(error::WriteStreamToFileSnafu { path }),
@@ -67,17 +72,22 @@ impl StatementExecutor {
                 object_store,
                 path,
                 threshold,
+                WRITE_CONCURRENCY,
             )
             .await
             .context(error::WriteStreamToFileSnafu { path }),
-            Format::Parquet(_) => stream_to_parquet(
-                Box::pin(DfRecordBatchStreamAdapter::new(stream)),
-                object_store,
-                path,
-                threshold,
-            )
-            .await
-            .context(error::WriteStreamToFileSnafu { path }),
+            Format::Parquet(_) => {
+                let schema = stream.schema();
+                stream_to_parquet(
+                    Box::pin(DfRecordBatchStreamAdapter::new(stream)),
+                    schema,
+                    object_store,
+                    path,
+                    WRITE_CONCURRENCY,
+                )
+                .await
+                .context(error::WriteStreamToFileSnafu { path })
+            }
             _ => error::UnsupportedFormatSnafu { format: *format }.fail(),
         }
     }
@@ -104,46 +114,61 @@ impl StatementExecutor {
                     req.timestamp_range.as_ref(),
                 )
             })
-            .map(|filter| filter.df_expr().clone())
             .into_iter()
             .collect::<Vec<_>>();
 
         let table_provider = Arc::new(DfTableProviderAdapter::new(table));
         let table_source = Arc::new(DefaultTableSource::new(table_provider));
 
-        let plan = LogicalPlanBuilder::scan_with_filters(
-            df_table_ref.to_owned_reference(),
+        let mut builder = LogicalPlanBuilder::scan_with_filters(
+            df_table_ref,
             table_source,
             None,
-            filters,
+            filters.clone(),
         )
-        .context(BuildDfLogicalPlanSnafu)?
-        .build()
         .context(BuildDfLogicalPlanSnafu)?;
+        for f in filters {
+            builder = builder.filter(f).context(BuildDfLogicalPlanSnafu)?;
+        }
+        let plan = builder.build().context(BuildDfLogicalPlanSnafu)?;
 
         let output = self
             .query_engine
-            .execute(LogicalPlan::DfPlan(plan), query_ctx)
+            .execute(plan, query_ctx)
             .await
             .context(ExecLogicalPlanSnafu)?;
-        let stream = match output {
-            Output::Stream(stream) => stream,
-            Output::RecordBatches(record_batches) => record_batches.as_stream(),
+
+        let CopyTableRequest {
+            location,
+            connection,
+            ..
+        } = &req;
+
+        debug!("Copy table: {table_id} to location: {location}");
+        self.copy_to_file(&format, output, location, connection)
+            .await
+    }
+
+    pub(crate) async fn copy_to_file(
+        &self,
+        format: &Format,
+        output: Output,
+        location: &str,
+        connection: &HashMap<String, String>,
+    ) -> Result<usize> {
+        let stream = match output.data {
+            OutputData::Stream(stream) => stream,
+            OutputData::RecordBatches(record_batches) => record_batches.as_stream(),
             _ => unreachable!(),
         };
 
-        let (_schema, _host, path) = parse_url(&req.location).context(error::ParseUrlSnafu)?;
+        let (_schema, _host, path) = parse_url(location).context(error::ParseUrlSnafu)?;
         let (_, filename) = find_dir_and_filename(&path);
         let filename = filename.context(error::UnexpectedSnafu {
             violated: format!("Expected filename, path: {path}"),
         })?;
-        let object_store =
-            build_backend(&req.location, &req.connection).context(error::BuildBackendSnafu)?;
-        debug!("Copy table: {table_id} to path: {path}");
-        let rows_copied = self
-            .stream_to_file(stream, &format, object_store, &filename)
-            .await?;
-
-        Ok(rows_copied)
+        let object_store = build_backend(location, connection).context(error::BuildBackendSnafu)?;
+        self.stream_to_file(stream, format, object_store, &filename)
+            .await
     }
 }

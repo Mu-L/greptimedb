@@ -12,13 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::{Display, Formatter};
+
+use serde::Serialize;
 use sqlparser::ast::Statement as SpStatement;
 use sqlparser_derive::{Visit, VisitMut};
 
 use crate::error::Error;
 
 /// Explain statement.
-#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut)]
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut, Serialize)]
 pub struct Explain {
     pub inner: SpStatement,
 }
@@ -31,8 +34,8 @@ impl TryFrom<SpStatement> for Explain {
     }
 }
 
-impl ToString for Explain {
-    fn to_string(&self) -> String {
-        self.inner.to_string()
+impl Display for Explain {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.inner)
     }
 }

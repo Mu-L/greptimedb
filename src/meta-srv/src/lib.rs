@@ -15,7 +15,6 @@
 #![feature(async_closure)]
 #![feature(result_flattening)]
 #![feature(assert_matches)]
-#![feature(option_take_if)]
 #![feature(extract_if)]
 
 pub mod bootstrap;
@@ -24,10 +23,10 @@ pub mod cluster;
 pub mod election;
 pub mod error;
 mod failure_detector;
+pub mod flow_meta_alloc;
 pub mod handler;
-pub mod keys;
+pub mod key;
 pub mod lease;
-pub mod lock;
 pub mod metasrv;
 mod metrics;
 #[cfg(feature = "mock")]

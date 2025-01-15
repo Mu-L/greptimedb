@@ -16,65 +16,90 @@
 
 use std::time::Duration;
 
-use common_telemetry::{info, warn};
+use bytes::Bytes;
+use common_telemetry::{error, info, warn};
 use futures::TryStreamExt;
 use object_store::util::join_path;
 use object_store::{EntryMode, ObjectStore};
 use snafu::ResultExt;
+use store_api::logstore::LogStore;
 use store_api::region_request::AffectedRows;
 use store_api::storage::RegionId;
 use tokio::time::sleep;
 
 use crate::error::{OpenDalSnafu, Result};
-use crate::metrics::REGION_COUNT;
-use crate::region::RegionMapRef;
+use crate::region::{RegionLeaderState, RegionMapRef};
 use crate::worker::{RegionWorkerLoop, DROPPING_MARKER_FILE};
 
 const GC_TASK_INTERVAL_SEC: u64 = 5 * 60; // 5 minutes
 const MAX_RETRY_TIMES: u64 = 288; // 24 hours (5m * 288)
 
-impl<S> RegionWorkerLoop<S> {
+impl<S> RegionWorkerLoop<S>
+where
+    S: LogStore,
+{
     pub(crate) async fn handle_drop_request(
         &mut self,
         region_id: RegionId,
     ) -> Result<AffectedRows> {
         let region = self.regions.writable_region(region_id)?;
 
-        info!("Try to drop region: {}", region_id);
+        info!("Try to drop region: {}, worker: {}", region_id, self.id);
 
-        // write dropping marker
+        // Marks the region as dropping.
+        region.set_dropping()?;
+        // Writes dropping marker
+        // We rarely drop a region so we still operate in the worker loop.
         let marker_path = join_path(region.access_layer.region_dir(), DROPPING_MARKER_FILE);
         region
             .access_layer
             .object_store()
-            .write(&marker_path, vec![])
+            .write(&marker_path, Bytes::new())
             .await
-            .context(OpenDalSnafu)?;
+            .context(OpenDalSnafu)
+            .inspect_err(|e| {
+                error!(e; "Failed to write the drop marker file for region {}", region_id);
 
-        region.stop().await?;
-        // remove this region from region map to prevent other requests from accessing this region
+                // Sets the state back to writable. It's possible that the marker file has been written.
+                // We set the state back to writable so we can retry the drop operation.
+                region.switch_state_to_writable(RegionLeaderState::Dropping);
+            })?;
+
+        region.stop().await;
+        // Removes this region from region map to prevent other requests from accessing this region
         self.regions.remove_region(region_id);
         self.dropping_regions.insert_region(region.clone());
+
+        // Delete region data in WAL.
+        self.wal
+            .obsolete(
+                region_id,
+                region.version_control.current().last_entry_id,
+                &region.provider,
+            )
+            .await?;
         // Notifies flush scheduler.
         self.flush_scheduler.on_region_dropped(region_id);
         // Notifies compaction scheduler.
         self.compaction_scheduler.on_region_dropped(region_id);
 
-        // mark region version as dropped
-        region.version_control.mark_dropped(&self.memtable_builder);
+        // Marks region version as dropped
+        region
+            .version_control
+            .mark_dropped(&region.memtable_builder);
         info!(
             "Region {} is dropped logically, but some files are not deleted yet",
             region_id
         );
 
-        REGION_COUNT.dec();
+        self.region_count.dec();
 
-        // detach a background task to delete the region dir
+        // Detaches a background task to delete the region dir
         let region_dir = region.access_layer.region_dir().to_owned();
         let object_store = region.access_layer.object_store().clone();
         let dropping_regions = self.dropping_regions.clone();
         let listener = self.listener.clone();
-        common_runtime::spawn_bg(async move {
+        common_runtime::spawn_global(async move {
             let gc_duration = listener
                 .on_later_drop_begin(region_id)
                 .unwrap_or(Duration::from_secs(GC_TASK_INTERVAL_SEC));
@@ -163,7 +188,7 @@ pub(crate) async fn remove_region_dir_once(
         // no parquet file found, delete the region path
         // first delete all files other than the marker
         object_store
-            .remove(files_to_remove_first)
+            .delete_iter(files_to_remove_first)
             .await
             .context(OpenDalSnafu)?;
         // then remove the marker with this dir

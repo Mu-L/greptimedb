@@ -4,5 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
+[features]
+codec = ["dep:serde"]
+
 [dependencies]
-build-data = "0.1.4"
+const_format = "0.2"
+serde = { workspace = true, optional = true }
+shadow-rs.workspace = true
+
+[build-dependencies]
+build-data = "0.2"
+shadow-rs.workspace = true

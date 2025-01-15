@@ -13,21 +13,21 @@
 // limitations under the License.
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::time::Duration;
 
 use api::v1::meta::MailboxMessage;
-use common_meta::ddl::utils::region_storage_path;
 use common_meta::distributed_time_constants::MAILBOX_RTT_SECS;
 use common_meta::instruction::{Instruction, InstructionReply, OpenRegion, SimpleReply};
+use common_meta::key::datanode_table::RegionInfo;
 use common_meta::RegionIdent;
 use common_procedure::Status;
+use common_telemetry::info;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
 
-use super::update_metadata::UpdateMetadata;
 use crate::error::{self, Result};
 use crate::handler::HeartbeatMailbox;
+use crate::procedure::region_migration::update_metadata::UpdateMetadata;
 use crate::procedure::region_migration::{Context, State};
 use crate::service::mailbox::Channel;
 
@@ -58,26 +58,21 @@ impl OpenCandidateRegion {
     /// Builds open region instructions
     ///
     /// Abort(non-retry):
-    /// - Table Info is not found.
+    /// - Datanode Table is not found.
     async fn build_open_region_instruction(&self, ctx: &mut Context) -> Result<Instruction> {
         let pc = &ctx.persistent_ctx;
         let cluster_id = pc.cluster_id;
         let table_id = pc.region_id.table_id();
         let region_number = pc.region_id.region_number();
         let candidate_id = pc.to_peer.id;
+        let datanode_table_value = ctx.get_from_peer_datanode_table_value().await?;
 
-        let table_info_value = ctx.get_table_info_value().await?;
-        let table_info = &table_info_value.table_info;
-
-        // The region storage path is immutable after the region is created.
-        // Therefore, it's safe to store it in `VolatileContext` for future use.
-        let region_storage_path =
-            region_storage_path(&table_info.catalog_name, &table_info.schema_name);
-
-        let engine = table_info.meta.engine.clone();
-        let region_options: HashMap<String, String> = (&table_info.meta.options).into();
-        // TODO(niebayes): properly fetch or construct region wal options.
-        let region_wal_options = HashMap::new();
+        let RegionInfo {
+            region_storage_path,
+            region_options,
+            region_wal_options,
+            engine,
+        } = datanode_table_value.region_info.clone();
 
         let open_instruction = Instruction::OpenRegion(OpenRegion::new(
             RegionIdent {
@@ -150,6 +145,10 @@ impl OpenCandidateRegion {
         match receiver.await? {
             Ok(msg) => {
                 let reply = HeartbeatMailbox::json_reply(&msg)?;
+                info!(
+                    "Received open region reply: {:?}, region: {}",
+                    reply, region_id
+                );
                 let InstructionReply::OpenRegion(SimpleReply { result, error }) = reply else {
                     return error::UnexpectedInstructionReplySnafu {
                         mailbox_message: msg.to_string(),
@@ -185,6 +184,7 @@ impl OpenCandidateRegion {
 #[cfg(test)]
 mod tests {
     use std::assert_matches::assert_matches;
+    use std::collections::HashMap;
 
     use common_catalog::consts::MITO2_ENGINE;
     use common_meta::key::table_route::TableRouteValue;
@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_info_is_not_found_error() {
+    async fn test_datanode_table_is_not_found_error() {
         let state = OpenCandidateRegion;
         let persistent_context = new_persistent_context();
         let env = TestingEnv::new();
@@ -233,7 +233,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_matches!(err, Error::TableInfoNotFound { .. });
+        assert_matches!(err, Error::DatanodeTableNotFound { .. });
         assert!(!err.is_retryable());
     }
 
@@ -388,7 +388,7 @@ mod tests {
 
         assert_matches!(err, Error::RetryLater { .. });
         assert!(err.is_retryable());
-        assert!(err.to_string().contains("test mocked"));
+        assert!(format!("{err:?}").contains("test mocked"));
     }
 
     #[tokio::test]
@@ -397,6 +397,7 @@ mod tests {
         // from_peer: 1
         // to_peer: 2
         let persistent_context = new_persistent_context();
+        let from_peer_id = persistent_context.from_peer.id;
         let region_id = persistent_context.region_id;
         let to_peer_id = persistent_context.to_peer.id;
         let mut env = TestingEnv::new();
@@ -405,7 +406,7 @@ mod tests {
         let table_info = new_test_table_info(1024, vec![1]).into();
         let region_routes = vec![RegionRoute {
             region: Region::new_test(persistent_context.region_id),
-            leader_peer: Some(Peer::empty(3)),
+            leader_peer: Some(Peer::empty(from_peer_id)),
             ..Default::default()
         }];
 

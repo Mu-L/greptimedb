@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::Hash;
 
 use api::v1::value::ValueData;
 use api::v1::{ColumnDataType, ColumnSchema, Row, Rows, SemanticType};
 use common_telemetry::{error, info};
-use snafu::OptionExt;
+use snafu::{ensure, OptionExt};
 use store_api::metric_engine_consts::{
     DATA_SCHEMA_TABLE_ID_COLUMN_NAME, DATA_SCHEMA_TSID_COLUMN_NAME,
 };
@@ -26,10 +26,11 @@ use store_api::storage::{RegionId, TableId};
 
 use crate::engine::MetricEngineInner;
 use crate::error::{
-    ColumnNotFoundSnafu, ForbiddenPhysicalAlterSnafu, LogicalRegionNotFoundSnafu, Result,
+    ColumnNotFoundSnafu, ForbiddenPhysicalAlterSnafu, LogicalRegionNotFoundSnafu,
+    PhysicalRegionNotFoundSnafu, Result,
 };
-use crate::metrics::FORBIDDEN_OPERATION_COUNT;
-use crate::utils::{to_data_region_id, to_metadata_region_id};
+use crate::metrics::{FORBIDDEN_OPERATION_COUNT, MITO_OPERATION_ELAPSED};
+use crate::utils::to_data_region_id;
 
 // A random number
 const TSID_HASH_SEED: u32 = 846793005;
@@ -44,7 +45,7 @@ impl MetricEngineInner {
         let is_putting_physical_region = self
             .state
             .read()
-            .await
+            .unwrap()
             .physical_regions()
             .contains_key(&region_id);
 
@@ -65,10 +66,14 @@ impl MetricEngineInner {
         logical_region_id: RegionId,
         mut request: RegionPutRequest,
     ) -> Result<AffectedRows> {
+        let _timer = MITO_OPERATION_ELAPSED
+            .with_label_values(&["put"])
+            .start_timer();
+
         let physical_region_id = *self
             .state
             .read()
-            .await
+            .unwrap()
             .logical_regions()
             .get(&logical_region_id)
             .with_context(|| LogicalRegionNotFoundSnafu {
@@ -80,6 +85,7 @@ impl MetricEngineInner {
             .await?;
 
         // write to data region
+
         // TODO: retrieve table name
         self.modify_rows(logical_region_id.table_id(), &mut request.rows)?;
         self.data_region.write_data(data_region_id, request).await
@@ -96,13 +102,10 @@ impl MetricEngineInner {
         physical_region_id: RegionId,
         request: &RegionPutRequest,
     ) -> Result<()> {
-        // check if the region exists
-        let metadata_region_id = to_metadata_region_id(physical_region_id);
-        if !self
-            .metadata_region
-            .is_logical_region_exists(metadata_region_id, logical_region_id)
-            .await?
-        {
+        // Check if the region exists
+        let data_region_id = to_data_region_id(physical_region_id);
+        let state = self.state.read().unwrap();
+        if !state.is_logical_region_exist(logical_region_id) {
             error!("Trying to write to an nonexistent region {logical_region_id}");
             return LogicalRegionNotFoundSnafu {
                 region_id: logical_region_id,
@@ -110,27 +113,28 @@ impl MetricEngineInner {
             .fail();
         }
 
-        // check if the columns exist
+        // Check if a physical column exists
+        let physical_columns =
+            state
+                .physical_columns()
+                .get(&data_region_id)
+                .context(PhysicalRegionNotFoundSnafu {
+                    region_id: data_region_id,
+                })?;
         for col in &request.rows.schema {
-            if self
-                .metadata_region
-                .column_semantic_type(metadata_region_id, logical_region_id, &col.column_name)
-                .await?
-                .is_none()
-            {
-                return ColumnNotFoundSnafu {
+            ensure!(
+                physical_columns.contains(&col.column_name),
+                ColumnNotFoundSnafu {
                     name: col.column_name.clone(),
                     region_id: logical_region_id,
                 }
-                .fail();
-            }
+            );
         }
 
         Ok(())
     }
 
     /// Perform metric engine specific logic to incoming rows.
-    /// - Change the semantic type of tag columns to field
     /// - Add table_id column
     /// - Generate tsid
     fn modify_rows(&self, table_id: TableId, rows: &mut Rows) -> Result<()> {
@@ -148,24 +152,13 @@ impl MetricEngineInner {
             })
             .collect::<Vec<_>>();
 
-        // generate new schema
-        rows.schema = rows
-            .schema
-            .clone()
-            .into_iter()
-            .map(|mut col| {
-                if col.semantic_type == SemanticType::Tag as i32 {
-                    col.semantic_type = SemanticType::Field as i32;
-                }
-                col
-            })
-            .collect::<Vec<_>>();
         // add table_name column
         rows.schema.push(ColumnSchema {
             column_name: DATA_SCHEMA_TABLE_ID_COLUMN_NAME.to_string(),
             datatype: ColumnDataType::Uint32 as i32,
             semantic_type: SemanticType::Tag as _,
             datatype_extension: None,
+            options: None,
         });
         // add tsid column
         rows.schema.push(ColumnSchema {
@@ -173,6 +166,7 @@ impl MetricEngineInner {
             datatype: ColumnDataType::Uint64 as i32,
             semantic_type: SemanticType::Tag as _,
             datatype_extension: None,
+            options: None,
         });
 
         // fill internal columns
@@ -231,19 +225,19 @@ mod tests {
 
         // write data
         let logical_region_id = env.default_logical_region_id();
-        let count = env
+        let result = env
             .metric()
             .handle_request(logical_region_id, request)
             .await
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(result.affected_rows, 5);
 
         // read data from physical region
         let physical_region_id = env.default_physical_region_id();
         let request = ScanRequest::default();
         let stream = env
             .metric()
-            .handle_query(physical_region_id, request)
+            .scan_to_stream(physical_region_id, request)
             .await
             .unwrap();
         let batches = RecordBatches::try_collect(stream).await.unwrap();
@@ -263,7 +257,7 @@ mod tests {
         let request = ScanRequest::default();
         let stream = env
             .metric()
-            .handle_query(logical_region_id, request)
+            .scan_to_stream(logical_region_id, request)
             .await
             .unwrap();
         let batches = RecordBatches::try_collect(stream).await.unwrap();
@@ -303,11 +297,11 @@ mod tests {
         });
 
         // write data
-        let count = engine
+        let result = engine
             .handle_request(logical_region_id, request)
             .await
             .unwrap();
-        assert_eq!(100, count);
+        assert_eq!(100, result.affected_rows);
     }
 
     #[tokio::test]

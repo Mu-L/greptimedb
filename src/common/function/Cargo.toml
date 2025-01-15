@@ -4,24 +4,52 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
+[features]
+default = ["geo"]
+geo = ["geohash", "h3o", "s2", "wkt", "geo-types", "dep:geo"]
+
 [dependencies]
+api.workspace = true
 arc-swap = "1.0"
-build-data = "0.1"
-chrono-tz = "0.6"
+async-trait.workspace = true
+common-base.workspace = true
+common-catalog.workspace = true
 common-error.workspace = true
 common-macro.workspace = true
+common-meta.workspace = true
 common-query.workspace = true
+common-runtime.workspace = true
+common-telemetry.workspace = true
 common-time.workspace = true
+common-version.workspace = true
 datafusion.workspace = true
 datatypes.workspace = true
-libc = "0.2"
+derive_more = { version = "1", default-features = false, features = ["display"] }
+geo = { version = "0.29", optional = true }
+geo-types = { version = "0.7", optional = true }
+geohash = { version = "0.13", optional = true }
+h3o = { version = "0.6", optional = true }
+jsonb.workspace = true
+nalgebra.workspace = true
 num = "0.4"
 num-traits = "0.2"
 once_cell.workspace = true
 paste = "1.0"
+s2 = { version = "0.0.12", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+session.workspace = true
 snafu.workspace = true
+sql.workspace = true
 statrs = "0.16"
+store-api.workspace = true
+table.workspace = true
+wkt = { version = "0.11", optional = true }
 
 [dev-dependencies]
-ron = "0.7"
+approx = "0.5"
 serde = { version = "1.0", features = ["derive"] }
+tokio.workspace = true

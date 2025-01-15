@@ -14,13 +14,14 @@
 
 use std::fmt;
 
+use serde::Serialize;
 use sqlparser::ast::Query as SpQuery;
 use sqlparser_derive::{Visit, VisitMut};
 
 use crate::error::Error;
 
 /// Query statement instance.
-#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut)]
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut, Serialize)]
 pub struct Query {
     pub inner: SpQuery,
 }
@@ -54,13 +55,17 @@ mod test {
 
     use super::Query;
     use crate::dialect::GreptimeDbDialect;
-    use crate::parser::ParserContext;
+    use crate::parser::{ParseOptions, ParserContext};
     use crate::statements::statement::Statement;
 
     fn create_query(sql: &str) -> Option<Box<Query>> {
-        match ParserContext::create_with_dialect(sql, &GreptimeDbDialect {})
-            .unwrap()
-            .remove(0)
+        match ParserContext::create_with_dialect(
+            sql,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        )
+        .unwrap()
+        .remove(0)
         {
             Statement::Query(query) => Some(query),
             _ => None,

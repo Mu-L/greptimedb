@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ops::Range;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use object_store::ObjectStore;
 use parquet::basic::ColumnOrder;
 use parquet::file::metadata::{FileMetaData, ParquetMetaData, RowGroupMetaData};
 use parquet::format;
@@ -83,4 +86,28 @@ fn parse_column_orders(
         }
         None => None,
     }
+}
+
+const FETCH_PARALLELISM: usize = 8;
+const MERGE_GAP: usize = 512 * 1024;
+
+/// Asynchronously fetches byte ranges from an object store.
+///
+/// * `FETCH_PARALLELISM` - The number of concurrent fetch operations.
+/// * `MERGE_GAP` - The maximum gap size (in bytes) to merge small byte ranges for optimized fetching.
+pub async fn fetch_byte_ranges(
+    file_path: &str,
+    object_store: ObjectStore,
+    ranges: &[Range<u64>],
+) -> object_store::Result<Vec<Bytes>> {
+    Ok(object_store
+        .reader_with(file_path)
+        .concurrent(FETCH_PARALLELISM)
+        .gap(MERGE_GAP)
+        .await?
+        .fetch(ranges.to_vec())
+        .await?
+        .into_iter()
+        .map(|buf| buf.to_bytes())
+        .collect::<Vec<_>>())
 }

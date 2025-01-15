@@ -16,8 +16,7 @@
 mod test {
     use std::sync::Arc;
 
-    use client::DEFAULT_CATALOG_NAME;
-    use common_query::Output;
+    use client::{OutputData, DEFAULT_CATALOG_NAME};
     use common_recordbatch::RecordBatches;
     use frontend::instance::Instance;
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -53,7 +52,7 @@ mod test {
     async fn test_otlp(instance: &Arc<Instance>) {
         let req = build_request();
         let db = "otlp";
-        let ctx = QueryContext::with(DEFAULT_CATALOG_NAME, db);
+        let ctx = Arc::new(QueryContext::with(DEFAULT_CATALOG_NAME, db));
 
         assert!(SqlQueryHandler::do_query(
             instance.as_ref(),
@@ -65,8 +64,8 @@ mod test {
         .unwrap()
         .is_ok());
 
-        let resp = instance.metrics(req, ctx.clone()).await.unwrap();
-        assert!(resp.partial_success.is_none());
+        let resp = instance.metrics(req, ctx.clone()).await;
+        assert!(resp.is_ok());
 
         let mut output = instance
             .do_query(
@@ -75,19 +74,19 @@ mod test {
             )
             .await;
         let output = output.remove(0).unwrap();
-        let Output::Stream(stream) = output else {
+        let OutputData::Stream(stream) = output.data else {
             unreachable!()
         };
         let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
         assert_eq!(
             recordbatches.pretty_print().unwrap(),
             "\
-+------------+-------+--------------------+------------+---------------------+----------------+
-| resource   | scope | telemetry_sdk_name | host       | greptime_timestamp  | greptime_value |
-+------------+-------+--------------------+------------+---------------------+----------------+
-| greptimedb | otel  | java               | testserver | 1970-01-01T00:00:00 | 105.0          |
-| greptimedb | otel  | java               | testsevrer | 1970-01-01T00:00:00 | 100.0          |
-+------------+-------+--------------------+------------+---------------------+----------------+",
++------------+-------+--------------------+------------+-------------------------------+----------------+
+| resource   | scope | telemetry_sdk_name | host       | greptime_timestamp            | greptime_value |
++------------+-------+--------------------+------------+-------------------------------+----------------+
+| greptimedb | otel  | java               | testsevrer | 1970-01-01T00:00:00.000000100 | 100.0          |
+| greptimedb | otel  | java               | testserver | 1970-01-01T00:00:00.000000105 | 105.0          |
++------------+-------+--------------------+------------+-------------------------------+----------------+",
         );
 
         let mut output = instance
@@ -97,7 +96,7 @@ mod test {
             )
             .await;
         let output = output.remove(0).unwrap();
-        let Output::Stream(stream) = output else {
+        let OutputData::Stream(stream) = output.data else {
             unreachable!()
         };
         let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
@@ -117,36 +116,36 @@ mod test {
             .do_query("SELECT * FROM my_test_histo_sum", ctx.clone())
             .await;
         let output = output.remove(0).unwrap();
-        let Output::Stream(stream) = output else {
+        let OutputData::Stream(stream) = output.data else {
             unreachable!()
         };
         let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
         assert_eq!(
             recordbatches.pretty_print().unwrap(),
             "\
-+------------+-------+--------------------+------------+---------------------+----------------+
-| resource   | scope | telemetry_sdk_name | host       | greptime_timestamp  | greptime_value |
-+------------+-------+--------------------+------------+---------------------+----------------+
-| greptimedb | otel  | java               | testserver | 1970-01-01T00:00:00 | 51.0           |
-+------------+-------+--------------------+------------+---------------------+----------------+",
++------------+-------+--------------------+------------+-------------------------------+----------------+
+| resource   | scope | telemetry_sdk_name | host       | greptime_timestamp            | greptime_value |
++------------+-------+--------------------+------------+-------------------------------+----------------+
+| greptimedb | otel  | java               | testserver | 1970-01-01T00:00:00.000000100 | 51.0           |
++------------+-------+--------------------+------------+-------------------------------+----------------+",
         );
 
         let mut output = instance
             .do_query("SELECT * FROM my_test_histo_count", ctx.clone())
             .await;
         let output = output.remove(0).unwrap();
-        let Output::Stream(stream) = output else {
+        let OutputData::Stream(stream) = output.data else {
             unreachable!()
         };
         let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
         assert_eq!(
             recordbatches.pretty_print().unwrap(),
             "\
-+------------+-------+--------------------+------------+---------------------+----------------+
-| resource   | scope | telemetry_sdk_name | host       | greptime_timestamp  | greptime_value |
-+------------+-------+--------------------+------------+---------------------+----------------+
-| greptimedb | otel  | java               | testserver | 1970-01-01T00:00:00 | 4.0            |
-+------------+-------+--------------------+------------+---------------------+----------------+",
++------------+-------+--------------------+------------+-------------------------------+----------------+
+| resource   | scope | telemetry_sdk_name | host       | greptime_timestamp            | greptime_value |
++------------+-------+--------------------+------------+-------------------------------+----------------+
+| greptimedb | otel  | java               | testserver | 1970-01-01T00:00:00.000000100 | 4.0            |
++------------+-------+--------------------+------------+-------------------------------+----------------+"
         );
     }
 

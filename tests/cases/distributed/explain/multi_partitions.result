@@ -7,10 +7,10 @@ CREATE TABLE demo(
     TIME INDEX (ts),
     PRIMARY KEY(host)
 )
-PARTITION BY RANGE COLUMNS (host) (
-    PARTITION r0 VALUES LESS THAN ('550-A'),
-    PARTITION r1 VALUES LESS THAN ('550-W'),
-    PARTITION r2 VALUES LESS THAN (MAXVALUE),
+PARTITION ON COLUMNS (host) (
+    host < '550-A',
+    host >= '550-A' AND host < '550-W',
+    host >= '550-W'
 );
 
 Affected Rows: 0
@@ -25,9 +25,10 @@ explain SELECT * FROM demo WHERE ts > cast(1000000000 as timestamp) ORDER BY hos
 +-+-+
 | plan_type_| plan_|
 +-+-+
-| logical_plan_| Sort: demo.host ASC NULLS LAST_|
+| logical_plan_| MergeSort: demo.host ASC NULLS LAST_|
 |_|_MergeScan [is_placeholder=false]_|
-| physical_plan | SortExec: expr=[host@0 ASC NULLS LAST]_|
+| physical_plan | SortPreservingMergeExec: [host@0 ASC NULLS LAST]_|
+|_|_SortExec: expr=[host@0 ASC NULLS LAST], preserve_partitioning=[true]_|
 |_|_MergeScanExec: REDACTED
 |_|_|
 +-+-+

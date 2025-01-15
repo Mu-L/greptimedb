@@ -12,75 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod client_manager;
+pub(crate) mod client_manager;
+pub(crate) mod consumer;
+pub(crate) mod index;
 pub mod log_store;
-mod offset;
-mod record_utils;
+pub(crate) mod producer;
+pub(crate) mod util;
+pub(crate) mod worker;
 
-use std::fmt::Display;
-
-use common_meta::wal::KafkaWalTopic as Topic;
+pub use index::{default_index_file, GlobalIndexCollector};
 use serde::{Deserialize, Serialize};
-use store_api::logstore::entry::{Entry, Id as EntryId};
-use store_api::logstore::namespace::Namespace;
-
-use crate::error::Error;
+use store_api::logstore::entry::Id as EntryId;
 
 /// Kafka Namespace implementation.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub struct NamespaceImpl {
-    region_id: u64,
-    topic: Topic,
-}
-
-impl Namespace for NamespaceImpl {
-    fn id(&self) -> u64 {
-        self.region_id
-    }
-}
-
-impl Display for NamespaceImpl {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.topic, self.region_id)
-    }
+    pub region_id: u64,
+    pub topic: String,
 }
 
 /// Kafka Entry implementation.
 #[derive(Debug, PartialEq, Clone)]
 pub struct EntryImpl {
     /// Entry payload.
-    data: Vec<u8>,
+    pub data: Vec<u8>,
     /// The logical entry id.
-    id: EntryId,
+    pub id: EntryId,
     /// The namespace used to identify and isolate log entries from different regions.
-    ns: NamespaceImpl,
-}
-
-impl Entry for EntryImpl {
-    type Error = Error;
-    type Namespace = NamespaceImpl;
-
-    fn data(&self) -> &[u8] {
-        &self.data
-    }
-
-    fn id(&self) -> EntryId {
-        self.id
-    }
-
-    fn namespace(&self) -> Self::Namespace {
-        self.ns.clone()
-    }
-}
-
-impl Display for EntryImpl {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Entry (ns: {}, id: {}, data_len: {})",
-            self.ns,
-            self.id,
-            self.data.len()
-        )
-    }
+    pub ns: NamespaceImpl,
 }

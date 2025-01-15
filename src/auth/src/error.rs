@@ -34,12 +34,15 @@ pub enum Error {
     Io {
         #[snafu(source)]
         error: std::io::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
-    #[snafu(display("Auth failed"))]
+    #[snafu(display("Authentication source failure"))]
     AuthBackend {
+        #[snafu(implicit)]
         location: Location,
+        #[snafu(source)]
         source: BoxedError,
     },
 
@@ -64,8 +67,18 @@ pub enum Error {
         username: String,
     },
 
+    #[snafu(display("Failed to initialize a watcher for file {}", path))]
+    FileWatch {
+        path: String,
+        #[snafu(source)]
+        error: notify::Error,
+    },
+
     #[snafu(display("User is not authorized to perform this action"))]
-    PermissionDenied { location: Location },
+    PermissionDenied {
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl ErrorExt for Error {
@@ -73,9 +86,10 @@ impl ErrorExt for Error {
         match self {
             Error::InvalidConfig { .. } => StatusCode::InvalidArguments,
             Error::IllegalParam { .. } => StatusCode::InvalidArguments,
+            Error::FileWatch { .. } => StatusCode::InvalidArguments,
             Error::InternalState { .. } => StatusCode::Unexpected,
-            Error::Io { .. } => StatusCode::Internal,
-            Error::AuthBackend { .. } => StatusCode::Internal,
+            Error::Io { .. } => StatusCode::StorageUnavailable,
+            Error::AuthBackend { source, .. } => source.status_code(),
 
             Error::UserNotFound { .. } => StatusCode::UserNotFound,
             Error::UnsupportedPasswordType { .. } => StatusCode::UnsupportedPasswordType,

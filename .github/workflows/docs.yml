@@ -9,6 +9,7 @@ on:
       - '.dockerignore'
       - 'docker/**'
       - '.gitignore'
+      - 'grafana/**'
   push:
     branches:
       - main
@@ -19,6 +20,7 @@ on:
       - '.dockerignore'
       - 'docker/**'
       - '.gitignore'
+      - 'grafana/**'
   workflow_dispatch:
 
 name: CI
@@ -31,39 +33,47 @@ jobs:
     name: Spell Check with Typos
     runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v3
-      - uses: crate-ci/typos@v1.13.10
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@master
+
+  license-header-check:
+    runs-on: ubuntu-20.04
+    name: Check License Header
+    steps:
+      - uses: actions/checkout@v4
+      - uses: korandoru/hawkeye@v5
 
   check:
     name: Check
-    if: github.event.pull_request.draft == false
     runs-on: ubuntu-20.04
     steps:
       - run: 'echo "No action required"'
 
   fmt:
     name: Rustfmt
-    if: github.event.pull_request.draft == false
     runs-on: ubuntu-20.04
     steps:
       - run: 'echo "No action required"'
 
   clippy:
     name: Clippy
-    if: github.event.pull_request.draft == false
     runs-on: ubuntu-20.04
     steps:
       - run: 'echo "No action required"'
 
   coverage:
-    if: github.event.pull_request.draft == false
     runs-on: ubuntu-20.04
     steps:
       - run: 'echo "No action required"'
 
   sqlness:
-    name: Sqlness Test
-    if: github.event.pull_request.draft == false
-    runs-on: ubuntu-20.04
+    name: Sqlness Test (${{ matrix.mode.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ ubuntu-20.04 ]
+        mode:
+          - name: "Basic"
+          - name: "Remote WAL"
     steps:
       - run: 'echo "No action required"'

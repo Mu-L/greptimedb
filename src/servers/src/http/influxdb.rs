@@ -13,15 +13,18 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Extension;
 use common_catalog::consts::DEFAULT_SCHEMA_NAME;
-use common_grpc::writer::Precision;
-use session::context::QueryContextRef;
+use common_grpc::precision::Precision;
+use common_telemetry::tracing;
+use session::context::{Channel, QueryContext, QueryContextRef};
 
+use super::header::write_cost_header_map;
 use crate::error::{Result, TimePrecisionSnafu};
 use crate::influxdb::InfluxdbRequest;
 use crate::query_handler::InfluxdbLineProtocolHandlerRef;
@@ -39,15 +42,18 @@ pub async fn influxdb_health() -> Result<impl IntoResponse> {
 }
 
 #[axum_macros::debug_handler]
+#[tracing::instrument(skip_all, fields(protocol = "influxdb", request_type = "write_v1"))]
 pub async fn influxdb_write_v1(
     State(handler): State<InfluxdbLineProtocolHandlerRef>,
     Query(mut params): Query<HashMap<String, String>>,
-    Extension(query_ctx): Extension<QueryContextRef>,
+    Extension(mut query_ctx): Extension<QueryContext>,
     lines: String,
 ) -> Result<impl IntoResponse> {
     let db = params
         .remove("db")
         .unwrap_or_else(|| DEFAULT_SCHEMA_NAME.to_string());
+    query_ctx.set_channel(Channel::Influx);
+    let query_ctx = Arc::new(query_ctx);
 
     let precision = params
         .get("precision")
@@ -58,15 +64,20 @@ pub async fn influxdb_write_v1(
 }
 
 #[axum_macros::debug_handler]
+#[tracing::instrument(skip_all, fields(protocol = "influxdb", request_type = "write_v2"))]
 pub async fn influxdb_write_v2(
     State(handler): State<InfluxdbLineProtocolHandlerRef>,
     Query(mut params): Query<HashMap<String, String>>,
-    Extension(query_ctx): Extension<QueryContextRef>,
+    Extension(mut query_ctx): Extension<QueryContext>,
     lines: String,
 ) -> Result<impl IntoResponse> {
-    let db = params
-        .remove("bucket")
-        .unwrap_or_else(|| DEFAULT_SCHEMA_NAME.to_string());
+    let db = match (params.remove("db"), params.remove("bucket")) {
+        (_, Some(bucket)) => bucket.clone(),
+        (Some(db), None) => db.clone(),
+        _ => DEFAULT_SCHEMA_NAME.to_string(),
+    };
+    query_ctx.set_channel(Channel::Influx);
+    let query_ctx = Arc::new(query_ctx);
 
     let precision = params
         .get("precision")
@@ -88,9 +99,12 @@ pub async fn influxdb_write(
         .start_timer();
 
     let request = InfluxdbRequest { precision, lines };
-    handler.exec(request, ctx).await?;
+    let output = handler.exec(request, ctx).await?;
 
-    Ok((StatusCode::NO_CONTENT, ()))
+    Ok((
+        StatusCode::NO_CONTENT,
+        write_cost_header_map(output.meta.cost),
+    ))
 }
 
 fn parse_time_precision(value: &str) -> Result<Precision> {
@@ -114,7 +128,7 @@ fn parse_time_precision(value: &str) -> Result<Precision> {
 
 #[cfg(test)]
 mod tests {
-    use common_grpc::writer::Precision;
+    use common_grpc::precision::Precision;
 
     use crate::http::influxdb::parse_time_precision;
 

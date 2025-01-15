@@ -27,20 +27,21 @@ use serde::{Deserialize, Serialize};
 use snafu::{ensure, ResultExt};
 use store_api::storage::RegionId;
 use strum::AsRefStr;
-use table::engine::TableReference;
 use table::metadata::{RawTableInfo, TableId};
+use table::table_name::TableName;
+use table::table_reference::TableReference;
 
 use super::utils::handle_retry_error;
-use crate::ddl::utils::handle_operate_region_error;
+use crate::ddl::utils::add_peer_context_if_needed;
 use crate::ddl::DdlContext;
 use crate::error::{Result, TableNotFoundSnafu};
 use crate::key::table_info::TableInfoValue;
 use crate::key::table_name::TableNameKey;
 use crate::key::DeserializedValueWithBytes;
-use crate::metrics;
+use crate::lock_key::{CatalogLock, SchemaLock, TableLock};
 use crate::rpc::ddl::TruncateTableTask;
 use crate::rpc::router::{find_leader_regions, find_leaders, RegionRoute};
-use crate::table_name::TableName;
+use crate::{metrics, ClusterId};
 
 pub struct TruncateTableProcedure {
     context: DdlContext,
@@ -75,13 +76,14 @@ impl Procedure for TruncateTableProcedure {
 
     fn lock_key(&self) -> LockKey {
         let table_ref = &self.data.table_ref();
-        let key = common_catalog::format_full_table_name(
-            table_ref.catalog,
-            table_ref.schema,
-            table_ref.table,
-        );
+        let table_id = self.data.table_id();
+        let lock_key = vec![
+            CatalogLock::Read(table_ref.catalog).into(),
+            SchemaLock::read(table_ref.catalog, table_ref.schema).into(),
+            TableLock::Write(table_id).into(),
+        ];
 
-        LockKey::single(key)
+        LockKey::new(lock_key)
     }
 }
 
@@ -89,7 +91,7 @@ impl TruncateTableProcedure {
     pub(crate) const TYPE_NAME: &'static str = "metasrv-procedure::TruncateTable";
 
     pub(crate) fn new(
-        cluster_id: u64,
+        cluster_id: ClusterId,
         task: TruncateTableTask,
         table_info_value: DeserializedValueWithBytes<TableInfoValue>,
         region_routes: Vec<RegionRoute>,
@@ -141,7 +143,7 @@ impl TruncateTableProcedure {
         let mut truncate_region_tasks = Vec::with_capacity(leaders.len());
 
         for datanode in leaders {
-            let requester = self.context.datanode_manager.datanode(&datanode).await;
+            let requester = self.context.node_manager.datanode(&datanode).await;
             let regions = find_leader_regions(region_routes, &datanode);
 
             for region in regions {
@@ -167,10 +169,10 @@ impl TruncateTableProcedure {
                 let requester = requester.clone();
 
                 truncate_region_tasks.push(async move {
-                    if let Err(err) = requester.handle(request).await {
-                        return Err(handle_operate_region_error(datanode)(err));
-                    }
-                    Ok(())
+                    requester
+                        .handle(request)
+                        .await
+                        .map_err(add_peer_context_if_needed(datanode))
                 });
             }
         }
@@ -180,14 +182,14 @@ impl TruncateTableProcedure {
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Status::Done)
+        Ok(Status::done())
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TruncateTableData {
     state: TruncateTableState,
-    cluster_id: u64,
+    cluster_id: ClusterId,
     task: TruncateTableTask,
     table_info_value: DeserializedValueWithBytes<TableInfoValue>,
     region_routes: Vec<RegionRoute>,
@@ -195,7 +197,7 @@ pub struct TruncateTableData {
 
 impl TruncateTableData {
     pub fn new(
-        cluster_id: u64,
+        cluster_id: ClusterId,
         task: TruncateTableTask,
         table_info_value: DeserializedValueWithBytes<TableInfoValue>,
         region_routes: Vec<RegionRoute>,

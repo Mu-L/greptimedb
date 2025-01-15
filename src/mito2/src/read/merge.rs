@@ -21,20 +21,22 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use common_telemetry::debug;
-use common_time::Timestamp;
 
 use crate::error::Result;
 use crate::memtable::BoxedBatchIterator;
-use crate::metrics::{MERGE_FILTER_ROWS_TOTAL, READ_STAGE_ELAPSED};
+use crate::metrics::READ_STAGE_ELAPSED;
 use crate::read::{Batch, BatchReader, BoxedBatchReader, Source};
 
 /// Reader to merge sorted batches.
 ///
 /// The merge reader merges [Batch]es from multiple sources that yield sorted batches.
 /// 1. Batch is ordered by primary key, time index, sequence desc, op type desc (we can
-/// ignore op type as sequence is already unique).
-/// 2. Batch doesn't have duplicate elements (elements with the same primary key and time index).
-/// 3. Batches from sources **must** not be empty.
+///    ignore op type as sequence is already unique).
+/// 2. Batches from sources **must** not be empty.
+///
+/// The reader won't concatenate batches. Each batch returned by the reader also doesn't
+/// contain duplicate rows. But the last (primary key, timestamp) of a batch may be the same
+/// as the first one in the next batch.
 pub struct MergeReader {
     /// Holds [Node]s whose key range of current batch **is** overlapped with the merge window.
     /// Each node yields batches from a `source`.
@@ -84,15 +86,12 @@ impl Drop for MergeReader {
     fn drop(&mut self) {
         debug!("Merge reader finished, metrics: {:?}", self.metrics);
 
-        MERGE_FILTER_ROWS_TOTAL
-            .with_label_values(&["dedup"])
-            .inc_by(self.metrics.num_duplicate_rows as u64);
-        MERGE_FILTER_ROWS_TOTAL
-            .with_label_values(&["delete"])
-            .inc_by(self.metrics.num_deleted_rows as u64);
         READ_STAGE_ELAPSED
             .with_label_values(&["merge"])
             .observe(self.metrics.scan_cost.as_secs_f64());
+        READ_STAGE_ELAPSED
+            .with_label_values(&["merge_fetch"])
+            .observe(self.metrics.fetch_cost.as_secs_f64());
     }
 }
 
@@ -150,12 +149,11 @@ impl MergeReader {
 
         let mut hottest = self.hot.pop().unwrap();
         let batch = hottest.fetch_batch(&mut self.metrics).await?;
-        Self::maybe_output_batch(batch, &mut self.output_batch, &mut self.metrics)?;
+        Self::maybe_output_batch(batch, &mut self.output_batch)?;
         self.reheap(hottest)
     }
 
-    /// Fetches non-duplicated rows from the hottest node and skips the timestamp duplicated
-    /// with the first timestamp in the next node.
+    /// Fetches non-duplicated rows from the hottest node.
     async fn fetch_rows_from_hottest(&mut self) -> Result<()> {
         // Safety: `fetch_batches_to_output()` ensures the hot heap has more than 1 element.
         // Pop hottest node.
@@ -176,89 +174,29 @@ impl MergeReader {
         // Binary searches the timestamp in the top batch.
         // Safety: Batches should have the same timestamp resolution so we can compare the native
         // value directly.
-        match timestamps.binary_search(&next_min_ts.value()) {
-            Ok(pos) => {
-                // They have duplicate timestamps. Outputs timestamps before the duplicated timestamp.
-                // Batch itself doesn't contain duplicate timestamps so timestamps before `pos`
-                // must be less than `next_min_ts`.
-                Self::maybe_output_batch(
-                    top.slice(0, pos),
-                    &mut self.output_batch,
-                    &mut self.metrics,
-                )?;
-                // This keep the duplicate timestamp in the node.
-                top_node.skip_rows(pos, &mut self.metrics).await?;
-                // The merge window should contain this timestamp so only nodes in the hot heap
-                // have this timestamp.
-                self.filter_first_duplicate_timestamp_in_hot(top_node, next_min_ts)
-                    .await?;
-            }
+        let duplicate_pos = match timestamps.binary_search(&next_min_ts.value()) {
+            Ok(pos) => pos,
             Err(pos) => {
                 // No duplicate timestamp. Outputs timestamp before `pos`.
-                Self::maybe_output_batch(
-                    top.slice(0, pos),
-                    &mut self.output_batch,
-                    &mut self.metrics,
-                )?;
+                Self::maybe_output_batch(top.slice(0, pos), &mut self.output_batch)?;
                 top_node.skip_rows(pos, &mut self.metrics).await?;
-                self.reheap(top_node)?;
+                return self.reheap(top_node);
             }
-        }
+        };
 
-        Ok(())
-    }
-
-    /// Filters the first duplicate `timestamp` in `top_node` and `hot` heap. Only keeps the timestamp
-    /// with the maximum sequence.
-    async fn filter_first_duplicate_timestamp_in_hot(
-        &mut self,
-        top_node: Node,
-        timestamp: Timestamp,
-    ) -> Result<()> {
-        debug_assert_eq!(
-            top_node.current_batch().first_timestamp().unwrap(),
-            timestamp
-        );
-
-        // The node with maximum sequence.
-        let mut max_seq_node = top_node;
-        let mut max_seq = max_seq_node.current_batch().first_sequence().unwrap();
-        while let Some(mut next_node) = self.hot.pop() {
-            // Safety: Batches in the heap is not empty.
-            let next_first_ts = next_node.current_batch().first_timestamp().unwrap();
-            let next_first_seq = next_node.current_batch().first_sequence().unwrap();
-
-            if next_first_ts != timestamp {
-                // We are done, push the node with max seq.
-                self.cold.push(next_node);
-                break;
-            }
-
-            if max_seq < next_first_seq {
-                // The next node has larger seq.
-                max_seq_node.skip_rows(1, &mut self.metrics).await?;
-                self.metrics.num_duplicate_rows += 1;
-                if !max_seq_node.is_eof() {
-                    self.cold.push(max_seq_node);
-                }
-                max_seq_node = next_node;
-                max_seq = next_first_seq;
-            } else {
-                next_node.skip_rows(1, &mut self.metrics).await?;
-                self.metrics.num_duplicate_rows += 1;
-                if !next_node.is_eof() {
-                    // If the next node has smaller seq, skip that row.
-                    self.cold.push(next_node);
-                }
-            }
-        }
-        debug_assert!(!max_seq_node.is_eof());
-        self.cold.push(max_seq_node);
-
-        // The merge window is updated, we need to refill the hot heap.
-        self.refill_hot();
-
-        Ok(())
+        // No need to remove duplicate timestamps.
+        let output_end = if duplicate_pos == 0 {
+            // If the first timestamp of the top node is duplicate. We can simply return the first row
+            // as the heap ensure it is the one with largest sequence.
+            1
+        } else {
+            // We don't know which one has the larger sequence so we use the range before
+            // the duplicate pos.
+            duplicate_pos
+        };
+        Self::maybe_output_batch(top.slice(0, output_end), &mut self.output_batch)?;
+        top_node.skip_rows(output_end, &mut self.metrics).await?;
+        self.reheap(top_node)
     }
 
     /// Push the node popped from `hot` back to a proper heap.
@@ -291,20 +229,11 @@ impl MergeReader {
         Ok(())
     }
 
-    /// Removeds deleted entries and sets the `batch` to the `output_batch`.
+    /// If `filter_deleted` is set to true, removes deleted entries and sets the `batch` to the `output_batch`.
     ///
     /// Ignores the `batch` if it is empty.
-    fn maybe_output_batch(
-        mut batch: Batch,
-        output_batch: &mut Option<Batch>,
-        metrics: &mut Metrics,
-    ) -> Result<()> {
+    fn maybe_output_batch(batch: Batch, output_batch: &mut Option<Batch>) -> Result<()> {
         debug_assert!(output_batch.is_none());
-
-        let num_rows = batch.num_rows();
-        batch.filter_deleted()?;
-        // Update deleted rows metrics.
-        metrics.num_deleted_rows += num_rows - batch.num_rows();
         if batch.is_empty() {
             return Ok(());
         }
@@ -364,12 +293,8 @@ struct Metrics {
     num_fetch_by_rows: usize,
     /// Number of input rows.
     num_input_rows: usize,
-    /// Number of skipped duplicate rows.
-    num_duplicate_rows: usize,
     /// Number of output rows.
     num_output_rows: usize,
-    /// Number of deleted rows.
-    num_deleted_rows: usize,
     /// Cost to fetch batches from sources.
     fetch_cost: Duration,
 }
@@ -605,15 +530,26 @@ mod tests {
                     &[OpType::Put, OpType::Put],
                     &[24, 25],
                 ),
-                new_batch(b"k1", &[7], &[17], &[OpType::Put], &[27]),
-                new_batch(b"k2", &[3], &[13], &[OpType::Put], &[23]),
+                new_batch(
+                    b"k1",
+                    &[7, 8],
+                    &[17, 18],
+                    &[OpType::Put, OpType::Delete],
+                    &[27, 28],
+                ),
+                new_batch(
+                    b"k2",
+                    &[2, 3],
+                    &[12, 13],
+                    &[OpType::Delete, OpType::Put],
+                    &[22, 23],
+                ),
             ],
         )
         .await;
 
         assert_eq!(8, reader.metrics.num_input_rows);
-        assert_eq!(6, reader.metrics.num_output_rows);
-        assert_eq!(2, reader.metrics.num_deleted_rows);
+        assert_eq!(8, reader.metrics.num_output_rows);
     }
 
     #[tokio::test]
@@ -715,17 +651,24 @@ mod tests {
                 ),
                 new_batch(b"k1", &[3], &[10], &[OpType::Put], &[33]),
                 new_batch(b"k1", &[4], &[14], &[OpType::Put], &[24]),
+                new_batch(b"k1", &[4], &[10], &[OpType::Put], &[34]),
+                new_batch(b"k1", &[5], &[15], &[OpType::Delete], &[25]),
+                new_batch(b"k1", &[5], &[10], &[OpType::Put], &[35]),
                 new_batch(b"k2", &[1], &[11], &[OpType::Put], &[21]),
-                new_batch(b"k2", &[3], &[13], &[OpType::Put], &[23]),
+                new_batch(
+                    b"k2",
+                    &[2, 3],
+                    &[12, 13],
+                    &[OpType::Delete, OpType::Put],
+                    &[22, 23],
+                ),
                 new_batch(b"k2", &[10], &[20], &[OpType::Put], &[30]),
             ],
         )
         .await;
 
         assert_eq!(11, reader.metrics.num_input_rows);
-        assert_eq!(7, reader.metrics.num_output_rows);
-        assert_eq!(2, reader.metrics.num_deleted_rows);
-        assert_eq!(2, reader.metrics.num_duplicate_rows);
+        assert_eq!(11, reader.metrics.num_output_rows);
     }
 
     #[tokio::test]
@@ -761,7 +704,29 @@ mod tests {
             .unwrap();
         check_reader_result(
             &mut reader,
-            &[new_batch(b"k2", &[3], &[13], &[OpType::Put], &[23])],
+            &[
+                new_batch(
+                    b"k1",
+                    &[1, 2],
+                    &[11, 12],
+                    &[OpType::Delete, OpType::Delete],
+                    &[21, 22],
+                ),
+                new_batch(
+                    b"k1",
+                    &[4, 5],
+                    &[14, 15],
+                    &[OpType::Delete, OpType::Delete],
+                    &[24, 25],
+                ),
+                new_batch(
+                    b"k2",
+                    &[2, 3],
+                    &[12, 13],
+                    &[OpType::Delete, OpType::Put],
+                    &[22, 23],
+                ),
+            ],
         )
         .await;
     }
@@ -775,7 +740,6 @@ mod tests {
             &[OpType::Put, OpType::Put],
             &[21, 22],
         )]);
-        // This reader will be empty after skipping the timestamp.
         let reader2 = VecBatchReader::new(&[new_batch(b"k1", &[1], &[10], &[OpType::Put], &[33])]);
         let mut reader = MergeReaderBuilder::new()
             .push_batch_reader(Box::new(reader1))
@@ -785,20 +749,17 @@ mod tests {
             .unwrap();
         check_reader_result(
             &mut reader,
-            &[new_batch(
-                b"k1",
-                &[1, 2],
-                &[11, 12],
-                &[OpType::Put, OpType::Put],
-                &[21, 22],
-            )],
+            &[
+                new_batch(b"k1", &[1], &[11], &[OpType::Put], &[21]),
+                new_batch(b"k1", &[1], &[10], &[OpType::Put], &[33]),
+                new_batch(b"k1", &[2], &[12], &[OpType::Put], &[22]),
+            ],
         )
         .await;
     }
 
     #[tokio::test]
     async fn test_merge_top_node_empty() {
-        // This reader will be empty after skipping the timestamp 2.
         let reader1 = VecBatchReader::new(&[new_batch(
             b"k1",
             &[1, 2],
@@ -823,13 +784,9 @@ mod tests {
             &mut reader,
             &[
                 new_batch(b"k1", &[1], &[10], &[OpType::Put], &[21]),
-                new_batch(
-                    b"k1",
-                    &[2, 3],
-                    &[11, 11],
-                    &[OpType::Put, OpType::Put],
-                    &[32, 33],
-                ),
+                new_batch(b"k1", &[2], &[11], &[OpType::Put], &[32]),
+                new_batch(b"k1", &[2], &[10], &[OpType::Put], &[22]),
+                new_batch(b"k1", &[3], &[11], &[OpType::Put], &[33]),
             ],
         )
         .await;
@@ -871,6 +828,7 @@ mod tests {
             &mut reader,
             &[
                 new_batch(b"k1", &[1], &[11], &[OpType::Put], &[31]),
+                new_batch(b"k1", &[1], &[10], &[OpType::Put], &[21]),
                 new_batch(
                     b"k1",
                     &[6, 8],
@@ -896,9 +854,49 @@ mod tests {
             builder.push_batch_reader(Box::new(reader));
         }
         let mut reader = builder.build().await.unwrap();
-        let expect: Vec<_> = (0..8)
-            .map(|ts| new_batch(b"k1", &[ts], &[9], &[OpType::Put], &[100]))
-            .collect();
+        let mut expect = Vec::with_capacity(80);
+        for ts in 0..8 {
+            for i in 0..10 {
+                let batch = new_batch(b"k1", &[ts], &[9 - i], &[OpType::Put], &[100]);
+                expect.push(batch);
+            }
+        }
         check_reader_result(&mut reader, &expect).await;
+    }
+
+    #[tokio::test]
+    async fn test_merge_keep_duplicate() {
+        let reader1 = VecBatchReader::new(&[new_batch(
+            b"k1",
+            &[1, 2],
+            &[10, 10],
+            &[OpType::Put, OpType::Put],
+            &[21, 22],
+        )]);
+        let reader2 = VecBatchReader::new(&[new_batch(
+            b"k1",
+            &[2, 3],
+            &[11, 11],
+            &[OpType::Put, OpType::Put],
+            &[32, 33],
+        )]);
+        let sources = vec![
+            Source::Reader(Box::new(reader1)),
+            Source::Iter(Box::new(reader2)),
+        ];
+        let mut reader = MergeReaderBuilder::from_sources(sources)
+            .build()
+            .await
+            .unwrap();
+        check_reader_result(
+            &mut reader,
+            &[
+                new_batch(b"k1", &[1], &[10], &[OpType::Put], &[21]),
+                new_batch(b"k1", &[2], &[11], &[OpType::Put], &[32]),
+                new_batch(b"k1", &[2], &[10], &[OpType::Put], &[22]),
+                new_batch(b"k1", &[3], &[11], &[OpType::Put], &[33]),
+            ],
+        )
+        .await;
     }
 }

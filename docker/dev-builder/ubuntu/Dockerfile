@@ -1,37 +1,49 @@
 FROM ubuntu:20.04
 
+# The root path under which contains all the dependencies to build this Dockerfile.
+ARG DOCKER_BUILD_ROOT=.
+
 ENV LANG en_US.utf8
 WORKDIR /greptimedb
 
-# Add PPA for Python 3.10.
 RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common && \
-    add-apt-repository ppa:deadsnakes/ppa -y
-
+    DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common
 # Install dependencies.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     libssl-dev \
     tzdata \
-    protobuf-compiler \
     curl \
+    unzip \
     ca-certificates \
     git \
     build-essential \
-    pkg-config \
-    python3.10 \
-    python3.10-dev
+    pkg-config
 
-# Remove Python 3.8 and install pip.
-RUN apt-get -y purge python3.8 && \
-    apt-get -y autoremove && \
-    ln -s /usr/bin/python3.10 /usr/bin/python3 && \
-    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
+ARG TARGETPLATFORM
+RUN echo "target platform: $TARGETPLATFORM"
 
-RUN git config --global --add safe.directory /greptimedb
+# Install protobuf, because the one in the apt is too old (v3.12).
+RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+    curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-aarch_64.zip && \
+    unzip protoc-29.1-linux-aarch_64.zip -d protoc3; \
+elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
+    curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-x86_64.zip && \
+    unzip protoc-29.1-linux-x86_64.zip -d protoc3; \
+fi
+RUN mv protoc3/bin/* /usr/local/bin/
+RUN mv protoc3/include/* /usr/local/include/
 
-# Install Python dependencies.
-COPY ./docker/python/requirements.txt /etc/greptime/requirements.txt
-RUN python3 -m pip install -r /etc/greptime/requirements.txt
+# Silence all `safe.directory` warnings, to avoid the "detect dubious repository" error when building with submodules.
+# Disabling the safe directory check here won't pose extra security issues, because in our usage for this dev build
+# image, we use it solely on our own environment (that github action's VM, or ECS created dynamically by ourselves),
+# and the repositories are pulled from trusted sources (still us, of course). Doing so does not violate the intention
+# of the Git's addition to the "safe.directory" at the first place (see the commit message here:
+# https://github.com/git/git/commit/8959555cee7ec045958f9b6dd62e541affb7e7d9).
+# There's also another solution to this, that we add the desired submodules to the safe directory, instead of using 
+# wildcard here. However, that requires the git's config files and the submodules all owned by the very same user.
+# It's troublesome to do this since the dev build runs in Docker, which is under user "root"; while outside the Docker,
+# it can be a different user that have prepared the submodules.
+RUN git config --global --add safe.directory '*'
 
 # Install Rust.
 SHELL ["/bin/bash", "-c"]
@@ -42,6 +54,11 @@ ENV PATH /root/.cargo/bin/:$PATH
 ARG RUST_TOOLCHAIN
 RUN rustup toolchain install ${RUST_TOOLCHAIN}
 
+# Install cargo-binstall with a specific version to adapt the current rust toolchain.
+# Note: if we use the latest version, we may encounter the following `use of unstable library feature 'io_error_downcast'` error.
+# compile from source take too long, so we use the precompiled binary instead
+COPY $DOCKER_BUILD_ROOT/docker/dev-builder/binstall/pull_binstall.sh /usr/local/bin/pull_binstall.sh
+RUN chmod +x /usr/local/bin/pull_binstall.sh && /usr/local/bin/pull_binstall.sh
+
 # Install nextest.
-RUN cargo install cargo-binstall --locked
 RUN cargo binstall cargo-nextest --no-confirm

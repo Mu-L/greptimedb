@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::parquet::file::metadata::RowGroupMetaData;
 use datafusion::parquet::file::statistics::Statistics as ParquetStats;
 use datafusion::physical_optimizer::pruning::PruningStatistics;
 use datafusion_common::{Column, ScalarValue};
-use datatypes::arrow::array::{ArrayRef, UInt64Array};
+use datatypes::arrow::array::{ArrayRef, BooleanArray, UInt64Array};
 use datatypes::arrow::datatypes::DataType;
 use paste::paste;
 
@@ -91,7 +92,7 @@ macro_rules! impl_min_max_values {
     }};
 }
 
-impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
+impl PruningStatistics for RowGroupPruningStatistics<'_> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         impl_min_max_values!(self, column, min)
     }
@@ -114,5 +115,15 @@ impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
             values.push(Some(bs));
         }
         Some(Arc::new(UInt64Array::from(values)))
+    }
+
+    fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+        // TODO(LFC): Impl it.
+        None
+    }
+
+    fn contained(&self, _column: &Column, _values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
+        // TODO(LFC): Impl it.
+        None
     }
 }

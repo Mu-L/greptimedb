@@ -18,15 +18,15 @@ use common_telemetry::info;
 use mito2::engine::MITO_ENGINE_NAME;
 use object_store::util::join_dir;
 use snafu::ResultExt;
-use store_api::metric_engine_consts::{
-    DATA_REGION_SUBDIR, METADATA_REGION_SUBDIR, PHYSICAL_TABLE_METADATA_KEY,
-};
+use store_api::metric_engine_consts::{DATA_REGION_SUBDIR, METADATA_REGION_SUBDIR};
 use store_api::region_engine::RegionEngine;
 use store_api::region_request::{AffectedRows, RegionOpenRequest, RegionRequest};
 use store_api::storage::RegionId;
 
 use super::MetricEngineInner;
-use crate::error::{Error, LogicalRegionNotFoundSnafu, OpenMitoRegionSnafu, Result};
+use crate::engine::create::region_options_for_metadata_region;
+use crate::engine::options::set_data_region_options;
+use crate::error::{OpenMitoRegionSnafu, Result};
 use crate::metrics::{LOGICAL_REGION_COUNT, PHYSICAL_REGION_COUNT};
 use crate::utils;
 
@@ -45,9 +45,7 @@ impl MetricEngineInner {
         region_id: RegionId,
         request: RegionOpenRequest,
     ) -> Result<AffectedRows> {
-        let is_opening_physical_region = request.options.contains_key(PHYSICAL_TABLE_METADATA_KEY);
-
-        if is_opening_physical_region {
+        if request.is_physical_table() {
             // open physical region and recover states
             self.open_physical_region(region_id, request).await?;
             self.recover_states(region_id).await?;
@@ -71,15 +69,19 @@ impl MetricEngineInner {
         let metadata_region_dir = join_dir(&request.region_dir, METADATA_REGION_SUBDIR);
         let data_region_dir = join_dir(&request.region_dir, DATA_REGION_SUBDIR);
 
+        let metadata_region_options = region_options_for_metadata_region(request.options.clone());
         let open_metadata_region_request = RegionOpenRequest {
             region_dir: metadata_region_dir,
-            options: request.options.clone(),
+            options: metadata_region_options,
             engine: MITO_ENGINE_NAME.to_string(),
             skip_wal_replay: request.skip_wal_replay,
         };
+
+        let mut data_region_options = request.options;
+        set_data_region_options(&mut data_region_options);
         let open_data_region_request = RegionOpenRequest {
             region_dir: data_region_dir,
-            options: request.options.clone(),
+            options: data_region_options,
             engine: MITO_ENGINE_NAME.to_string(),
             skip_wal_replay: request.skip_wal_replay,
         };
@@ -118,7 +120,7 @@ impl MetricEngineInner {
     /// Includes:
     /// - Record physical region's column names
     /// - Record the mapping between logical region id and physical region id
-    async fn recover_states(&self, physical_region_id: RegionId) -> Result<()> {
+    pub(crate) async fn recover_states(&self, physical_region_id: RegionId) -> Result<()> {
         // load logical regions and physical column names
         let logical_regions = self
             .metadata_region
@@ -130,17 +132,26 @@ impl MetricEngineInner {
             .await?;
         let logical_region_num = logical_regions.len();
 
-        let mut state = self.state.write().await;
-        // recover physical column names
-        let physical_column_names = physical_columns
-            .into_iter()
-            .map(|col| col.column_schema.name)
-            .collect();
-        state.add_physical_region(physical_region_id, physical_column_names);
-        // recover logical regions
-        for logical_region_id in logical_regions {
-            state.add_logical_region(physical_region_id, logical_region_id);
+        {
+            let mut state = self.state.write().unwrap();
+            // recover physical column names
+            let physical_column_names = physical_columns
+                .into_iter()
+                .map(|col| col.column_schema.name)
+                .collect();
+            state.add_physical_region(physical_region_id, physical_column_names);
+            // recover logical regions
+            for logical_region_id in &logical_regions {
+                state.add_logical_region(physical_region_id, *logical_region_id);
+            }
         }
+
+        for logical_region_id in logical_regions {
+            self.metadata_region
+                .open_logical_region(logical_region_id)
+                .await;
+        }
+
         LOGICAL_REGION_COUNT.add(logical_region_num as i64);
 
         Ok(())

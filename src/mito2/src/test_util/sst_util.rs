@@ -14,18 +14,24 @@
 
 //! Utilities for testing SSTs.
 
-use api::v1::SemanticType;
+use std::sync::Arc;
+
+use api::v1::{OpType, SemanticType};
 use common_time::Timestamp;
+use datatypes::arrow::array::{BinaryArray, TimestampMillisecondArray, UInt64Array, UInt8Array};
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::ColumnSchema;
 use datatypes::value::ValueRef;
-use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataBuilder};
+use parquet::file::metadata::ParquetMetaData;
+use store_api::metadata::{
+    ColumnMetadata, RegionMetadata, RegionMetadataBuilder, RegionMetadataRef,
+};
 use store_api::storage::RegionId;
 
-use crate::read::{Batch, Source};
-use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
+use crate::read::{Batch, BatchBuilder, Source};
+use crate::row_converter::{DensePrimaryKeyCodec, PrimaryKeyCodec, PrimaryKeyCodecExt, SortField};
 use crate::sst::file::{FileHandle, FileId, FileMeta};
-use crate::test_util::{new_noop_file_purger, VecBatchReader};
+use crate::test_util::{new_batch_builder, new_noop_file_purger, VecBatchReader};
 
 /// Test region id.
 const REGION_ID: RegionId = RegionId::new(0, 0);
@@ -81,7 +87,7 @@ pub fn new_primary_key(tags: &[&str]) -> Vec<u8> {
     let fields = (0..tags.len())
         .map(|_| SortField::new(ConcreteDataType::string_datatype()))
         .collect();
-    let converter = McmpRowCodec::new(fields);
+    let converter = DensePrimaryKeyCodec::with_fields(fields);
     converter
         .encode(tags.iter().map(|tag| ValueRef::String(tag)))
         .unwrap()
@@ -106,7 +112,111 @@ pub fn sst_file_handle(start_ms: i64, end_ms: i64) -> FileHandle {
             ),
             level: 0,
             file_size: 0,
+            available_indexes: Default::default(),
+            index_file_size: 0,
+            num_rows: 0,
+            num_row_groups: 0,
+            sequence: None,
         },
         file_purger,
     )
+}
+
+pub fn new_batch_by_range(tags: &[&str], start: usize, end: usize) -> Batch {
+    assert!(end >= start);
+    let pk = new_primary_key(tags);
+    let timestamps: Vec<_> = (start..end).map(|v| v as i64).collect();
+    let sequences = vec![1000; end - start];
+    let op_types = vec![OpType::Put; end - start];
+    let field: Vec<_> = (start..end).map(|v| v as u64).collect();
+    new_batch_builder(&pk, &timestamps, &sequences, &op_types, 2, &field)
+        .build()
+        .unwrap()
+}
+
+pub fn new_batch_with_binary(tags: &[&str], start: usize, end: usize) -> Batch {
+    assert!(end >= start);
+    let pk = new_primary_key(tags);
+    let timestamps: Vec<_> = (start..end).map(|v| v as i64).collect();
+    let sequences = vec![1000; end - start];
+    let op_types = vec![OpType::Put; end - start];
+
+    let field: Vec<_> = (start..end)
+        .map(|_v| "some data".as_bytes().to_vec())
+        .collect();
+
+    let mut builder = BatchBuilder::new(pk);
+    builder
+        .timestamps_array(Arc::new(TimestampMillisecondArray::from_iter_values(
+            timestamps.iter().copied(),
+        )))
+        .unwrap()
+        .sequences_array(Arc::new(UInt64Array::from_iter_values(
+            sequences.iter().copied(),
+        )))
+        .unwrap()
+        .op_types_array(Arc::new(UInt8Array::from_iter_values(
+            op_types.iter().map(|v| *v as u8),
+        )))
+        .unwrap()
+        .push_field_array(1, Arc::new(BinaryArray::from_iter_values(field)))
+        .unwrap();
+    builder.build().unwrap()
+}
+
+/// ParquetMetaData doesn't implement `PartialEq` trait, check internal fields manually
+pub fn assert_parquet_metadata_eq(a: Arc<ParquetMetaData>, b: Arc<ParquetMetaData>) {
+    macro_rules! assert_metadata {
+            ( $a:expr, $b:expr, $($method:ident,)+ ) => {
+                $(
+                    assert_eq!($a.$method(), $b.$method());
+                )+
+            }
+        }
+
+    assert_metadata!(
+        a.file_metadata(),
+        b.file_metadata(),
+        version,
+        num_rows,
+        created_by,
+        key_value_metadata,
+        schema_descr,
+        column_orders,
+    );
+
+    assert_metadata!(a, b, row_groups, column_index, offset_index,);
+}
+
+/// Creates a new region metadata for testing SSTs with binary datatype.
+///
+/// Schema: tag_0(string), field_0(binary), ts
+pub fn build_test_binary_test_region_metadata() -> RegionMetadataRef {
+    let mut builder = RegionMetadataBuilder::new(RegionId::new(1, 1));
+    builder
+        .push_column_metadata(ColumnMetadata {
+            column_schema: ColumnSchema::new(
+                "tag_0".to_string(),
+                ConcreteDataType::string_datatype(),
+                true,
+            ),
+            semantic_type: SemanticType::Tag,
+            column_id: 0,
+        })
+        .push_column_metadata(ColumnMetadata {
+            column_schema: ColumnSchema::new("field_0", ConcreteDataType::binary_datatype(), true),
+            semantic_type: SemanticType::Field,
+            column_id: 1,
+        })
+        .push_column_metadata(ColumnMetadata {
+            column_schema: ColumnSchema::new(
+                "ts",
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                false,
+            ),
+            semantic_type: SemanticType::Timestamp,
+            column_id: 2,
+        })
+        .primary_key(vec![0]);
+    Arc::new(builder.build().unwrap())
 }

@@ -20,7 +20,7 @@ use common_base::Plugins;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, NUMBERS_TABLE_ID};
 use common_error::ext::BoxedError;
 use common_query::prelude::{create_udf, make_scalar_function, Volatility};
-use common_query::Output;
+use common_query::OutputData;
 use common_recordbatch::{util, RecordBatch};
 use datafusion::datasource::DefaultTableSource;
 use datafusion_expr::logical_plan::builder::LogicalPlanBuilder;
@@ -35,7 +35,6 @@ use table::test_util::MemTable;
 
 use crate::error::{QueryExecutionSnafu, Result};
 use crate::parser::QueryLanguageParser;
-use crate::plan::LogicalPlan;
 use crate::query_engine::options::QueryOptions;
 use crate::query_engine::QueryEngineFactory;
 use crate::tests::exec_selection;
@@ -47,7 +46,7 @@ async fn test_datafusion_query_engine() -> Result<()> {
     let catalog_list = catalog::memory::new_memory_catalog_manager()
         .map_err(BoxedError::new)
         .context(QueryExecutionSnafu)?;
-    let factory = QueryEngineFactory::new(catalog_list, None, None, false);
+    let factory = QueryEngineFactory::new(catalog_list, None, None, None, None, false);
     let engine = factory.query_engine();
 
     let column_schemas = vec![ColumnSchema::new(
@@ -64,23 +63,21 @@ async fn test_datafusion_query_engine() -> Result<()> {
 
     let limit = 10;
     let table_provider = Arc::new(DfTableProviderAdapter::new(table.clone()));
-    let plan = LogicalPlan::DfPlan(
-        LogicalPlanBuilder::scan(
-            "numbers",
-            Arc::new(DefaultTableSource { table_provider }),
-            None,
-        )
-        .unwrap()
-        .limit(0, Some(limit))
-        .unwrap()
-        .build()
-        .unwrap(),
-    );
+    let plan = LogicalPlanBuilder::scan(
+        "numbers",
+        Arc::new(DefaultTableSource { table_provider }),
+        None,
+    )
+    .unwrap()
+    .limit(0, Some(limit))
+    .unwrap()
+    .build()
+    .unwrap();
 
     let output = engine.execute(plan, QueryContext::arc()).await?;
 
-    let recordbatch = match output {
-        Output::Stream(recordbatch) => recordbatch,
+    let recordbatch = match output.data {
+        OutputData::Stream(recordbatch) => recordbatch,
         _ => unreachable!(),
     };
 
@@ -125,23 +122,30 @@ async fn test_query_validate() -> Result<()> {
     // set plugins
     let plugins = Plugins::new();
     plugins.insert(QueryOptions {
-        disallow_cross_schema_query: true,
+        disallow_cross_catalog_query: true,
     });
 
-    let factory = QueryEngineFactory::new_with_plugins(catalog_list, None, None, false, plugins);
+    let factory =
+        QueryEngineFactory::new_with_plugins(catalog_list, None, None, None, None, false, plugins);
     let engine = factory.query_engine();
 
-    let stmt = QueryLanguageParser::parse_sql("select number from public.numbers").unwrap();
+    let stmt =
+        QueryLanguageParser::parse_sql("select number from public.numbers", &QueryContext::arc())
+            .unwrap();
     assert!(engine
         .planner()
-        .plan(stmt, QueryContext::arc())
+        .plan(&stmt, QueryContext::arc())
         .await
         .is_ok());
 
-    let stmt = QueryLanguageParser::parse_sql("select number from wrongschema.numbers").unwrap();
+    let stmt = QueryLanguageParser::parse_sql(
+        "select number from wrongschema.numbers",
+        &QueryContext::arc(),
+    )
+    .unwrap();
     assert!(engine
         .planner()
-        .plan(stmt, QueryContext::arc())
+        .plan(&stmt, QueryContext::arc())
         .await
         .is_err());
     Ok(())
@@ -152,7 +156,7 @@ async fn test_udf() -> Result<()> {
     common_telemetry::init_default_ut_logging();
     let catalog_list = catalog_manager()?;
 
-    let factory = QueryEngineFactory::new(catalog_list, None, None, false);
+    let factory = QueryEngineFactory::new(catalog_list, None, None, None, None, false);
     let engine = factory.query_engine();
 
     let pow = make_scalar_function(pow);

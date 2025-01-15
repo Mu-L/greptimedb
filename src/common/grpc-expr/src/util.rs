@@ -14,24 +14,28 @@
 
 use std::collections::HashSet;
 
+use api::v1::column_data_type_extension::TypeExt;
+use api::v1::column_def::contains_fulltext;
 use api::v1::{
-    AddColumn, AddColumns, Column, ColumnDataTypeExtension, ColumnDef, ColumnSchema,
-    CreateTableExpr, SemanticType,
+    AddColumn, AddColumns, Column, ColumnDataType, ColumnDataTypeExtension, ColumnDef,
+    ColumnOptions, ColumnSchema, CreateTableExpr, JsonTypeExtension, SemanticType,
 };
 use datatypes::schema::Schema;
-use snafu::{ensure, OptionExt};
-use table::engine::TableReference;
+use snafu::{ensure, OptionExt, ResultExt};
 use table::metadata::TableId;
+use table::table_reference::TableReference;
 
 use crate::error::{
-    DuplicatedColumnNameSnafu, DuplicatedTimestampColumnSnafu, MissingTimestampColumnSnafu, Result,
+    self, DuplicatedColumnNameSnafu, DuplicatedTimestampColumnSnafu,
+    InvalidFulltextColumnTypeSnafu, MissingTimestampColumnSnafu, Result,
+    UnknownColumnDataTypeSnafu,
 };
-
 pub struct ColumnExpr<'a> {
     pub column_name: &'a str,
     pub datatype: i32,
     pub semantic_type: i32,
     pub datatype_extension: &'a Option<ColumnDataTypeExtension>,
+    pub options: &'a Option<ColumnOptions>,
 }
 
 impl<'a> ColumnExpr<'a> {
@@ -53,6 +57,7 @@ impl<'a> From<&'a Column> for ColumnExpr<'a> {
             datatype: column.datatype,
             semantic_type: column.semantic_type,
             datatype_extension: &column.datatype_extension,
+            options: &column.options,
         }
     }
 }
@@ -64,8 +69,31 @@ impl<'a> From<&'a ColumnSchema> for ColumnExpr<'a> {
             datatype: schema.datatype,
             semantic_type: schema.semantic_type,
             datatype_extension: &schema.datatype_extension,
+            options: &schema.options,
         }
     }
+}
+
+fn infer_column_datatype(
+    datatype: i32,
+    datatype_extension: &Option<ColumnDataTypeExtension>,
+) -> Result<ColumnDataType> {
+    let column_type =
+        ColumnDataType::try_from(datatype).context(UnknownColumnDataTypeSnafu { datatype })?;
+
+    if matches!(&column_type, ColumnDataType::Binary) {
+        if let Some(ext) = datatype_extension {
+            let type_ext = ext
+                .type_ext
+                .as_ref()
+                .context(error::MissingFieldSnafu { field: "type_ext" })?;
+            if *type_ext == TypeExt::JsonType(JsonTypeExtension::JsonBinary.into()) {
+                return Ok(ColumnDataType::Json);
+            }
+        }
+    }
+
+    Ok(column_type)
 }
 
 pub fn build_create_table_expr(
@@ -99,6 +127,7 @@ pub fn build_create_table_expr(
         datatype,
         semantic_type,
         datatype_extension,
+        options,
     } in column_exprs
     {
         let mut is_nullable = true;
@@ -119,6 +148,16 @@ pub fn build_create_table_expr(
             _ => {}
         }
 
+        let column_type = infer_column_datatype(datatype, datatype_extension)?;
+
+        ensure!(
+            !contains_fulltext(options) || column_type == ColumnDataType::String,
+            InvalidFulltextColumnTypeSnafu {
+                column_name,
+                column_type,
+            }
+        );
+
         let column_def = ColumnDef {
             name: column_name.to_string(),
             data_type: datatype,
@@ -127,6 +166,7 @@ pub fn build_create_table_expr(
             semantic_type,
             comment: String::new(),
             datatype_extension: datatype_extension.clone(),
+            options: options.clone(),
         };
         column_defs.push(column_def);
     }
@@ -152,6 +192,9 @@ pub fn build_create_table_expr(
     Ok(expr)
 }
 
+/// Find columns that are not present in the schema and return them as `AddColumns`
+/// for adding columns automatically.
+/// It always sets `add_if_not_exists` to `true` for now.
 pub fn extract_new_columns(
     schema: &Schema,
     column_exprs: Vec<ColumnExpr>,
@@ -168,10 +211,12 @@ pub fn extract_new_columns(
                 semantic_type: expr.semantic_type,
                 comment: String::new(),
                 datatype_extension: expr.datatype_extension.clone(),
+                options: expr.options.clone(),
             });
             AddColumn {
                 column_def,
                 location: None,
+                add_if_not_exists: true,
             }
         })
         .collect::<Vec<_>>();

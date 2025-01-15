@@ -17,12 +17,13 @@ use std::sync::Arc;
 use api::v1::meta::heartbeat_client::HeartbeatClient;
 use api::v1::meta::{HeartbeatRequest, HeartbeatResponse, RequestHeader, Role};
 use common_grpc::channel_manager::ChannelManager;
-use common_meta::rpc::util;
+use common_meta::util;
 use common_telemetry::info;
 use common_telemetry::tracing_context::TracingContext;
 use snafu::{ensure, OptionExt, ResultExt};
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
 use tonic::Streaming;
 
@@ -127,11 +128,6 @@ impl Client {
         let inner = self.inner.read().await;
         inner.ask_leader().await?;
         inner.heartbeat().await
-    }
-
-    pub async fn is_started(&self) -> bool {
-        let inner = self.inner.read().await;
-        inner.is_started()
     }
 }
 
@@ -254,7 +250,10 @@ impl Inner {
             .get(addr)
             .context(error::CreateChannelSnafu)?;
 
-        Ok(HeartbeatClient::new(channel))
+        Ok(HeartbeatClient::new(channel)
+            .accept_compressed(CompressionEncoding::Zstd)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .send_compressed(CompressionEncoding::Zstd))
     }
 
     #[inline]
@@ -268,24 +267,12 @@ mod test {
     use super::*;
 
     #[tokio::test]
-    async fn test_start_client() {
-        let mut client = Client::new((0, 0), Role::Datanode, ChannelManager::default(), 3);
-        assert!(!client.is_started().await);
-        client
-            .start(&["127.0.0.1:1000", "127.0.0.1:1001"])
-            .await
-            .unwrap();
-        assert!(client.is_started().await);
-    }
-
-    #[tokio::test]
     async fn test_already_start() {
         let mut client = Client::new((0, 0), Role::Datanode, ChannelManager::default(), 3);
         client
             .start(&["127.0.0.1:1000", "127.0.0.1:1001"])
             .await
             .unwrap();
-        assert!(client.is_started().await);
         let res = client.start(&["127.0.0.1:1002"]).await;
         assert!(res.is_err());
         assert!(matches!(

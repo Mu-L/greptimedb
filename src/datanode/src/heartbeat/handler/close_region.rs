@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_error::ext::ErrorExt;
 use common_meta::instruction::{InstructionReply, SimpleReply};
 use common_meta::RegionIdent;
-use common_telemetry::warn;
+use common_telemetry::{tracing, warn};
 use futures_util::future::BoxFuture;
 use store_api::region_request::{RegionCloseRequest, RegionRequest};
 
@@ -23,6 +22,7 @@ use crate::error;
 use crate::heartbeat::handler::HandlerContext;
 
 impl HandlerContext {
+    #[tracing::instrument(skip_all)]
     pub(crate) fn handle_close_region_instruction(
         self,
         region_ident: RegionIdent,
@@ -46,7 +46,7 @@ impl HandlerContext {
                 }
                 Err(err) => InstructionReply::CloseRegion(SimpleReply {
                     result: false,
-                    error: Some(err.output_msg()),
+                    error: Some(format!("{err:?}")),
                 }),
             }
         })

@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use client::{CachedMetaKvBackend, MetaKvBackend};
+pub use client::{CachedKvBackend, CachedKvBackendBuilder, MetaKvBackend};
 
 mod client;
 mod manager;
+mod table_cache;
 
-#[cfg(feature = "testing")]
-pub mod mock;
 pub use manager::KvBackendCatalogManager;
+pub use table_cache::{new_table_cache, TableCache, TableCacheRef};

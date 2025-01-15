@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use ::auth::UserProviderRef;
 use async_trait::async_trait;
+use common_runtime::runtime::RuntimeTrait;
 use common_runtime::Runtime;
-use common_telemetry::logging::error;
 use common_telemetry::{debug, warn};
 use futures::StreamExt;
 use pgwire::tokio::process_socket;
@@ -29,52 +29,57 @@ use super::{MakePostgresServerHandler, MakePostgresServerHandlerBuilder};
 use crate::error::Result;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 use crate::server::{AbortableStream, BaseTcpServer, Server};
-use crate::tls::TlsOption;
+use crate::tls::ReloadableTlsServerConfig;
 
 pub struct PostgresServer {
     base_server: BaseTcpServer,
     make_handler: Arc<MakePostgresServerHandler>,
-    tls: TlsOption,
+    tls_server_config: Arc<ReloadableTlsServerConfig>,
 }
 
 impl PostgresServer {
     /// Creates a new Postgres server with provided query_handler and async runtime
     pub fn new(
         query_handler: ServerSqlQueryHandlerRef,
-        tls: TlsOption,
-        io_runtime: Arc<Runtime>,
+        force_tls: bool,
+        tls_server_config: Arc<ReloadableTlsServerConfig>,
+        io_runtime: Runtime,
         user_provider: Option<UserProviderRef>,
     ) -> PostgresServer {
         let make_handler = Arc::new(
             MakePostgresServerHandlerBuilder::default()
                 .query_handler(query_handler.clone())
                 .user_provider(user_provider.clone())
-                .force_tls(tls.should_force_tls())
+                .force_tls(force_tls)
                 .build()
                 .unwrap(),
         );
         PostgresServer {
             base_server: BaseTcpServer::create_server("Postgres", io_runtime),
             make_handler,
-            tls,
+            tls_server_config,
         }
     }
 
     fn accept(
         &self,
-        io_runtime: Arc<Runtime>,
+        io_runtime: Runtime,
         accepting_stream: AbortableStream,
-        tls_acceptor: Option<Arc<TlsAcceptor>>,
     ) -> impl Future<Output = ()> {
         let handler_maker = self.make_handler.clone();
+        let tls_server_config = self.tls_server_config.clone();
         accepting_stream.for_each(move |tcp_stream| {
             let io_runtime = io_runtime.clone();
-            let tls_acceptor = tls_acceptor.clone();
+
+            let tls_acceptor = tls_server_config
+                .get_server_config()
+                .map(|server_config| Arc::new(TlsAcceptor::from(server_config)));
+
             let handler_maker = handler_maker.clone();
 
             async move {
                 match tcp_stream {
-                    Err(error) => error!("Broken pipe: {}", error), // IoError doesn't impl ErrorExt.
+                    Err(error) => debug!("Broken pipe: {}", error), // IoError doesn't impl ErrorExt.
                     Ok(io_stream) => {
                         let addr = match io_stream.peer_addr() {
                             Ok(addr) => {
@@ -82,7 +87,7 @@ impl PostgresServer {
                                 Some(addr)
                             }
                             Err(e) => {
-                                warn!("Failed to get PostgreSQL client addr, err: {}", e);
+                                warn!(e; "Failed to get PostgreSQL client addr");
                                 None
                             }
                         };
@@ -90,14 +95,8 @@ impl PostgresServer {
                         let _handle = io_runtime.spawn(async move {
                             crate::metrics::METRIC_POSTGRES_CONNECTIONS.inc();
                             let pg_handler = Arc::new(handler_maker.make(addr));
-                            let r = process_socket(
-                                io_stream,
-                                tls_acceptor.clone(),
-                                pg_handler.clone(),
-                                pg_handler.clone(),
-                                pg_handler,
-                            )
-                            .await;
+                            let r =
+                                process_socket(io_stream, tls_acceptor.clone(), pg_handler).await;
                             crate::metrics::METRIC_POSTGRES_CONNECTIONS.dec();
                             r
                         });
@@ -119,14 +118,8 @@ impl Server for PostgresServer {
     async fn start(&self, listening: SocketAddr) -> Result<SocketAddr> {
         let (stream, addr) = self.base_server.bind(listening).await?;
 
-        debug!("Starting PostgreSQL with TLS option: {:?}", self.tls);
-        let tls_acceptor = self
-            .tls
-            .setup()?
-            .map(|server_conf| Arc::new(TlsAcceptor::from(Arc::new(server_conf))));
-
         let io_runtime = self.base_server.io_runtime();
-        let join_handle = common_runtime::spawn_read(self.accept(io_runtime, stream, tls_acceptor));
+        let join_handle = common_runtime::spawn_global(self.accept(io_runtime, stream));
 
         self.base_server.start_with(join_handle).await?;
         Ok(addr)

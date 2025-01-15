@@ -16,22 +16,26 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
+use api::region::RegionResponse;
 use async_trait::async_trait;
 use common_error::ext::BoxedError;
 use common_function::function::FunctionRef;
 use common_function::scalars::aggregate::AggregateFunctionMetaRef;
 use common_query::prelude::ScalarUdf;
 use common_query::Output;
-use common_recordbatch::SendableRecordBatchStream;
+use common_runtime::runtime::{BuilderBuild, RuntimeTrait};
 use common_runtime::Runtime;
+use datafusion_expr::LogicalPlan;
 use query::dataframe::DataFrame;
-use query::plan::LogicalPlan;
 use query::planner::LogicalPlanner;
-use query::query_engine::DescribeResult;
-use query::QueryEngine;
+use query::query_engine::{DescribeResult, QueryEngineState};
+use query::{QueryEngine, QueryEngineContext};
 use session::context::QueryContextRef;
 use store_api::metadata::RegionMetadataRef;
-use store_api::region_engine::{RegionEngine, RegionRole, SetReadonlyResponse};
+use store_api::region_engine::{
+    RegionEngine, RegionRole, RegionScannerRef, RegionStatistic, SetRegionRoleStateResponse,
+    SettableRegionRoleState,
+};
 use store_api::region_request::{AffectedRows, RegionRequest};
 use store_api::storage::{RegionId, ScanRequest};
 use table::TableRef;
@@ -57,7 +61,11 @@ impl QueryEngine for MockQueryEngine {
         "MockQueryEngine"
     }
 
-    async fn describe(&self, _plan: LogicalPlan) -> query::error::Result<DescribeResult> {
+    async fn describe(
+        &self,
+        _plan: LogicalPlan,
+        _query_ctx: QueryContextRef,
+    ) -> query::error::Result<DescribeResult> {
         unimplemented!()
     }
 
@@ -78,13 +86,20 @@ impl QueryEngine for MockQueryEngine {
     fn read_table(&self, _table: TableRef) -> query::error::Result<DataFrame> {
         unimplemented!()
     }
+
+    fn engine_context(&self, _query_ctx: QueryContextRef) -> QueryEngineContext {
+        unimplemented!()
+    }
+    fn engine_state(&self) -> &QueryEngineState {
+        unimplemented!()
+    }
 }
 
 /// Create a region server without any engine
 pub fn mock_region_server() -> RegionServer {
     RegionServer::new(
         Arc::new(MockQueryEngine),
-        Arc::new(Runtime::builder().build().unwrap()),
+        Runtime::builder().build().unwrap(),
         Box::new(NoopRegionServerEventListener),
     )
 }
@@ -92,15 +107,20 @@ pub fn mock_region_server() -> RegionServer {
 pub type MockRequestHandler =
     Box<dyn Fn(RegionId, RegionRequest) -> Result<AffectedRows, Error> + Send + Sync>;
 
+pub type MockSetReadonlyGracefullyHandler =
+    Box<dyn Fn(RegionId) -> Result<SetRegionRoleStateResponse, Error> + Send + Sync>;
+
 pub struct MockRegionEngine {
     sender: Sender<(RegionId, RegionRequest)>,
     pub(crate) handle_request_delay: Option<Duration>,
     pub(crate) handle_request_mock_fn: Option<MockRequestHandler>,
+    pub(crate) handle_set_readonly_gracefully_mock_fn: Option<MockSetReadonlyGracefullyHandler>,
     pub(crate) mock_role: Option<Option<RegionRole>>,
+    engine: String,
 }
 
 impl MockRegionEngine {
-    pub fn new() -> (Arc<Self>, Receiver<(RegionId, RegionRequest)>) {
+    pub fn new(engine: &str) -> (Arc<Self>, Receiver<(RegionId, RegionRequest)>) {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
 
         (
@@ -108,13 +128,16 @@ impl MockRegionEngine {
                 handle_request_delay: None,
                 sender: tx,
                 handle_request_mock_fn: None,
+                handle_set_readonly_gracefully_mock_fn: None,
                 mock_role: None,
+                engine: engine.to_string(),
             }),
             rx,
         )
     }
 
     pub fn with_mock_fn(
+        engine: &str,
         mock_fn: MockRequestHandler,
     ) -> (Arc<Self>, Receiver<(RegionId, RegionRequest)>) {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
@@ -124,13 +147,18 @@ impl MockRegionEngine {
                 handle_request_delay: None,
                 sender: tx,
                 handle_request_mock_fn: Some(mock_fn),
+                handle_set_readonly_gracefully_mock_fn: None,
                 mock_role: None,
+                engine: engine.to_string(),
             }),
             rx,
         )
     }
 
-    pub fn with_custom_apply_fn<F>(apply: F) -> (Arc<Self>, Receiver<(RegionId, RegionRequest)>)
+    pub fn with_custom_apply_fn<F>(
+        engine: &str,
+        apply: F,
+    ) -> (Arc<Self>, Receiver<(RegionId, RegionRequest)>)
     where
         F: FnOnce(&mut MockRegionEngine),
     {
@@ -139,7 +167,9 @@ impl MockRegionEngine {
             handle_request_delay: None,
             sender: tx,
             handle_request_mock_fn: None,
+            handle_set_readonly_gracefully_mock_fn: None,
             mock_role: None,
+            engine: engine.to_string(),
         };
 
         apply(&mut region_engine);
@@ -151,30 +181,32 @@ impl MockRegionEngine {
 #[async_trait::async_trait]
 impl RegionEngine for MockRegionEngine {
     fn name(&self) -> &str {
-        "mock"
+        &self.engine
     }
 
     async fn handle_request(
         &self,
         region_id: RegionId,
         request: RegionRequest,
-    ) -> Result<AffectedRows, BoxedError> {
+    ) -> Result<RegionResponse, BoxedError> {
         if let Some(delay) = self.handle_request_delay {
             tokio::time::sleep(delay).await;
         }
         if let Some(mock_fn) = &self.handle_request_mock_fn {
-            return mock_fn(region_id, request).map_err(BoxedError::new);
+            return mock_fn(region_id, request)
+                .map_err(BoxedError::new)
+                .map(RegionResponse::new);
         };
 
         let _ = self.sender.send((region_id, request)).await;
-        Ok(0)
+        Ok(RegionResponse::new(0))
     }
 
     async fn handle_query(
         &self,
         _region_id: RegionId,
         _request: ScanRequest,
-    ) -> Result<SendableRecordBatchStream, BoxedError> {
+    ) -> Result<RegionScannerRef, BoxedError> {
         unimplemented!()
     }
 
@@ -182,7 +214,7 @@ impl RegionEngine for MockRegionEngine {
         unimplemented!()
     }
 
-    async fn region_disk_usage(&self, _region_id: RegionId) -> Option<i64> {
+    fn region_statistic(&self, _region_id: RegionId) -> Option<RegionStatistic> {
         unimplemented!()
     }
 
@@ -190,15 +222,20 @@ impl RegionEngine for MockRegionEngine {
         Ok(())
     }
 
-    fn set_writable(&self, _region_id: RegionId, _writable: bool) -> Result<(), BoxedError> {
+    fn set_region_role(&self, _region_id: RegionId, _role: RegionRole) -> Result<(), BoxedError> {
         Ok(())
     }
 
-    async fn set_readonly_gracefully(
+    async fn set_region_role_state_gracefully(
         &self,
-        _region_id: RegionId,
-    ) -> Result<SetReadonlyResponse, BoxedError> {
-        unimplemented!()
+        region_id: RegionId,
+        _region_role_state: SettableRegionRoleState,
+    ) -> Result<SetRegionRoleStateResponse, BoxedError> {
+        if let Some(mock_fn) = &self.handle_set_readonly_gracefully_mock_fn {
+            return mock_fn(region_id).map_err(BoxedError::new);
+        };
+
+        unreachable!()
     }
 
     fn role(&self, _region_id: RegionId) -> Option<RegionRole> {
@@ -206,5 +243,9 @@ impl RegionEngine for MockRegionEngine {
             return role;
         }
         Some(RegionRole::Leader)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

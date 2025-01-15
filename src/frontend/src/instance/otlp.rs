@@ -14,84 +14,136 @@
 
 use async_trait::async_trait;
 use auth::{PermissionChecker, PermissionCheckerRef, PermissionReq};
+use client::Output;
 use common_error::ext::BoxedError;
-use opentelemetry_proto::tonic::collector::metrics::v1::{
-    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
-};
-use opentelemetry_proto::tonic::collector::trace::v1::{
-    ExportTraceServiceRequest, ExportTraceServiceResponse,
-};
-use servers::error::{self, AuthSnafu, Result as ServerResult};
+use common_telemetry::tracing;
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use pipeline::PipelineWay;
+use servers::error::{self, AuthSnafu, InFlightWriteBytesExceededSnafu, Result as ServerResult};
+use servers::interceptor::{OpenTelemetryProtocolInterceptor, OpenTelemetryProtocolInterceptorRef};
 use servers::otlp;
-use servers::otlp::plugin::TraceParserRef;
 use servers::query_handler::OpenTelemetryProtocolHandler;
 use session::context::QueryContextRef;
 use snafu::ResultExt;
 
 use crate::instance::Instance;
-use crate::metrics::{OTLP_METRICS_ROWS, OTLP_TRACES_ROWS};
+use crate::metrics::{OTLP_LOGS_ROWS, OTLP_METRICS_ROWS, OTLP_TRACES_ROWS};
 
 #[async_trait]
 impl OpenTelemetryProtocolHandler for Instance {
+    #[tracing::instrument(skip_all)]
     async fn metrics(
         &self,
         request: ExportMetricsServiceRequest,
         ctx: QueryContextRef,
-    ) -> ServerResult<ExportMetricsServiceResponse> {
+    ) -> ServerResult<Output> {
         self.plugins
             .get::<PermissionCheckerRef>()
             .as_ref()
             .check_permission(ctx.current_user(), PermissionReq::Otlp)
             .context(AuthSnafu)?;
-        let (requests, rows) = otlp::metrics::to_grpc_insert_requests(request)?;
-        let _ = self
-            .handle_row_inserts(requests, ctx)
-            .await
-            .map_err(BoxedError::new)
-            .context(error::ExecuteGrpcQuerySnafu)?;
 
+        let interceptor_ref = self
+            .plugins
+            .get::<OpenTelemetryProtocolInterceptorRef<servers::error::Error>>();
+        interceptor_ref.pre_execute(ctx.clone())?;
+
+        let (requests, rows) = otlp::metrics::to_grpc_insert_requests(request)?;
         OTLP_METRICS_ROWS.inc_by(rows as u64);
 
-        let resp = ExportMetricsServiceResponse {
-            // TODO(sunng87): add support for partial_success in future patch
-            partial_success: None,
+        let _guard = if let Some(limiter) = &self.limiter {
+            let result = limiter.limit_row_inserts(&requests);
+            if result.is_none() {
+                return InFlightWriteBytesExceededSnafu.fail();
+            }
+            result
+        } else {
+            None
         };
-        Ok(resp)
+
+        self.handle_row_inserts(requests, ctx)
+            .await
+            .map_err(BoxedError::new)
+            .context(error::ExecuteGrpcQuerySnafu)
     }
 
+    #[tracing::instrument(skip_all)]
     async fn traces(
         &self,
         request: ExportTraceServiceRequest,
+        table_name: String,
         ctx: QueryContextRef,
-    ) -> ServerResult<ExportTraceServiceResponse> {
+    ) -> ServerResult<Output> {
         self.plugins
             .get::<PermissionCheckerRef>()
             .as_ref()
             .check_permission(ctx.current_user(), PermissionReq::Otlp)
             .context(AuthSnafu)?;
 
-        let (table_name, spans) = match self.plugins.get::<TraceParserRef>() {
-            Some(parser) => (parser.table_name(), parser.parse(request)),
-            None => (
-                otlp::trace::TRACE_TABLE_NAME.to_string(),
-                otlp::trace::parse(request),
-            ),
-        };
+        let interceptor_ref = self
+            .plugins
+            .get::<OpenTelemetryProtocolInterceptorRef<servers::error::Error>>();
+        interceptor_ref.pre_execute(ctx.clone())?;
+
+        let spans = otlp::trace::parse(request);
 
         let (requests, rows) = otlp::trace::to_grpc_insert_requests(table_name, spans)?;
 
-        let _ = self
-            .handle_row_inserts(requests, ctx)
-            .await
-            .map_err(BoxedError::new)
-            .context(error::ExecuteGrpcQuerySnafu)?;
-
         OTLP_TRACES_ROWS.inc_by(rows as u64);
 
-        let resp = ExportTraceServiceResponse {
-            // TODO(fys): add support for partial_success in future patch
-            partial_success: None,
+        let _guard = if let Some(limiter) = &self.limiter {
+            let result = limiter.limit_row_inserts(&requests);
+            if result.is_none() {
+                return InFlightWriteBytesExceededSnafu.fail();
+            }
+            result
+        } else {
+            None
         };
-        Ok(resp)
+
+        self.handle_log_inserts(requests, ctx)
+            .await
+            .map_err(BoxedError::new)
+            .context(error::ExecuteGrpcQuerySnafu)
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn logs(
+        &self,
+        request: ExportLogsServiceRequest,
+        pipeline: PipelineWay,
+        table_name: String,
+        ctx: QueryContextRef,
+    ) -> ServerResult<Output> {
+        self.plugins
+            .get::<PermissionCheckerRef>()
+            .as_ref()
+            .check_permission(ctx.current_user(), PermissionReq::Otlp)
+            .context(AuthSnafu)?;
+
+        let interceptor_ref = self
+            .plugins
+            .get::<OpenTelemetryProtocolInterceptorRef<servers::error::Error>>();
+        interceptor_ref.pre_execute(ctx.clone())?;
+
+        let (requests, rows) = otlp::logs::to_grpc_insert_requests(request, pipeline, table_name)?;
+
+        let _guard = if let Some(limiter) = &self.limiter {
+            let result = limiter.limit_row_inserts(&requests);
+            if result.is_none() {
+                return InFlightWriteBytesExceededSnafu.fail();
+            }
+            result
+        } else {
+            None
+        };
+
+        self.handle_log_inserts(requests, ctx)
+            .await
+            .inspect(|_| OTLP_LOGS_ROWS.inc_by(rows as u64))
+            .map_err(BoxedError::new)
+            .context(error::ExecuteGrpcQuerySnafu)
     }
 }

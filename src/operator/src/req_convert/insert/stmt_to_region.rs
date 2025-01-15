@@ -13,25 +13,29 @@
 // limitations under the License.
 
 use api::helper::{value_to_grpc_value, ColumnDataTypeWrapper};
+use api::v1::column_def::options_from_column_schema;
 use api::v1::region::InsertRequests as RegionInsertRequests;
 use api::v1::{ColumnSchema as GrpcColumnSchema, Row, Rows, Value as GrpcValue};
 use catalog::CatalogManager;
+use common_time::Timezone;
 use datatypes::schema::{ColumnSchema, SchemaRef};
 use partition::manager::PartitionRuleManager;
-use session::context::QueryContext;
+use session::context::{QueryContext, QueryContextRef};
 use snafu::{ensure, OptionExt, ResultExt};
 use sql::statements;
 use sql::statements::insert::Insert;
 use sqlparser::ast::{ObjectName, Value as SqlValue};
+use table::metadata::TableInfoRef;
 use table::TableRef;
 
-use super::semantic_type;
 use crate::error::{
     CatalogSnafu, ColumnDataTypeSnafu, ColumnDefaultValueSnafu, ColumnNoneDefaultValueSnafu,
     ColumnNotFoundSnafu, InvalidSqlSnafu, MissingInsertBodySnafu, ParseSqlSnafu, Result,
-    TableNotFoundSnafu,
+    SchemaReadOnlySnafu, TableNotFoundSnafu,
 };
+use crate::insert::InstantAndNormalInsertRequests;
 use crate::req_convert::common::partitioner::Partitioner;
+use crate::req_convert::insert::semantic_type;
 
 const DEFAULT_PLACEHOLDER_VALUE: &str = "default";
 
@@ -54,11 +58,20 @@ impl<'a> StatementToRegion<'a> {
         }
     }
 
-    pub async fn convert(&self, stmt: &Insert) -> Result<RegionInsertRequests> {
+    pub async fn convert(
+        &self,
+        stmt: &Insert,
+        query_ctx: &QueryContextRef,
+    ) -> Result<(InstantAndNormalInsertRequests, TableInfoRef)> {
         let (catalog, schema, table_name) = self.get_full_name(stmt.table_name())?;
         let table = self.get_table(&catalog, &schema, &table_name).await?;
         let table_schema = table.schema();
         let table_info = table.table_info();
+
+        ensure!(
+            !common_catalog::consts::is_readonly_schema(&schema),
+            SchemaReadOnlySnafu { name: schema }
+        );
 
         let column_names = column_names(stmt, &table_schema);
         let column_count = column_names.len();
@@ -106,11 +119,16 @@ impl<'a> StatementToRegion<'a> {
                 datatype: datatype.into(),
                 semantic_type: semantic_type.into(),
                 datatype_extension,
+                options: options_from_column_schema(column_schema),
             };
             schema.push(grpc_column_schema);
 
             for (sql_row, grpc_row) in sql_rows.iter().zip(rows.iter_mut()) {
-                let value = sql_value_to_grpc_value(column_schema, &sql_row[i])?;
+                let value = sql_value_to_grpc_value(
+                    column_schema,
+                    &sql_row[i],
+                    Some(&query_ctx.timezone()),
+                )?;
                 grpc_row.values.push(value);
             }
         }
@@ -118,12 +136,29 @@ impl<'a> StatementToRegion<'a> {
         let requests = Partitioner::new(self.partition_manager)
             .partition_insert_requests(table_info.table_id(), Rows { schema, rows })
             .await?;
-        Ok(RegionInsertRequests { requests })
+        let requests = RegionInsertRequests { requests };
+        if table_info.is_ttl_instant_table() {
+            Ok((
+                InstantAndNormalInsertRequests {
+                    normal_requests: Default::default(),
+                    instant_requests: requests,
+                },
+                table_info,
+            ))
+        } else {
+            Ok((
+                InstantAndNormalInsertRequests {
+                    normal_requests: requests,
+                    instant_requests: Default::default(),
+                },
+                table_info,
+            ))
+        }
     }
 
     async fn get_table(&self, catalog: &str, schema: &str, table: &str) -> Result<TableRef> {
         self.catalog_manager
-            .table(catalog, schema, table)
+            .table(catalog, schema, table, None)
             .await
             .context(CatalogSnafu)?
             .with_context(|| TableNotFoundSnafu {
@@ -135,7 +170,7 @@ impl<'a> StatementToRegion<'a> {
         match &obj_name.0[..] {
             [table] => Ok((
                 self.ctx.current_catalog().to_owned(),
-                self.ctx.current_schema().to_owned(),
+                self.ctx.current_schema(),
                 table.value.clone(),
             )),
             [schema, table] => Ok((
@@ -169,7 +204,11 @@ fn column_names<'a>(stmt: &'a Insert, table_schema: &'a SchemaRef) -> Vec<&'a St
     }
 }
 
-fn sql_value_to_grpc_value(column_schema: &ColumnSchema, sql_val: &SqlValue) -> Result<GrpcValue> {
+fn sql_value_to_grpc_value(
+    column_schema: &ColumnSchema,
+    sql_val: &SqlValue,
+    timezone: Option<&Timezone>,
+) -> Result<GrpcValue> {
     let column = &column_schema.name;
     let value = if replace_default(sql_val) {
         let default_value = column_schema
@@ -182,7 +221,7 @@ fn sql_value_to_grpc_value(column_schema: &ColumnSchema, sql_val: &SqlValue) -> 
             column: column.clone(),
         })?
     } else {
-        statements::sql_value_to_value(column, &column_schema.data_type, sql_val)
+        statements::sql_value_to_value(column, &column_schema.data_type, sql_val, timezone, None)
             .context(ParseSqlSnafu)?
     };
 

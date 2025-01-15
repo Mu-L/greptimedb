@@ -18,19 +18,21 @@ use api::v1::meta::{
     Partition as PbPartition, Peer as PbPeer, Region as PbRegion, Table as PbTable,
     TableRoute as PbTableRoute,
 };
+use common_time::util::current_time_millis;
 use derive_builder::Builder;
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use snafu::OptionExt;
 use store_api::storage::{RegionId, RegionNumber};
+use strum::AsRefStr;
+use table::table_name::TableName;
 
 use crate::error::{self, Result};
 use crate::key::RegionDistribution;
 use crate::peer::Peer;
-use crate::table_name::TableName;
 use crate::DatanodeId;
 
-pub fn region_distribution(region_routes: &[RegionRoute]) -> Result<RegionDistribution> {
+pub fn region_distribution(region_routes: &[RegionRoute]) -> RegionDistribution {
     let mut regions_id_map = RegionDistribution::new();
     for route in region_routes.iter() {
         if let Some(peer) = route.leader_peer.as_ref() {
@@ -42,7 +44,7 @@ pub fn region_distribution(region_routes: &[RegionRoute]) -> Result<RegionDistri
         // id asc
         regions.sort()
     }
-    Ok(regions_id_map)
+    regions_id_map
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -87,47 +89,15 @@ pub fn convert_to_region_leader_map(region_routes: &[RegionRoute]) -> HashMap<Re
         .collect::<HashMap<_, _>>()
 }
 
-/// Returns the HashMap<[RegionNumber], HashSet<DatanodeId>>
-pub fn convert_to_region_peer_map(
-    region_routes: &[RegionRoute],
-) -> HashMap<RegionNumber, HashSet<u64>> {
-    region_routes
-        .iter()
-        .map(|x| {
-            let set = x
-                .follower_peers
-                .iter()
-                .map(|p| p.id)
-                .chain(x.leader_peer.as_ref().map(|p| p.id))
-                .collect::<HashSet<_>>();
-
-            (x.region.id.region_number(), set)
-        })
-        .collect::<HashMap<_, _>>()
-}
-
-/// Returns the HashMap<[RegionNumber], [RegionStatus]>;
-pub fn convert_to_region_leader_status_map(
-    region_routes: &[RegionRoute],
-) -> HashMap<RegionNumber, RegionStatus> {
-    region_routes
-        .iter()
-        .filter_map(|x| {
-            x.leader_status
-                .as_ref()
-                .map(|status| (x.region.id.region_number(), *status))
-        })
-        .collect::<HashMap<_, _>>()
-}
-
 pub fn find_region_leader(
     region_routes: &[RegionRoute],
     region_number: RegionNumber,
-) -> Option<&Peer> {
+) -> Option<Peer> {
     region_routes
         .iter()
         .find(|x| x.region.id.region_number() == region_number)
         .and_then(|r| r.leader_peer.as_ref())
+        .cloned()
 }
 
 pub fn find_leader_regions(region_routes: &[RegionRoute], datanode: &Peer) -> Vec<RegionNumber> {
@@ -142,19 +112,6 @@ pub fn find_leader_regions(region_routes: &[RegionRoute], datanode: &Peer) -> Ve
             None
         })
         .collect()
-}
-
-pub fn extract_all_peers(region_routes: &[RegionRoute]) -> Vec<Peer> {
-    let mut peers = region_routes
-        .iter()
-        .flat_map(|x| x.leader_peer.iter().chain(x.follower_peers.iter()))
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    peers.sort_by_key(|x| x.id);
-
-    peers
 }
 
 impl TableRoute {
@@ -202,7 +159,8 @@ impl TableRoute {
                 region,
                 leader_peer,
                 follower_peers,
-                leader_status: None,
+                leader_state: None,
+                leader_down_since: None,
             });
         }
 
@@ -255,52 +213,93 @@ pub struct RegionRoute {
     pub follower_peers: Vec<Peer>,
     /// `None` by default.
     #[builder(setter(into, strip_option), default)]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub leader_status: Option<RegionStatus>,
+    #[serde(
+        default,
+        alias = "leader_status",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub leader_state: Option<LeaderState>,
+    /// The start time when the leader is in `Downgraded` state.
+    #[serde(default)]
+    #[builder(default = "self.default_leader_down_since()")]
+    pub leader_down_since: Option<i64>,
 }
 
-/// The Status of the [Region].
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
-pub enum RegionStatus {
-    /// The following cases in which the [Region] will be downgraded.
+impl RegionRouteBuilder {
+    fn default_leader_down_since(&self) -> Option<i64> {
+        match self.leader_state {
+            Some(Some(LeaderState::Downgrading)) => Some(current_time_millis()),
+            _ => None,
+        }
+    }
+}
+
+/// The State of the [`Region`] Leader.
+/// TODO(dennis): It's better to add more fine-grained statuses such as `PENDING` etc.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, AsRefStr)]
+#[strum(serialize_all = "UPPERCASE")]
+pub enum LeaderState {
+    /// The following cases in which the [`Region`] will be downgraded.
     ///
-    /// - The [Region] is unavailable(e.g., Crashed, Network disconnected).
-    /// - The [Region] was planned to migrate to another [Peer].
-    Downgraded,
+    /// - The [`Region`] may be unavailable (e.g., Crashed, Network disconnected).
+    /// - The [`Region`] was planned to migrate to another [`Peer`].
+    #[serde(alias = "Downgraded")]
+    Downgrading,
 }
 
 impl RegionRoute {
-    /// Returns true if the Leader [Region] is downgraded.
+    /// Returns true if the Leader [`Region`] is downgraded.
     ///
-    /// The following cases in which the [Region] will be downgraded.
+    /// The following cases in which the [`Region`] will be downgraded.
     ///
-    /// - The [Region] is unavailable(e.g., Crashed, Network disconnected).
-    /// - The [Region] was planned to migrate to another [Peer].
+    /// - The [`Region`] is unavailable(e.g., Crashed, Network disconnected).
+    /// - The [`Region`] was planned to migrate to another [`Peer`].
     ///
-    pub fn is_leader_downgraded(&self) -> bool {
-        matches!(self.leader_status, Some(RegionStatus::Downgraded))
+    pub fn is_leader_downgrading(&self) -> bool {
+        matches!(self.leader_state, Some(LeaderState::Downgrading))
     }
 
-    /// Marks the Leader [Region] as downgraded.
+    /// Marks the Leader [`Region`] as [`RegionState::Downgrading`].
     ///
-    /// We should downgrade a [Region] before deactivating it:
+    /// We should downgrade a [`Region`] before deactivating it:
     ///
-    /// - During the [Region] Failover Procedure.
-    /// - Migrating a [Region].
+    /// - During the [`Region`] Failover Procedure.
+    /// - Migrating a [`Region`].
     ///
-    /// **Notes:** Meta Server will stop renewing the lease for the downgraded [Region].
+    /// **Notes:** Meta Server will renewing a special lease(`Downgrading`) for the downgrading [`Region`].
+    ///
+    /// A downgrading region will reject any write requests, and only allow memetable to be flushed to object storage
     ///
     pub fn downgrade_leader(&mut self) {
-        self.leader_status = Some(RegionStatus::Downgraded)
+        self.leader_down_since = Some(current_time_millis());
+        self.leader_state = Some(LeaderState::Downgrading)
     }
 
-    /// Sets the leader status.
+    /// Returns how long since the leader is in `Downgraded` state.
+    pub fn leader_down_millis(&self) -> Option<i64> {
+        self.leader_down_since
+            .map(|start| current_time_millis() - start)
+    }
+
+    /// Sets the leader state.
     ///
     /// Returns true if updated.
-    pub fn set_leader_status(&mut self, status: Option<RegionStatus>) -> bool {
-        let updated = self.leader_status != status;
+    pub fn set_leader_state(&mut self, state: Option<LeaderState>) -> bool {
+        let updated = self.leader_state != state;
 
-        self.leader_status = status;
+        match (state, updated) {
+            (Some(LeaderState::Downgrading), true) => {
+                self.leader_down_since = Some(current_time_millis());
+            }
+            (Some(LeaderState::Downgrading), false) => {
+                // Do nothing if leader is still in `Downgraded` state.
+            }
+            _ => {
+                self.leader_down_since = None;
+            }
+        }
+
+        self.leader_state = state;
         updated
     }
 }
@@ -439,14 +438,15 @@ mod tests {
             },
             leader_peer: Some(Peer::new(1, "a1")),
             follower_peers: vec![Peer::new(2, "a2"), Peer::new(3, "a3")],
-            leader_status: None,
+            leader_state: None,
+            leader_down_since: None,
         };
 
-        assert!(!region_route.is_leader_downgraded());
+        assert!(!region_route.is_leader_downgrading());
 
         region_route.downgrade_leader();
 
-        assert!(region_route.is_leader_downgraded());
+        assert!(region_route.is_leader_downgrading());
     }
 
     #[test]
@@ -460,13 +460,81 @@ mod tests {
             },
             leader_peer: Some(Peer::new(1, "a1")),
             follower_peers: vec![Peer::new(2, "a2"), Peer::new(3, "a3")],
-            leader_status: None,
+            leader_state: None,
+            leader_down_since: None,
         };
 
         let input = r#"{"region":{"id":2,"name":"r2","partition":null,"attrs":{}},"leader_peer":{"id":1,"addr":"a1"},"follower_peers":[{"id":2,"addr":"a2"},{"id":3,"addr":"a3"}]}"#;
 
         let decoded: RegionRoute = serde_json::from_str(input).unwrap();
 
+        assert_eq!(decoded, region_route);
+    }
+
+    #[test]
+    fn test_region_route_compatibility() {
+        let region_route = RegionRoute {
+            region: Region {
+                id: 2.into(),
+                name: "r2".to_string(),
+                partition: None,
+                attrs: BTreeMap::new(),
+            },
+            leader_peer: Some(Peer::new(1, "a1")),
+            follower_peers: vec![Peer::new(2, "a2"), Peer::new(3, "a3")],
+            leader_state: Some(LeaderState::Downgrading),
+            leader_down_since: None,
+        };
+        let input = r#"{"region":{"id":2,"name":"r2","partition":null,"attrs":{}},"leader_peer":{"id":1,"addr":"a1"},"follower_peers":[{"id":2,"addr":"a2"},{"id":3,"addr":"a3"}],"leader_state":"Downgraded","leader_down_since":null}"#;
+        let decoded: RegionRoute = serde_json::from_str(input).unwrap();
+        assert_eq!(decoded, region_route);
+
+        let region_route = RegionRoute {
+            region: Region {
+                id: 2.into(),
+                name: "r2".to_string(),
+                partition: None,
+                attrs: BTreeMap::new(),
+            },
+            leader_peer: Some(Peer::new(1, "a1")),
+            follower_peers: vec![Peer::new(2, "a2"), Peer::new(3, "a3")],
+            leader_state: Some(LeaderState::Downgrading),
+            leader_down_since: None,
+        };
+        let input = r#"{"region":{"id":2,"name":"r2","partition":null,"attrs":{}},"leader_peer":{"id":1,"addr":"a1"},"follower_peers":[{"id":2,"addr":"a2"},{"id":3,"addr":"a3"}],"leader_status":"Downgraded","leader_down_since":null}"#;
+        let decoded: RegionRoute = serde_json::from_str(input).unwrap();
+        assert_eq!(decoded, region_route);
+
+        let region_route = RegionRoute {
+            region: Region {
+                id: 2.into(),
+                name: "r2".to_string(),
+                partition: None,
+                attrs: BTreeMap::new(),
+            },
+            leader_peer: Some(Peer::new(1, "a1")),
+            follower_peers: vec![Peer::new(2, "a2"), Peer::new(3, "a3")],
+            leader_state: Some(LeaderState::Downgrading),
+            leader_down_since: None,
+        };
+        let input = r#"{"region":{"id":2,"name":"r2","partition":null,"attrs":{}},"leader_peer":{"id":1,"addr":"a1"},"follower_peers":[{"id":2,"addr":"a2"},{"id":3,"addr":"a3"}],"leader_state":"Downgrading","leader_down_since":null}"#;
+        let decoded: RegionRoute = serde_json::from_str(input).unwrap();
+        assert_eq!(decoded, region_route);
+
+        let region_route = RegionRoute {
+            region: Region {
+                id: 2.into(),
+                name: "r2".to_string(),
+                partition: None,
+                attrs: BTreeMap::new(),
+            },
+            leader_peer: Some(Peer::new(1, "a1")),
+            follower_peers: vec![Peer::new(2, "a2"), Peer::new(3, "a3")],
+            leader_state: Some(LeaderState::Downgrading),
+            leader_down_since: None,
+        };
+        let input = r#"{"region":{"id":2,"name":"r2","partition":null,"attrs":{}},"leader_peer":{"id":1,"addr":"a1"},"follower_peers":[{"id":2,"addr":"a2"},{"id":3,"addr":"a3"}],"leader_status":"Downgrading","leader_down_since":null}"#;
+        let decoded: RegionRoute = serde_json::from_str(input).unwrap();
         assert_eq!(decoded, region_route);
     }
 
