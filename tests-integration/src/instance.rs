@@ -20,6 +20,7 @@ mod tests {
     use std::sync::Arc;
 
     use api::v1::region::QueryRequest;
+    use client::OutputData;
     use common_base::Plugins;
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
     use common_meta::key::table_name::TableNameKey;
@@ -27,10 +28,11 @@ mod tests {
     use common_query::Output;
     use common_recordbatch::RecordBatches;
     use common_telemetry::debug;
+    use datafusion_expr::LogicalPlan;
     use frontend::error::{self, Error, Result};
     use frontend::instance::Instance;
     use query::parser::QueryLanguageParser;
-    use query::plan::LogicalPlan;
+    use query::query_engine::DefaultSerializer;
     use servers::interceptor::{SqlQueryInterceptor, SqlQueryInterceptorRef};
     use servers::query_handler::sql::SqlQueryHandler;
     use session::context::{QueryContext, QueryContextRef};
@@ -84,11 +86,11 @@ mod tests {
                 TIME INDEX (ts),
                 PRIMARY KEY(host)
             )
-            PARTITION BY RANGE COLUMNS (host) (
-                PARTITION r0 VALUES LESS THAN ('550-A'),
-                PARTITION r1 VALUES LESS THAN ('550-W'),
-                PARTITION r2 VALUES LESS THAN ('MOSS'),
-                PARTITION r3 VALUES LESS THAN (MAXVALUE),
+            PARTITION ON COLUMNS (host) (
+                host < '550-A',
+                host >= '550-A' AND host < '550-W',
+                host >= '550-W' AND host < 'MOSS',
+                host >= 'MOSS'
             )
             engine=mito"#;
         create_table(instance, sql).await;
@@ -152,7 +154,7 @@ mod tests {
 
     async fn create_table(instance: &Instance, sql: &str) {
         let output = query(instance, sql).await;
-        let Output::AffectedRows(x) = output else {
+        let OutputData::AffectedRows(x) = output.data else {
             unreachable!()
         };
         assert_eq!(x, 0);
@@ -166,27 +168,27 @@ mod tests {
                                 ('MOSS', 100000000, 10000000000, 2335190400000)
                                 "#;
         let output = query(instance, sql).await;
-        let Output::AffectedRows(x) = output else {
+        let OutputData::AffectedRows(x) = output.data else {
             unreachable!()
         };
         assert_eq!(x, 4);
 
         let sql = "SELECT * FROM demo WHERE ts > cast(1000000000 as timestamp) ORDER BY host"; // use nanoseconds as where condition
         let output = query(instance, sql).await;
-        let Output::Stream(s) = output else {
+        let OutputData::Stream(s) = output.data else {
             unreachable!()
         };
         let batches = common_recordbatch::util::collect_batches(s).await.unwrap();
         let pretty_print = batches.pretty_print().unwrap();
         let expected = "\
-+-------+---------------------+-------------+-----------+-----------+
-| host  | ts                  | cpu         | memory    | disk_util |
-+-------+---------------------+-------------+-----------+-----------+
-| 490   | 2013-12-31T16:00:00 | 0.1         | 1.0       | 9.9       |
-| 550-A | 2022-12-31T16:00:00 | 1.0         | 100.0     | 9.9       |
-| 550-W | 2023-12-31T16:00:00 | 10000.0     | 1000000.0 | 9.9       |
-| MOSS  | 2043-12-31T16:00:00 | 100000000.0 | 1.0e10    | 9.9       |
-+-------+---------------------+-------------+-----------+-----------+";
++-------+---------------------+-------------+---------------+-----------+
+| host  | ts                  | cpu         | memory        | disk_util |
++-------+---------------------+-------------+---------------+-----------+
+| 490   | 2013-12-31T16:00:00 | 0.1         | 1.0           | 9.9       |
+| 550-A | 2022-12-31T16:00:00 | 1.0         | 100.0         | 9.9       |
+| 550-W | 2023-12-31T16:00:00 | 10000.0     | 1000000.0     | 9.9       |
+| MOSS  | 2043-12-31T16:00:00 | 100000000.0 | 10000000000.0 | 9.9       |
++-------+---------------------+-------------+---------------+-----------+";
         assert_eq!(pretty_print, expected);
     }
 
@@ -210,27 +212,36 @@ mod tests {
 
         let table_route_value = manager
             .table_route_manager()
+            .table_route_storage()
             .get(table_id)
             .await
             .unwrap()
-            .unwrap()
-            .into_inner();
+            .unwrap();
 
-        let region_to_dn_map = region_distribution(table_route_value.region_routes())
-            .unwrap()
-            .iter()
-            .map(|(k, v)| (v[0], *k))
-            .collect::<HashMap<u32, u64>>();
+        let region_to_dn_map = region_distribution(
+            table_route_value
+                .region_routes()
+                .expect("region routes should be physical"),
+        )
+        .iter()
+        .map(|(k, v)| (v[0], *k))
+        .collect::<HashMap<u32, u64>>();
         assert!(region_to_dn_map.len() <= instance.datanodes().len());
 
-        let stmt = QueryLanguageParser::parse_sql("SELECT ts, host FROM demo ORDER BY ts").unwrap();
-        let LogicalPlan::DfPlan(plan) = instance
+        let stmt = QueryLanguageParser::parse_sql(
+            "SELECT ts, host FROM demo ORDER BY ts",
+            &QueryContext::arc(),
+        )
+        .unwrap();
+        let plan = instance
             .frontend()
             .statement_executor()
-            .plan(stmt, QueryContext::arc())
+            .plan(&stmt, QueryContext::arc())
             .await
             .unwrap();
-        let plan = DFLogicalSubstraitConvertor.encode(&plan).unwrap();
+        let plan = DFLogicalSubstraitConvertor
+            .encode(&plan, DefaultSerializer)
+            .unwrap();
 
         for (region, dn) in region_to_dn_map.iter() {
             let region_server = instance.datanodes().get(dn).unwrap().region_server();
@@ -238,7 +249,7 @@ mod tests {
             let region_id = RegionId::new(table_id, *region);
 
             let stream = region_server
-                .handle_read(QueryRequest {
+                .handle_remote_read(QueryRequest {
                     region_id: region_id.as_u64(),
                     plan: plan.to_vec(),
                     ..Default::default()
@@ -257,7 +268,7 @@ mod tests {
     async fn drop_table(instance: &Instance) {
         let sql = "DROP TABLE demo";
         let output = query(instance, sql).await;
-        let Output::AffectedRows(x) = output else {
+        let OutputData::AffectedRows(x) = output.data else {
             unreachable!()
         };
         assert_eq!(x, 0);
@@ -267,7 +278,7 @@ mod tests {
         assert!(instance
             .frontend()
             .catalog_manager()
-            .table("greptime", "public", "demo")
+            .table("greptime", "public", "demo", None)
             .await
             .unwrap()
             .is_none())
@@ -306,7 +317,7 @@ mod tests {
             fn pre_execute(
                 &self,
                 _statement: &Statement,
-                _plan: Option<&query::plan::LogicalPlan>,
+                _plan: Option<&LogicalPlan>,
                 _query_ctx: QueryContextRef,
             ) -> Result<()> {
                 let _ = self.c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -319,8 +330,8 @@ mod tests {
                 _query_ctx: QueryContextRef,
             ) -> Result<Output> {
                 let _ = self.c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                match &mut output {
-                    Output::AffectedRows(rows) => {
+                match &mut output.data {
+                    OutputData::AffectedRows(rows) => {
                         assert_eq!(*rows, 0);
                         // update output result
                         *rows = 10;
@@ -349,7 +360,7 @@ mod tests {
                             disk_util DOUBLE DEFAULT 9.9,
                             TIME INDEX (ts),
                             PRIMARY KEY(host)
-                        ) engine=mito with(regions=1);"#;
+                        ) engine=mito;"#;
         let output = SqlQueryHandler::do_query(&*instance, sql, QueryContext::arc())
             .await
             .remove(0)
@@ -357,8 +368,8 @@ mod tests {
 
         // assert that the hook is called 3 times
         assert_eq!(4, counter_hook.c.load(std::sync::atomic::Ordering::Relaxed));
-        match output {
-            Output::AffectedRows(rows) => assert_eq!(rows, 10),
+        match output.data {
+            OutputData::AffectedRows(rows) => assert_eq!(rows, 10),
             _ => unreachable!(),
         }
     }
@@ -411,14 +422,14 @@ mod tests {
                             disk_util DOUBLE DEFAULT 9.9,
                             TIME INDEX (ts),
                             PRIMARY KEY(host)
-                        ) engine=mito with(regions=1);"#;
+                        ) engine=mito;"#;
         let output = SqlQueryHandler::do_query(&*instance, sql, query_ctx.clone())
             .await
             .remove(0)
             .unwrap();
 
-        match output {
-            Output::AffectedRows(rows) => assert_eq!(rows, 0),
+        match output.data {
+            OutputData::AffectedRows(rows) => assert_eq!(rows, 0),
             _ => unreachable!(),
         }
 

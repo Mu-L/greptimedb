@@ -19,6 +19,7 @@ use std::time::Duration;
 use auth::tests::{DatabaseAuthInfo, MockUserProvider};
 use auth::UserProviderRef;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use common_runtime::runtime::BuilderBuild;
 use common_runtime::Builder as RuntimeBuilder;
 use pgwire::api::Type;
 use rand::rngs::StdRng;
@@ -27,9 +28,10 @@ use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use rustls::{Error, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName};
 use servers::error::Result;
+use servers::install_ring_crypto_provider;
 use servers::postgres::PostgresServer;
 use servers::server::Server;
-use servers::tls::TlsOption;
+use servers::tls::{ReloadableTlsServerConfig, TlsOption};
 use table::test_util::MemTable;
 use table::TableRef;
 use tokio_postgres::{Client, Error as PgError, NoTls, SimpleQueryMessage};
@@ -43,13 +45,11 @@ fn create_postgres_server(
     auth_info: Option<DatabaseAuthInfo>,
 ) -> Result<Box<dyn Server>> {
     let instance = Arc::new(create_testing_instance(table));
-    let io_runtime = Arc::new(
-        RuntimeBuilder::default()
-            .worker_threads(4)
-            .thread_name("postgres-io-handlers")
-            .build()
-            .unwrap(),
-    );
+    let io_runtime = RuntimeBuilder::default()
+        .worker_threads(4)
+        .thread_name("postgres-io-handlers")
+        .build()
+        .unwrap();
     let user_provider: Option<UserProviderRef> = if check_pwd {
         let mut provider = MockUserProvider::default();
         if let Some(info) = auth_info {
@@ -60,9 +60,15 @@ fn create_postgres_server(
         None
     };
 
+    let tls_server_config = Arc::new(
+        ReloadableTlsServerConfig::try_new(tls.clone())
+            .expect("Failed to load certificates and keys"),
+    );
+
     Ok(Box::new(PostgresServer::new(
         instance,
-        tls,
+        tls.should_force_tls(),
+        tls_server_config,
         io_runtime,
         user_provider,
     )))
@@ -267,6 +273,7 @@ async fn test_server_secure_require_client_plain() -> Result<()> {
         mode: servers::tls::TlsMode::Require,
         cert_path: "tests/ssl/server.crt".to_owned(),
         key_path: "tests/ssl/server-rsa.key".to_owned(),
+        watch: false,
     };
     let server_port = start_test_server(server_tls).await?;
     let r = create_plain_connection(server_port, false).await;
@@ -282,6 +289,7 @@ async fn test_server_secure_require_client_plain_with_pkcs8_priv_key() -> Result
         mode: servers::tls::TlsMode::Require,
         cert_path: "tests/ssl/server.crt".to_owned(),
         key_path: "tests/ssl/server-pkcs8.key".to_owned(),
+        watch: false,
     };
     let server_port = start_test_server(server_tls).await?;
     let r = create_plain_connection(server_port, false).await;
@@ -351,6 +359,8 @@ async fn test_extended_query() -> Result<()> {
 
 async fn start_test_server(server_tls: TlsOption) -> Result<u16> {
     common_telemetry::init_default_ut_logging();
+    let _ = install_ring_crypto_provider();
+
     let table = MemTable::default_numbers_table();
     let pg_server = create_postgres_server(table, false, server_tls, None)?;
     let listening = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
@@ -514,6 +524,7 @@ async fn do_simple_query_with_secure_server(
                 "tests/ssl/server-rsa.key".to_owned()
             }
         },
+        watch: false,
     };
 
     do_simple_query(server_tls, client_tls).await

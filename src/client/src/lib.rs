@@ -12,28 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![feature(assert_matches)]
+
 mod client;
 pub mod client_manager;
+#[cfg(feature = "testing")]
 mod database;
 pub mod error;
+pub mod flow;
 pub mod load_balance;
 mod metrics;
 pub mod region;
-mod stream_insert;
 
 pub use api;
 use api::v1::greptime_response::Response;
 use api::v1::{AffectedRows, GreptimeResponse};
 pub use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_error::status_code::StatusCode;
-pub use common_query::Output;
+pub use common_query::{Output, OutputData, OutputMeta};
 pub use common_recordbatch::{RecordBatches, SendableRecordBatchStream};
 use snafu::OptionExt;
 
 pub use self::client::Client;
+#[cfg(feature = "testing")]
 pub use self::database::Database;
 pub use self::error::{Error, Result};
-pub use self::stream_insert::StreamInserter;
 use crate::error::{IllegalDatabaseResponseSnafu, ServerSnafu};
 
 pub fn from_grpc_response(response: GreptimeResponse) -> Result<u32> {

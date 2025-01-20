@@ -15,13 +15,16 @@
 use std::collections::HashMap;
 
 use snafu::ResultExt;
-use sqlparser::ast::ObjectName;
 use sqlparser::keywords::Keyword;
+use sqlparser::tokenizer::Token;
 use sqlparser::tokenizer::Token::Word;
 
 use crate::error::{self, Result};
 use crate::parser::ParserContext;
-use crate::statements::copy::{CopyDatabaseArgument, CopyTable, CopyTableArgument};
+use crate::statements::copy::{
+    CopyDatabase, CopyDatabaseArgument, CopyQueryTo, CopyQueryToArgument, CopyTable,
+    CopyTableArgument,
+};
 use crate::statements::statement::Statement;
 use crate::util::parse_option_string;
 
@@ -29,11 +32,15 @@ pub type With = HashMap<String, String>;
 pub type Connection = HashMap<String, String>;
 
 // COPY tbl TO 'output.parquet';
-impl<'a> ParserContext<'a> {
+impl ParserContext<'_> {
     pub(crate) fn parse_copy(&mut self) -> Result<Statement> {
         let _ = self.parser.next_token();
         let next = self.parser.peek_token();
-        let copy = if let Word(word) = next.token
+        let copy = if next.token == Token::LParen {
+            let copy_query = self.parse_copy_query_to()?;
+
+            crate::statements::copy::Copy::CopyQueryTo(copy_query)
+        } else if let Word(word) = next.token
             && word.keyword == Keyword::DATABASE
         {
             let _ = self.parser.next_token();
@@ -47,103 +54,125 @@ impl<'a> ParserContext<'a> {
         Ok(Statement::Copy(copy))
     }
 
-    fn parser_copy_database(&mut self) -> Result<CopyDatabaseArgument> {
-        let database_name =
+    fn parser_copy_database(&mut self) -> Result<CopyDatabase> {
+        let database_name = self
+            .parse_object_name()
+            .with_context(|_| error::UnexpectedSnafu {
+                expected: "a database name",
+                actual: self.peek_token_as_string(),
+            })?;
+
+        let req = if self.parser.parse_keyword(Keyword::TO) {
+            let (with, connection, location, limit) = self.parse_copy_parameters()?;
+            if limit.is_some() {
+                return error::InvalidSqlSnafu {
+                    msg: "limit is not supported",
+                }
+                .fail();
+            }
+
+            let argument = CopyDatabaseArgument {
+                database_name,
+                with: with.into(),
+                connection: connection.into(),
+                location,
+            };
+            CopyDatabase::To(argument)
+        } else {
             self.parser
-                .parse_object_name()
-                .with_context(|_| error::UnexpectedSnafu {
-                    sql: self.sql,
-                    expected: "a database name",
-                    actual: self.peek_token_as_string(),
-                })?;
+                .expect_keyword(Keyword::FROM)
+                .context(error::SyntaxSnafu)?;
+            let (with, connection, location, limit) = self.parse_copy_parameters()?;
+            if limit.is_some() {
+                return error::InvalidSqlSnafu {
+                    msg: "limit is not supported",
+                }
+                .fail();
+            }
 
-        self.parser
-            .expect_keyword(Keyword::TO)
-            .context(error::SyntaxSnafu)?;
-
-        let (with, connection, location) = self.parse_copy_to()?;
-        Ok(CopyDatabaseArgument {
-            database_name,
-            with: with.into(),
-            connection: connection.into(),
-            location,
-        })
+            let argument = CopyDatabaseArgument {
+                database_name,
+                with: with.into(),
+                connection: connection.into(),
+                location,
+            };
+            CopyDatabase::From(argument)
+        };
+        Ok(req)
     }
 
     fn parse_copy_table(&mut self) -> Result<CopyTable> {
-        let raw_table_name =
-            self.parser
-                .parse_object_name()
-                .with_context(|_| error::UnexpectedSnafu {
-                    sql: self.sql,
-                    expected: "a table name",
-                    actual: self.peek_token_as_string(),
-                })?;
+        let raw_table_name = self
+            .parse_object_name()
+            .with_context(|_| error::UnexpectedSnafu {
+                expected: "a table name",
+                actual: self.peek_token_as_string(),
+            })?;
         let table_name = Self::canonicalize_object_name(raw_table_name);
 
         if self.parser.parse_keyword(Keyword::TO) {
-            let (with, connection, location) = self.parse_copy_to()?;
+            let (with, connection, location, limit) = self.parse_copy_parameters()?;
             Ok(CopyTable::To(CopyTableArgument {
                 table_name,
                 with: with.into(),
                 connection: connection.into(),
                 location,
+                limit,
             }))
         } else {
             self.parser
                 .expect_keyword(Keyword::FROM)
                 .context(error::SyntaxSnafu)?;
-            Ok(CopyTable::From(self.parse_copy_table_from(table_name)?))
+            let (with, connection, location, limit) = self.parse_copy_parameters()?;
+            Ok(CopyTable::From(CopyTableArgument {
+                table_name,
+                with: with.into(),
+                connection: connection.into(),
+                location,
+                limit,
+            }))
         }
     }
 
-    fn parse_copy_table_from(&mut self, table_name: ObjectName) -> Result<CopyTableArgument> {
-        let location =
-            self.parser
-                .parse_literal_string()
-                .with_context(|_| error::UnexpectedSnafu {
-                    sql: self.sql,
-                    expected: "a uri",
-                    actual: self.peek_token_as_string(),
-                })?;
-
-        let options = self
-            .parser
-            .parse_options(Keyword::WITH)
+    fn parse_copy_query_to(&mut self) -> Result<CopyQueryTo> {
+        self.parser
+            .expect_token(&Token::LParen)
+            .with_context(|_| error::UnexpectedSnafu {
+                expected: "'('",
+                actual: self.peek_token_as_string(),
+            })?;
+        let query = self.parse_query()?;
+        self.parser
+            .expect_token(&Token::RParen)
+            .with_context(|_| error::UnexpectedSnafu {
+                expected: "')'",
+                actual: self.peek_token_as_string(),
+            })?;
+        self.parser
+            .expect_keyword(Keyword::TO)
             .context(error::SyntaxSnafu)?;
-
-        let with = options
-            .into_iter()
-            .filter_map(|option| {
-                parse_option_string(option.value).map(|v| (option.name.value.to_lowercase(), v))
-            })
-            .collect();
-
-        let connection_options = self
-            .parser
-            .parse_options(Keyword::CONNECTION)
-            .context(error::SyntaxSnafu)?;
-
-        let connection = connection_options
-            .into_iter()
-            .filter_map(|option| {
-                parse_option_string(option.value).map(|v| (option.name.value.to_lowercase(), v))
-            })
-            .collect();
-        Ok(CopyTableArgument {
-            table_name,
-            with,
-            connection,
-            location,
+        let (with, connection, location, limit) = self.parse_copy_parameters()?;
+        if limit.is_some() {
+            return error::InvalidSqlSnafu {
+                msg: "limit is not supported",
+            }
+            .fail();
+        }
+        Ok(CopyQueryTo {
+            query: Box::new(query),
+            arg: CopyQueryToArgument {
+                with: with.into(),
+                connection: connection.into(),
+                location,
+            },
         })
     }
 
-    fn parse_copy_to(&mut self) -> Result<(With, Connection, String)> {
+    fn parse_copy_parameters(&mut self) -> Result<(With, Connection, String, Option<u64>)> {
         let location =
             self.parser
                 .parse_literal_string()
                 .with_context(|_| error::UnexpectedSnafu {
-                    sql: self.sql,
                     expected: "a file name",
                     actual: self.peek_token_as_string(),
                 })?;
@@ -155,10 +184,8 @@ impl<'a> ParserContext<'a> {
 
         let with = options
             .into_iter()
-            .filter_map(|option| {
-                parse_option_string(option.value).map(|v| (option.name.value.to_lowercase(), v))
-            })
-            .collect();
+            .map(parse_option_string)
+            .collect::<Result<With>>()?;
 
         let connection_options = self
             .parser
@@ -167,12 +194,23 @@ impl<'a> ParserContext<'a> {
 
         let connection = connection_options
             .into_iter()
-            .filter_map(|option| {
-                parse_option_string(option.value).map(|v| (option.name.value.to_lowercase(), v))
-            })
-            .collect();
+            .map(parse_option_string)
+            .collect::<Result<Connection>>()?;
 
-        Ok((with, connection, location))
+        let limit = if self.parser.parse_keyword(Keyword::LIMIT) {
+            Some(
+                self.parser
+                    .parse_literal_uint()
+                    .with_context(|_| error::UnexpectedSnafu {
+                        expected: "the number of maximum rows",
+                        actual: self.peek_token_as_string(),
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        Ok((with, connection, location, limit))
     }
 }
 
@@ -181,18 +219,29 @@ mod tests {
     use std::assert_matches::assert_matches;
     use std::collections::HashMap;
 
-    use sqlparser::ast::Ident;
+    use sqlparser::ast::{Ident, ObjectName};
 
     use super::*;
     use crate::dialect::GreptimeDbDialect;
+    use crate::parser::ParseOptions;
     use crate::statements::statement::Statement::Copy;
 
     #[test]
     fn test_parse_copy_table() {
         let sql0 = "COPY catalog0.schema0.tbl TO 'tbl_file.parquet'";
         let sql1 = "COPY catalog0.schema0.tbl TO 'tbl_file.parquet' WITH (FORMAT = 'parquet')";
-        let result0 = ParserContext::create_with_dialect(sql0, &GreptimeDbDialect {}).unwrap();
-        let result1 = ParserContext::create_with_dialect(sql1, &GreptimeDbDialect {}).unwrap();
+        let result0 = ParserContext::create_with_dialect(
+            sql0,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        )
+        .unwrap();
+        let result1 = ParserContext::create_with_dialect(
+            sql1,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        )
+        .unwrap();
 
         for mut result in [result0, result1] {
             assert_eq!(1, result.len());
@@ -238,7 +287,10 @@ mod tests {
             "COPY catalog0.schema0.tbl FROM 'tbl_file.parquet' WITH (FORMAT = 'parquet')",
         ]
         .iter()
-        .map(|sql| ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).unwrap())
+        .map(|sql| {
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+        })
         .collect::<Vec<_>>();
 
         for mut result in results {
@@ -298,8 +350,12 @@ mod tests {
         ];
 
         for test in tests {
-            let mut result =
-                ParserContext::create_with_dialect(test.sql, &GreptimeDbDialect {}).unwrap();
+            let mut result = ParserContext::create_with_dialect(
+                test.sql,
+                &GreptimeDbDialect {},
+                ParseOptions::default(),
+            )
+            .unwrap();
             assert_eq!(1, result.len());
 
             let statement = result.remove(0);
@@ -344,8 +400,12 @@ mod tests {
         ];
 
         for test in tests {
-            let mut result =
-                ParserContext::create_with_dialect(test.sql, &GreptimeDbDialect {}).unwrap();
+            let mut result = ParserContext::create_with_dialect(
+                test.sql,
+                &GreptimeDbDialect {},
+                ParseOptions::default(),
+            )
+            .unwrap();
             assert_eq!(1, result.len());
 
             let statement = result.remove(0);
@@ -367,33 +427,143 @@ mod tests {
     #[test]
     fn test_copy_database_to() {
         let sql = "COPY DATABASE catalog0.schema0 TO 'tbl_file.parquet' WITH (FORMAT = 'parquet') CONNECTION (FOO='Bar', ONE='two')";
-        let stmt = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {})
-            .unwrap()
-            .pop()
-            .unwrap();
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
 
         let Copy(crate::statements::copy::Copy::CopyDatabase(stmt)) = stmt else {
             unreachable!()
         };
+
+        let CopyDatabase::To(stmt) = stmt else {
+            unreachable!()
+        };
+
         assert_eq!(
             ObjectName(vec![Ident::new("catalog0"), Ident::new("schema0")]),
             stmt.database_name
         );
         assert_eq!(
-            [("format".to_string(), "parquet".to_string())]
+            [("format", "parquet")]
                 .into_iter()
                 .collect::<HashMap<_, _>>(),
-            stmt.with.map
+            stmt.with.to_str_map()
         );
 
         assert_eq!(
-            [
-                ("foo".to_string(), "Bar".to_string()),
-                ("one".to_string(), "two".to_string())
-            ]
-            .into_iter()
-            .collect::<HashMap<_, _>>(),
-            stmt.connection.map
+            [("foo", "Bar"), ("one", "two")]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            stmt.connection.to_str_map()
         );
+    }
+
+    #[test]
+    fn test_copy_database_from() {
+        let sql = "COPY DATABASE catalog0.schema0 FROM '/a/b/c/' WITH (FORMAT = 'parquet') CONNECTION (FOO='Bar', ONE='two')";
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+
+        let Copy(crate::statements::copy::Copy::CopyDatabase(stmt)) = stmt else {
+            unreachable!()
+        };
+
+        let CopyDatabase::From(stmt) = stmt else {
+            unreachable!()
+        };
+
+        assert_eq!(
+            ObjectName(vec![Ident::new("catalog0"), Ident::new("schema0")]),
+            stmt.database_name
+        );
+        assert_eq!(
+            [("format", "parquet")]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            stmt.with.to_str_map()
+        );
+
+        assert_eq!(
+            [("foo", "Bar"), ("one", "two")]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            stmt.connection.to_str_map()
+        );
+    }
+
+    #[test]
+    fn test_copy_query_to() {
+        let sql = "COPY (SELECT * FROM tbl WHERE ts > 10) TO 'tbl_file.parquet' WITH (FORMAT = 'parquet') CONNECTION (FOO='Bar', ONE='two')";
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+
+        let Copy(crate::statements::copy::Copy::CopyQueryTo(stmt)) = stmt else {
+            unreachable!()
+        };
+
+        let query = ParserContext::create_with_dialect(
+            "SELECT * FROM tbl WHERE ts > 10",
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        )
+        .unwrap()
+        .remove(0);
+
+        assert_eq!(&query, stmt.query.as_ref());
+        assert_eq!(
+            [("format", "parquet")]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            stmt.arg.with.to_str_map()
+        );
+
+        assert_eq!(
+            [("foo", "Bar"), ("one", "two")]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            stmt.arg.connection.to_str_map()
+        );
+    }
+
+    #[test]
+    fn test_invalid_copy_query_to() {
+        {
+            let sql = "COPY SELECT * FROM tbl WHERE ts > 10 TO 'tbl_file.parquet' WITH (FORMAT = 'parquet') CONNECTION (FOO='Bar', ONE='two')";
+
+            assert!(ParserContext::create_with_dialect(
+                sql,
+                &GreptimeDbDialect {},
+                ParseOptions::default()
+            )
+            .is_err())
+        }
+        {
+            let sql = "COPY SELECT * FROM tbl WHERE ts > 10) TO 'tbl_file.parquet' WITH (FORMAT = 'parquet') CONNECTION (FOO='Bar', ONE='two')";
+
+            assert!(ParserContext::create_with_dialect(
+                sql,
+                &GreptimeDbDialect {},
+                ParseOptions::default()
+            )
+            .is_err())
+        }
+        {
+            let sql = "COPY (SELECT * FROM tbl WHERE ts > 10 TO 'tbl_file.parquet' WITH (FORMAT = 'parquet') CONNECTION (FOO='Bar', ONE='two')";
+
+            assert!(ParserContext::create_with_dialect(
+                sql,
+                &GreptimeDbDialect {},
+                ParseOptions::default()
+            )
+            .is_err())
+        }
     }
 }

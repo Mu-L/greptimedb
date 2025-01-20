@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use common_time::Timestamp;
+use common_time::{TimeToLive, Timestamp};
 
 use crate::sst::file::{FileHandle, FileId, FileMeta, Level, MAX_LEVEL};
 use crate::sst::file_purger::FilePurgerRef;
@@ -55,10 +55,10 @@ impl SstVersion {
     ) {
         for file in files_to_add {
             let level = file.level;
-            let handle = FileHandle::new(file, file_purger.clone());
-            let file_id = handle.file_id();
-            let old = self.levels[level as usize].files.insert(file_id, handle);
-            assert!(old.is_none(), "Adds an existing file: {file_id}");
+            self.levels[level as usize]
+                .files
+                .entry(file.file_id)
+                .or_insert_with(|| FileHandle::new(file, file_purger.clone()));
         }
     }
 
@@ -84,7 +84,25 @@ impl SstVersion {
         }
     }
 
-    /// Returns SST files'space occupied in current version.
+    /// Returns the number of rows in SST files.
+    /// For historical reasons, the result is not precise for old SST files.
+    pub(crate) fn num_rows(&self) -> u64 {
+        self.levels
+            .iter()
+            .map(|level_meta| {
+                level_meta
+                    .files
+                    .values()
+                    .map(|file_handle| {
+                        let meta = file_handle.meta_ref();
+                        meta.num_rows
+                    })
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    /// Returns SST data files'space occupied in current version.
     pub(crate) fn sst_usage(&self) -> u64 {
         self.levels
             .iter()
@@ -92,7 +110,27 @@ impl SstVersion {
                 level_meta
                     .files
                     .values()
-                    .map(|file_handle| file_handle.meta().file_size)
+                    .map(|file_handle| {
+                        let meta = file_handle.meta_ref();
+                        meta.file_size
+                    })
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    /// Returns SST index files'space occupied in current version.
+    pub(crate) fn index_usage(&self) -> u64 {
+        self.levels
+            .iter()
+            .map(|level_meta| {
+                level_meta
+                    .files
+                    .values()
+                    .map(|file_handle| {
+                        let meta = file_handle.meta_ref();
+                        meta.index_file_size
+                    })
                     .sum::<u64>()
             })
             .sum()
@@ -122,12 +160,19 @@ impl LevelMeta {
     }
 
     /// Returns expired SSTs from current level.
-    pub fn get_expired_files(&self, expire_time: &Timestamp) -> Vec<FileHandle> {
+    pub fn get_expired_files(&self, now: &Timestamp, ttl: &TimeToLive) -> Vec<FileHandle> {
         self.files
             .values()
             .filter(|v| {
                 let (_, end) = v.time_range();
-                &end < expire_time
+
+                match ttl.is_expired(&end, now) {
+                    Ok(expired) => expired,
+                    Err(e) => {
+                        common_telemetry::error!(e; "Failed to calculate region TTL expire time");
+                        false
+                    }
+                }
             })
             .cloned()
             .collect()
@@ -153,4 +198,33 @@ fn new_level_meta_vec() -> LevelMetaArray {
         .collect::<Vec<_>>()
         .try_into()
         .unwrap() // safety: LevelMetaArray is a fixed length array with length MAX_LEVEL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::new_noop_file_purger;
+
+    #[test]
+    fn test_add_files() {
+        let purger = new_noop_file_purger();
+
+        let files = (1..=3)
+            .map(|_| FileMeta {
+                file_id: FileId::random(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let mut version = SstVersion::new();
+        // files[1] is added multiple times, and that's ok.
+        version.add_files(purger.clone(), files[..=1].iter().cloned());
+        version.add_files(purger, files[1..].iter().cloned());
+
+        let added_files = &version.levels()[0].files;
+        assert_eq!(added_files.len(), 3);
+        files.iter().for_each(|f| {
+            assert!(added_files.contains_key(&f.file_id));
+        });
+    }
 }

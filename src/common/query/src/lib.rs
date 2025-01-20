@@ -12,42 +12,114 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::{Debug, Formatter};
-
-use api::greptime_proto::v1::add_column_location::LocationType;
-use api::greptime_proto::v1::AddColumnLocation as Location;
-use common_recordbatch::{RecordBatches, SendableRecordBatchStream};
-use serde::{Deserialize, Serialize};
-
 pub mod columnar_value;
 pub mod error;
 mod function;
 pub mod logical_plan;
-pub mod physical_plan;
 pub mod prelude;
+pub mod request;
 mod signature;
+pub mod stream;
+#[cfg(any(test, feature = "testing"))]
+pub mod test_util;
+
+use std::fmt::{Debug, Display, Formatter};
+use std::sync::Arc;
+
+use api::greptime_proto::v1::add_column_location::LocationType;
+use api::greptime_proto::v1::AddColumnLocation as Location;
+use common_recordbatch::{RecordBatches, SendableRecordBatchStream};
+use datafusion::physical_plan::ExecutionPlan;
+use serde::{Deserialize, Serialize};
 use sqlparser_derive::{Visit, VisitMut};
 
-// sql output
-pub enum Output {
-    AffectedRows(usize),
+/// new Output struct with output data(previously Output) and output meta
+#[derive(Debug)]
+pub struct Output {
+    pub data: OutputData,
+    pub meta: OutputMeta,
+}
+
+/// Original Output struct
+/// carrying result data to response/client/user interface
+pub enum OutputData {
+    AffectedRows(OutputRows),
     RecordBatches(RecordBatches),
     Stream(SendableRecordBatchStream),
 }
 
-impl Debug for Output {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Output::AffectedRows(rows) => write!(f, "Output::AffectedRows({rows})"),
-            Output::RecordBatches(recordbatches) => {
-                write!(f, "Output::RecordBatches({recordbatches:?})")
-            }
-            Output::Stream(_) => write!(f, "Output::Stream(<stream>)"),
+/// OutputMeta stores meta information produced/generated during the execution
+#[derive(Debug, Default)]
+pub struct OutputMeta {
+    /// May exist for query output. One can retrieve execution metrics from this plan.
+    pub plan: Option<Arc<dyn ExecutionPlan>>,
+    pub cost: OutputCost,
+}
+
+impl Output {
+    pub fn new_with_affected_rows(affected_rows: OutputRows) -> Self {
+        Self {
+            data: OutputData::AffectedRows(affected_rows),
+            meta: Default::default(),
+        }
+    }
+
+    pub fn new_with_record_batches(recordbatches: RecordBatches) -> Self {
+        Self {
+            data: OutputData::RecordBatches(recordbatches),
+            meta: Default::default(),
+        }
+    }
+
+    pub fn new_with_stream(stream: SendableRecordBatchStream) -> Self {
+        Self {
+            data: OutputData::Stream(stream),
+            meta: Default::default(),
+        }
+    }
+
+    pub fn new(data: OutputData, meta: OutputMeta) -> Self {
+        Self { data, meta }
+    }
+
+    pub fn extract_rows_and_cost(&self) -> (OutputRows, OutputCost) {
+        match self.data {
+            OutputData::AffectedRows(rows) => (rows, self.meta.cost),
+            _ => (0, self.meta.cost),
         }
     }
 }
 
-pub use datafusion::physical_plan::ExecutionPlan as DfPhysicalPlan;
+impl Debug for OutputData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputData::AffectedRows(rows) => write!(f, "OutputData::AffectedRows({rows})"),
+            OutputData::RecordBatches(recordbatches) => {
+                write!(f, "OutputData::RecordBatches({recordbatches:?})")
+            }
+            OutputData::Stream(s) => {
+                write!(f, "OutputData::Stream(<{}>)", s.name())
+            }
+        }
+    }
+}
+
+impl OutputMeta {
+    pub fn new(plan: Option<Arc<dyn ExecutionPlan>>, cost: usize) -> Self {
+        Self { plan, cost }
+    }
+
+    pub fn new_with_plan(plan: Arc<dyn ExecutionPlan>) -> Self {
+        Self {
+            plan: Some(plan),
+            cost: 0,
+        }
+    }
+
+    pub fn new_with_cost(cost: usize) -> Self {
+        Self { plan: None, cost }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Visit, VisitMut)]
 pub enum AddColumnLocation {
@@ -55,12 +127,23 @@ pub enum AddColumnLocation {
     After { column_name: String },
 }
 
+impl Display for AddColumnLocation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddColumnLocation::First => write!(f, r#"FIRST"#),
+            AddColumnLocation::After { column_name } => {
+                write!(f, r#"AFTER {column_name}"#)
+            }
+        }
+    }
+}
+
 impl From<&AddColumnLocation> for Location {
     fn from(value: &AddColumnLocation) -> Self {
         match value {
             AddColumnLocation::First => Location {
                 location_type: LocationType::First.into(),
-                after_column_name: "".to_string(),
+                after_column_name: String::default(),
             },
             AddColumnLocation::After { column_name } => Location {
                 location_type: LocationType::After.into(),
@@ -69,3 +152,6 @@ impl From<&AddColumnLocation> for Location {
         }
     }
 }
+
+pub type OutputRows = usize;
+pub type OutputCost = usize;

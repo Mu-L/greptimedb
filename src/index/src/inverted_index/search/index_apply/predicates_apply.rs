@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::mem::size_of;
+
 use async_trait::async_trait;
 use common_base::BitVec;
 use greptime_proto::v1::index::InvertedIndexMetas;
@@ -21,9 +23,9 @@ use crate::inverted_index::format::reader::InvertedIndexReader;
 use crate::inverted_index::search::fst_apply::{
     FstApplier, IntersectionFstApplier, KeysFstApplier,
 };
-use crate::inverted_index::search::fst_values_mapper::FstValuesMapper;
+use crate::inverted_index::search::fst_values_mapper::ParallelFstValuesMapper;
 use crate::inverted_index::search::index_apply::{
-    IndexApplier, IndexNotFoundStrategy, SearchContext,
+    ApplyOutput, IndexApplier, IndexNotFoundStrategy, SearchContext,
 };
 use crate::inverted_index::search::predicate::Predicate;
 
@@ -41,24 +43,28 @@ pub struct PredicatesIndexApplier {
 impl IndexApplier for PredicatesIndexApplier {
     /// Applies all `FstApplier`s to the data in the inverted index reader, intersecting the individual
     /// bitmaps obtained for each index to result in a final set of indices.
-    async fn apply(
+    async fn apply<'a>(
         &self,
         context: SearchContext,
-        reader: &mut dyn InvertedIndexReader,
-    ) -> Result<Vec<usize>> {
+        reader: &mut (dyn InvertedIndexReader + 'a),
+    ) -> Result<ApplyOutput> {
         let metadata = reader.metadata().await?;
+        let mut output = ApplyOutput {
+            matched_segment_ids: BitVec::EMPTY,
+            total_row_count: metadata.total_row_count as _,
+            segment_row_count: metadata.segment_row_count as _,
+        };
 
         let mut bitmap = Self::bitmap_full_range(&metadata);
         // TODO(zhongzc): optimize the order of applying to make it quicker to return empty.
-        for (name, fst_applier) in &self.fst_appliers {
-            if bitmap.count_ones() == 0 {
-                break;
-            }
+        let mut appliers = Vec::with_capacity(self.fst_appliers.len());
+        let mut fst_ranges = Vec::with_capacity(self.fst_appliers.len());
 
+        for (name, fst_applier) in &self.fst_appliers {
             let Some(meta) = metadata.metas.get(name) else {
                 match context.index_not_found_strategy {
                     IndexNotFoundStrategy::ReturnEmpty => {
-                        return Ok(vec![]);
+                        return Ok(output);
                     }
                     IndexNotFoundStrategy::Ignore => {
                         continue;
@@ -68,17 +74,47 @@ impl IndexApplier for PredicatesIndexApplier {
                     }
                 }
             };
+            let fst_offset = meta.base_offset + meta.relative_fst_offset as u64;
+            let fst_size = meta.fst_size as u64;
+            appliers.push((fst_applier, meta));
+            fst_ranges.push(fst_offset..fst_offset + fst_size);
+        }
 
-            let fst = reader.fst(meta).await?;
-            let values = fst_applier.apply(&fst);
+        if fst_ranges.is_empty() {
+            output.matched_segment_ids = bitmap;
+            return Ok(output);
+        }
 
-            let mut mapper = FstValuesMapper::new(&mut *reader, meta);
-            let bm = mapper.map_values(&values).await?;
+        let fsts = reader.fst_vec(&fst_ranges).await?;
+        let value_and_meta_vec = fsts
+            .into_iter()
+            .zip(appliers)
+            .map(|(fst, (fst_applier, meta))| (fst_applier.apply(&fst), meta))
+            .collect::<Vec<_>>();
+
+        let mut mapper = ParallelFstValuesMapper::new(reader);
+        let bm_vec = mapper.map_values_vec(&value_and_meta_vec).await?;
+
+        for bm in bm_vec {
+            if bitmap.count_ones() == 0 {
+                break;
+            }
 
             bitmap &= bm;
         }
 
-        Ok(bitmap.iter_ones().collect())
+        output.matched_segment_ids = bitmap;
+        Ok(output)
+    }
+
+    /// Returns the memory usage of the applier.
+    fn memory_usage(&self) -> usize {
+        let mut size = self.fst_appliers.capacity() * size_of::<(IndexName, Box<dyn FstApplier>)>();
+        for (name, fst_applier) in &self.fst_appliers {
+            size += name.capacity();
+            size += fst_applier.memory_usage();
+        }
+        size
     }
 }
 
@@ -94,17 +130,17 @@ impl PredicatesIndexApplier {
             .partition_in_place(|(_, ps)| ps.iter().any(|p| matches!(p, Predicate::InList(_))));
         let mut iter = predicates.into_iter();
         for _ in 0..in_list_index {
-            let (tag_name, predicates) = iter.next().unwrap();
+            let (column_name, predicates) = iter.next().unwrap();
             let fst_applier = Box::new(KeysFstApplier::try_from(predicates)?) as _;
-            fst_appliers.push((tag_name, fst_applier));
+            fst_appliers.push((column_name, fst_applier));
         }
 
-        for (tag_name, predicates) in iter {
+        for (column_name, predicates) in iter {
             if predicates.is_empty() {
                 continue;
             }
             let fst_applier = Box::new(IntersectionFstApplier::try_from(predicates)?) as _;
-            fst_appliers.push((tag_name, fst_applier));
+            fst_appliers.push((column_name, fst_applier));
         }
 
         Ok(PredicatesIndexApplier { fst_appliers })
@@ -114,7 +150,7 @@ impl PredicatesIndexApplier {
     fn bitmap_full_range(metadata: &InvertedIndexMetas) -> BitVec {
         let total_count = metadata.total_row_count;
         let segment_count = metadata.segment_row_count;
-        let len = (total_count + segment_count - 1) / segment_count;
+        let len = total_count.div_ceil(segment_count);
         BitVec::repeat(true, len as _)
     }
 }
@@ -128,6 +164,9 @@ impl TryFrom<Vec<(String, Vec<Predicate>)>> for PredicatesIndexApplier {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
     use common_base::bit_vec::prelude::*;
     use greptime_proto::v1::index::InvertedIndexMeta;
 
@@ -141,20 +180,21 @@ mod tests {
         s.to_owned()
     }
 
-    fn mock_metas(tags: impl IntoIterator<Item = &'static str>) -> InvertedIndexMetas {
+    fn mock_metas(tags: impl IntoIterator<Item = (&'static str, u32)>) -> Arc<InvertedIndexMetas> {
         let mut metas = InvertedIndexMetas {
             total_row_count: 8,
             segment_row_count: 1,
             ..Default::default()
         };
-        for tag in tags.into_iter() {
+        for (tag, idx) in tags.into_iter() {
             let meta = InvertedIndexMeta {
                 name: s(tag),
+                relative_fst_offset: idx,
                 ..Default::default()
             };
             metas.metas.insert(s(tag), meta);
         }
-        metas
+        Arc::new(metas)
     }
 
     fn key_fst_applier(value: &'static str) -> Box<dyn FstApplier> {
@@ -180,41 +220,46 @@ mod tests {
         let mut mock_reader = MockInvertedIndexReader::new();
         mock_reader
             .expect_metadata()
-            .returning(|| Ok(mock_metas(["tag-0"])));
-        mock_reader
-            .expect_fst()
-            .returning(|meta| match meta.name.as_str() {
-                "tag-0" => Ok(FstMap::from_iter([(b"tag-0_value-0", fst_value(2, 1))]).unwrap()),
-                _ => unreachable!(),
-            });
-        mock_reader.expect_bitmap().returning(|meta, offset, size| {
-            match (meta.name.as_str(), offset, size) {
-                ("tag-0", 2, 1) => Ok(bitvec![u8, Lsb0; 1, 0, 1, 0, 1, 0, 1, 0]),
-                _ => unreachable!(),
-            }
+            .returning(|| Ok(mock_metas([("tag-0", 0)])));
+        mock_reader.expect_fst_vec().returning(|_ranges| {
+            Ok(vec![FstMap::from_iter([(
+                b"tag-0_value-0",
+                fst_value(2, 1),
+            )])
+            .unwrap()])
         });
-        let indices = applier
+
+        mock_reader.expect_bitmap_deque().returning(|range| {
+            assert_eq!(range.len(), 1);
+            assert_eq!(range[0], 2..3);
+            Ok(VecDeque::from([bitvec![u8, Lsb0; 1, 0, 1, 0, 1, 0, 1, 0]]))
+        });
+        let output = applier
             .apply(SearchContext::default(), &mut mock_reader)
             .await
             .unwrap();
-        assert_eq!(indices, vec![0, 2, 4, 6]);
+        assert_eq!(
+            output.matched_segment_ids,
+            bitvec![u8, Lsb0; 1, 0, 1, 0, 1, 0, 1, 0]
+        );
 
         // An index reader with a single tag "tag-0" but without value "tag-0_value-0"
         let mut mock_reader = MockInvertedIndexReader::new();
         mock_reader
             .expect_metadata()
-            .returning(|| Ok(mock_metas(["tag-0"])));
-        mock_reader
-            .expect_fst()
-            .returning(|meta| match meta.name.as_str() {
-                "tag-0" => Ok(FstMap::from_iter([(b"tag-0_value-1", fst_value(2, 1))]).unwrap()),
-                _ => unreachable!(),
-            });
-        let indices = applier
+            .returning(|| Ok(mock_metas([("tag-0", 0)])));
+        mock_reader.expect_fst_vec().returning(|_range| {
+            Ok(vec![FstMap::from_iter([(
+                b"tag-0_value-1",
+                fst_value(2, 1),
+            )])
+            .unwrap()])
+        });
+        let output = applier
             .apply(SearchContext::default(), &mut mock_reader)
             .await
             .unwrap();
-        assert!(indices.is_empty());
+        assert_eq!(output.matched_segment_ids.count_ones(), 0);
     }
 
     #[tokio::test]
@@ -231,27 +276,43 @@ mod tests {
         let mut mock_reader = MockInvertedIndexReader::new();
         mock_reader
             .expect_metadata()
-            .returning(|| Ok(mock_metas(["tag-0", "tag-1"])));
-        mock_reader
-            .expect_fst()
-            .returning(|meta| match meta.name.as_str() {
-                "tag-0" => Ok(FstMap::from_iter([(b"tag-0_value-0", fst_value(1, 1))]).unwrap()),
-                "tag-1" => Ok(FstMap::from_iter([(b"tag-1_value-a", fst_value(2, 1))]).unwrap()),
-                _ => unreachable!(),
-            });
-        mock_reader.expect_bitmap().returning(|meta, offset, size| {
-            match (meta.name.as_str(), offset, size) {
-                ("tag-0", 1, 1) => Ok(bitvec![u8, Lsb0; 1, 0, 1, 0, 1, 0, 1, 0]),
-                ("tag-1", 2, 1) => Ok(bitvec![u8, Lsb0; 1, 1, 0, 1, 1, 0, 1, 1]),
-                _ => unreachable!(),
+            .returning(|| Ok(mock_metas([("tag-0", 0), ("tag-1", 1)])));
+        mock_reader.expect_fst_vec().returning(|ranges| {
+            let mut output = vec![];
+            for range in ranges {
+                match range.start {
+                    0 => output
+                        .push(FstMap::from_iter([(b"tag-0_value-0", fst_value(1, 1))]).unwrap()),
+                    1 => output
+                        .push(FstMap::from_iter([(b"tag-1_value-a", fst_value(2, 1))]).unwrap()),
+                    _ => unreachable!(),
+                }
             }
+            Ok(output)
+        });
+        mock_reader.expect_bitmap_deque().returning(|ranges| {
+            let mut output = VecDeque::new();
+            for range in ranges {
+                let offset = range.start;
+                let size = range.end - range.start;
+                match (offset, size) {
+                    (1, 1) => output.push_back(bitvec![u8, Lsb0; 1, 0, 1, 0, 1, 0, 1, 0]),
+                    (2, 1) => output.push_back(bitvec![u8, Lsb0; 1, 1, 0, 1, 1, 0, 1, 1]),
+                    _ => unreachable!(),
+                }
+            }
+
+            Ok(output)
         });
 
-        let indices = applier
+        let output = applier
             .apply(SearchContext::default(), &mut mock_reader)
             .await
             .unwrap();
-        assert_eq!(indices, vec![0, 4, 6]);
+        assert_eq!(
+            output.matched_segment_ids,
+            bitvec![u8, Lsb0; 1, 0, 0, 0, 1, 0, 1, 0]
+        );
     }
 
     #[tokio::test]
@@ -263,24 +324,27 @@ mod tests {
         let mut mock_reader: MockInvertedIndexReader = MockInvertedIndexReader::new();
         mock_reader
             .expect_metadata()
-            .returning(|| Ok(mock_metas(["tag-0"])));
+            .returning(|| Ok(mock_metas([("tag-0", 0)])));
 
-        let indices = applier
+        let output = applier
             .apply(SearchContext::default(), &mut mock_reader)
             .await
             .unwrap();
-        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5, 6, 7]); // full range to scan
+        assert_eq!(
+            output.matched_segment_ids,
+            bitvec![u8, Lsb0; 1, 1, 1, 1, 1, 1, 1, 1]
+        ); // full range to scan
     }
 
     #[tokio::test]
     async fn test_index_applier_with_empty_index() {
         let mut mock_reader = MockInvertedIndexReader::new();
         mock_reader.expect_metadata().returning(move || {
-            Ok(InvertedIndexMetas {
+            Ok(Arc::new(InvertedIndexMetas {
                 total_row_count: 0, // No rows
                 segment_row_count: 1,
                 ..Default::default()
-            })
+            }))
         });
 
         let mut mock_fst_applier = MockFstApplier::new();
@@ -290,11 +354,11 @@ mod tests {
             fst_appliers: vec![(s("tag-0"), Box::new(mock_fst_applier))],
         };
 
-        let indices = applier
+        let output = applier
             .apply(SearchContext::default(), &mut mock_reader)
             .await
             .unwrap();
-        assert!(indices.is_empty());
+        assert!(output.matched_segment_ids.is_empty());
     }
 
     #[tokio::test]
@@ -321,7 +385,7 @@ mod tests {
             .await;
         assert!(matches!(result, Err(Error::IndexNotFound { .. })));
 
-        let indices = applier
+        let output = applier
             .apply(
                 SearchContext {
                     index_not_found_strategy: IndexNotFoundStrategy::ReturnEmpty,
@@ -330,9 +394,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(indices.is_empty());
+        assert!(output.matched_segment_ids.is_empty());
 
-        let indices = applier
+        let output = applier
             .apply(
                 SearchContext {
                     index_not_found_strategy: IndexNotFoundStrategy::Ignore,
@@ -341,6 +405,24 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            output.matched_segment_ids,
+            bitvec![u8, Lsb0; 1, 1, 1, 1, 1, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn test_index_applier_memory_usage() {
+        let mut mock_fst_applier = MockFstApplier::new();
+        mock_fst_applier.expect_memory_usage().returning(|| 100);
+
+        let applier = PredicatesIndexApplier {
+            fst_appliers: vec![(s("tag-0"), Box::new(mock_fst_applier))],
+        };
+
+        assert_eq!(
+            applier.memory_usage(),
+            size_of::<(IndexName, Box<dyn FstApplier>)>() + 5 + 100
+        );
     }
 }

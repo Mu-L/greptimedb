@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![feature(lazy_cell)]
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
 
 pub mod ports;
+pub mod recordbatch;
 pub mod temp_dir;
 
 // Rust is working on an env possibly named `CARGO_WORKSPACE_DIR` to find the root path to the

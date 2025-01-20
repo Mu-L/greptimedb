@@ -31,6 +31,7 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use object_store::ObjectStore;
 use snafu::ResultExt;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::SyncIoBridge;
 
 use super::stream_to_file;
@@ -82,16 +83,25 @@ impl Default for JsonFormat {
 #[async_trait]
 impl FileFormat for JsonFormat {
     async fn infer_schema(&self, store: &ObjectStore, path: &str) -> Result<Schema> {
+        let meta = store
+            .stat(path)
+            .await
+            .context(error::ReadObjectSnafu { path })?;
+
         let reader = store
             .reader(path)
             .await
-            .context(error::ReadObjectSnafu { path })?;
+            .context(error::ReadObjectSnafu { path })?
+            .into_futures_async_read(0..meta.content_length())
+            .await
+            .context(error::ReadObjectSnafu { path })?
+            .compat();
 
         let decoded = self.compression_type.convert_async_read(reader);
 
         let schema_infer_max_record = self.schema_infer_max_record;
 
-        common_runtime::spawn_blocking_read(move || {
+        common_runtime::spawn_blocking_global(move || {
             let mut reader = BufReader::new(SyncIoBridge::new(decoded));
 
             let iter = ValueIter::new(&mut reader, schema_infer_max_record);
@@ -152,8 +162,9 @@ pub async fn stream_to_json(
     store: ObjectStore,
     path: &str,
     threshold: usize,
+    concurrency: usize,
 ) -> Result<usize> {
-    stream_to_file(stream, store, path, threshold, |buffer| {
+    stream_to_file(stream, store, path, threshold, concurrency, |buffer| {
         json::LineDelimitedWriter::new(buffer)
     })
     .await

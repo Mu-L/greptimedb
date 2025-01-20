@@ -207,7 +207,7 @@ pub struct PrimitiveIter<'a, T: LogicalPrimitiveType> {
     iter: ArrayIter<&'a PrimitiveArray<T::ArrowPrimitive>>,
 }
 
-impl<'a, T: LogicalPrimitiveType> Iterator for PrimitiveIter<'a, T> {
+impl<T: LogicalPrimitiveType> Iterator for PrimitiveIter<'_, T> {
     type Item = Option<T::Wrapper>;
 
     fn next(&mut self) -> Option<Option<T::Wrapper>> {
@@ -531,9 +531,9 @@ mod tests {
     #[test]
     fn test_memory_size() {
         let v = Int32Vector::from_slice((0..5).collect::<Vec<i32>>());
-        assert_eq!(64, v.memory_size());
+        assert_eq!(20, v.memory_size());
         let v = Int64Vector::from(vec![Some(0i64), Some(1i64), Some(2i64), None, None]);
-        assert_eq!(128, v.memory_size());
+        assert_eq!(144, v.memory_size());
     }
 
     #[test]

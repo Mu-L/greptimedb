@@ -12,9 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::mem::size_of;
+
 use fst::map::OpBuilder;
 use fst::{IntoStreamer, Streamer};
-use regex_automata::DenseDFA;
+use regex_automata::dfa::dense::DFA;
+use regex_automata::dfa::Automaton;
+use regex_automata::util::primitives::StateID;
+use regex_automata::util::start::Config;
+use regex_automata::Anchored;
 use snafu::{ensure, ResultExt};
 
 use crate::inverted_index::error::{
@@ -24,15 +30,59 @@ use crate::inverted_index::search::fst_apply::FstApplier;
 use crate::inverted_index::search::predicate::{Predicate, Range};
 use crate::inverted_index::FstMap;
 
-type Dfa = DenseDFA<Vec<usize>, usize>;
-
 /// `IntersectionFstApplier` applies intersection operations on an FstMap using specified ranges and regex patterns.
 pub struct IntersectionFstApplier {
     /// A list of `Range` which define inclusive or exclusive ranges for keys to be queried in the FstMap.
     ranges: Vec<Range>,
 
     /// A list of `Dfa` compiled from regular expression patterns.
-    dfas: Vec<Dfa>,
+    dfas: Vec<DfaFstAutomaton>,
+}
+
+#[derive(Debug)]
+struct DfaFstAutomaton(DFA<Vec<u32>>);
+
+impl fst::Automaton for DfaFstAutomaton {
+    type State = StateID;
+
+    #[inline]
+    fn start(&self) -> Self::State {
+        let config = Config::new().anchored(Anchored::No);
+        self.0.start_state(&config).unwrap()
+    }
+
+    #[inline]
+    fn is_match(&self, state: &Self::State) -> bool {
+        self.0.is_match_state(*state)
+    }
+
+    #[inline]
+    fn can_match(&self, state: &Self::State) -> bool {
+        !self.0.is_dead_state(*state)
+    }
+
+    #[inline]
+    fn accept_eof(&self, state: &StateID) -> Option<StateID> {
+        if self.0.is_match_state(*state) {
+            return Some(*state);
+        }
+        Some(self.0.next_eoi_state(*state))
+    }
+
+    #[inline]
+    fn accept(&self, state: &Self::State, byte: u8) -> Self::State {
+        if self.0.is_match_state(*state) {
+            return *state;
+        }
+        self.0.next_state(*state, byte)
+    }
+}
+
+impl IntersectionFstApplier {
+    fn new(ranges: Vec<Range>, dfas: Vec<DFA<Vec<u32>>>) -> Self {
+        let dfas = dfas.into_iter().map(DfaFstAutomaton).collect();
+        Self { ranges, dfas }
+    }
 }
 
 impl FstApplier for IntersectionFstApplier {
@@ -70,6 +120,26 @@ impl FstApplier for IntersectionFstApplier {
         }
         values
     }
+
+    fn memory_usage(&self) -> usize {
+        let mut size = self.ranges.capacity() * size_of::<Range>();
+        for range in &self.ranges {
+            size += range
+                .lower
+                .as_ref()
+                .map_or(0, |bound| bound.value.capacity());
+            size += range
+                .upper
+                .as_ref()
+                .map_or(0, |bound| bound.value.capacity());
+        }
+
+        size += self.dfas.capacity() * size_of::<DFA<Vec<u32>>>();
+        for dfa in &self.dfas {
+            size += dfa.0.memory_usage();
+        }
+        size
+    }
 }
 
 impl IntersectionFstApplier {
@@ -88,8 +158,8 @@ impl IntersectionFstApplier {
             match predicate {
                 Predicate::Range(range) => ranges.push(range.range),
                 Predicate::RegexMatch(regex) => {
-                    let dfa = DenseDFA::new(&regex.pattern);
-                    let dfa = dfa.context(ParseDFASnafu)?;
+                    let dfa = DFA::new(&regex.pattern);
+                    let dfa = dfa.map_err(Box::new).context(ParseDFASnafu)?;
                     dfas.push(dfa);
                 }
                 // Rejection of `InList` predicates is enforced here.
@@ -99,7 +169,7 @@ impl IntersectionFstApplier {
             }
         }
 
-        Ok(Self { dfas, ranges })
+        Ok(Self::new(ranges, dfas))
     }
 }
 
@@ -210,47 +280,67 @@ mod tests {
 
     #[test]
     fn test_intersection_fst_applier_with_valid_pattern() {
-        let test_fst = FstMap::from_iter([("aa", 1), ("bb", 2), ("cc", 3)]).unwrap();
+        let test_fst = FstMap::from_iter([("123", 1), ("abc", 2)]).unwrap();
 
-        let applier = create_applier_from_pattern("a.?").unwrap();
-        let results = applier.apply(&test_fst);
-        assert_eq!(results, vec![1]);
+        let cases = vec![
+            ("1", vec![1]),
+            ("2", vec![1]),
+            ("3", vec![1]),
+            ("^1", vec![1]),
+            ("^2", vec![]),
+            ("^3", vec![]),
+            ("^1.*", vec![1]),
+            ("^.*2", vec![1]),
+            ("^.*3", vec![1]),
+            ("1$", vec![]),
+            ("2$", vec![]),
+            ("3$", vec![1]),
+            ("1.*$", vec![1]),
+            ("2.*$", vec![1]),
+            ("3.*$", vec![1]),
+            ("^1..$", vec![1]),
+            ("^.2.$", vec![1]),
+            ("^..3$", vec![1]),
+            ("^[0-9]", vec![1]),
+            ("^[0-9]+$", vec![1]),
+            ("^[0-9][0-9]$", vec![]),
+            ("^[0-9][0-9][0-9]$", vec![1]),
+            ("^123$", vec![1]),
+            ("a", vec![2]),
+            ("b", vec![2]),
+            ("c", vec![2]),
+            ("^a", vec![2]),
+            ("^b", vec![]),
+            ("^c", vec![]),
+            ("^a.*", vec![2]),
+            ("^.*b", vec![2]),
+            ("^.*c", vec![2]),
+            ("a$", vec![]),
+            ("b$", vec![]),
+            ("c$", vec![2]),
+            ("a.*$", vec![2]),
+            ("b.*$", vec![2]),
+            ("c.*$", vec![2]),
+            ("^.[a-z]", vec![2]),
+            ("^abc$", vec![2]),
+            ("^ab$", vec![]),
+            ("abc$", vec![2]),
+            ("^a.c$", vec![2]),
+            ("^..c$", vec![2]),
+            ("ab", vec![2]),
+            (".*", vec![1, 2]),
+            ("", vec![1, 2]),
+            ("^$", vec![]),
+            ("1|a", vec![1, 2]),
+            ("^123$|^abc$", vec![1, 2]),
+            ("^123$|d", vec![1]),
+        ];
 
-        let applier = create_applier_from_pattern("b.?").unwrap();
-        let results = applier.apply(&test_fst);
-        assert_eq!(results, vec![2]);
-
-        let applier = create_applier_from_pattern("c.?").unwrap();
-        let results = applier.apply(&test_fst);
-        assert_eq!(results, vec![3]);
-
-        let applier = create_applier_from_pattern("a.*").unwrap();
-        let results = applier.apply(&test_fst);
-        assert_eq!(results, vec![1]);
-
-        let applier = create_applier_from_pattern("b.*").unwrap();
-        let results = applier.apply(&test_fst);
-        assert_eq!(results, vec![2]);
-
-        let applier = create_applier_from_pattern("c.*").unwrap();
-        let results = applier.apply(&test_fst);
-        assert_eq!(results, vec![3]);
-
-        let applier = create_applier_from_pattern("d.?").unwrap();
-        let results = applier.apply(&test_fst);
-        assert!(results.is_empty());
-
-        let applier = create_applier_from_pattern("a.?|b.?").unwrap();
-        let results = applier.apply(&test_fst);
-        assert_eq!(results, vec![1, 2]);
-
-        let applier = create_applier_from_pattern("d.?|a.?").unwrap();
-        let results = applier.apply(&test_fst);
-        assert_eq!(results, vec![1]);
-
-        let applier = create_applier_from_pattern(".*").unwrap();
-        let results = applier.apply(&test_fst);
-        assert_eq!(results, vec![1, 2, 3]);
+        for (pattern, expected) in cases {
+            let applier = create_applier_from_pattern(pattern).unwrap();
+            let results = applier.apply(&test_fst);
+            assert_eq!(results, expected);
+        }
     }
 
     #[test]
@@ -321,5 +411,33 @@ mod tests {
             result,
             Err(Error::IntersectionApplierWithInList { .. })
         ));
+    }
+
+    #[test]
+    fn test_intersection_fst_applier_memory_usage() {
+        let applier = IntersectionFstApplier::new(vec![], vec![]);
+
+        assert_eq!(applier.memory_usage(), 0);
+
+        let dfa = DFA::new("^abc$").unwrap();
+        assert_eq!(dfa.memory_usage(), 320);
+
+        let applier = IntersectionFstApplier::new(
+            vec![Range {
+                lower: Some(Bound {
+                    value: b"aa".to_vec(),
+                    inclusive: true,
+                }),
+                upper: Some(Bound {
+                    value: b"cc".to_vec(),
+                    inclusive: true,
+                }),
+            }],
+            vec![dfa],
+        );
+        assert_eq!(
+            applier.memory_usage(),
+            size_of::<Range>() + 4 + size_of::<DFA<Vec<u32>>>() + 320
+        );
     }
 }

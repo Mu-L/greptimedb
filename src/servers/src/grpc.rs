@@ -12,75 +12,130 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod authorize;
+pub mod builder;
+mod cancellation;
 mod database;
 pub mod flight;
 pub mod greptime_handler;
+mod otlp;
 pub mod prom_query_gateway;
 pub mod region_server;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
-use api::v1::greptime_database_server::GreptimeDatabaseServer;
 use api::v1::health_check_server::{HealthCheck, HealthCheckServer};
-use api::v1::prometheus_gateway_server::{PrometheusGateway, PrometheusGatewayServer};
-#[cfg(feature = "testing")]
-use api::v1::region::region_server::Region;
-use api::v1::region::region_server::RegionServer;
 use api::v1::{HealthCheckRequest, HealthCheckResponse};
-#[cfg(feature = "testing")]
-use arrow_flight::flight_service_server::FlightService;
-use arrow_flight::flight_service_server::FlightServiceServer;
 use async_trait::async_trait;
-use auth::UserProviderRef;
+use common_base::readable_size::ReadableSize;
 use common_grpc::channel_manager::{
     DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE, DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE,
 };
-use common_runtime::Runtime;
-use common_telemetry::logging::info;
-use common_telemetry::{error, warn};
+use common_telemetry::{error, info, warn};
 use futures::FutureExt;
+use serde::{Deserialize, Serialize};
 use snafu::{ensure, OptionExt, ResultExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot::{self, Receiver, Sender};
 use tokio::sync::Mutex;
-use tonic::transport::server::TcpIncoming;
+use tonic::transport::server::{Routes, TcpIncoming};
+use tonic::transport::ServerTlsConfig;
 use tonic::{Request, Response, Status};
 use tonic_reflection::server::{ServerReflection, ServerReflectionServer};
 
-use self::flight::{FlightCraftRef, FlightCraftWrapper};
-use self::prom_query_gateway::PrometheusGatewayService;
-use self::region_server::{RegionServerHandlerRef, RegionServerRequestHandler};
 use crate::error::{
     AlreadyStartedSnafu, InternalSnafu, Result, StartGrpcSnafu, TcpBindSnafu, TcpIncomingSnafu,
 };
-use crate::grpc::database::DatabaseService;
-use crate::grpc::greptime_handler::GreptimeRequestHandler;
-use crate::prometheus_handler::PrometheusHandlerRef;
-use crate::query_handler::grpc::ServerGrpcQueryHandlerRef;
+use crate::metrics::MetricsMiddlewareLayer;
 use crate::server::Server;
+use crate::tls::TlsOption;
 
 type TonicResult<T> = std::result::Result<T, Status>;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GrpcOptions {
+    pub addr: String,
+    pub hostname: String,
+    /// Max gRPC receiving(decoding) message size
+    pub max_recv_message_size: ReadableSize,
+    /// Max gRPC sending(encoding) message size
+    pub max_send_message_size: ReadableSize,
+    pub runtime_size: usize,
+    #[serde(default = "Default::default")]
+    pub tls: TlsOption,
+}
+
+impl GrpcOptions {
+    /// Detect hostname if `auto_hostname` is true.
+    #[cfg(not(target_os = "android"))]
+    pub fn detect_hostname(&mut self) {
+        if self.hostname.is_empty() {
+            match local_ip_address::local_ip() {
+                Ok(ip) => {
+                    let detected_addr = format!(
+                        "{}:{}",
+                        ip,
+                        self.addr
+                            .split(':')
+                            .nth(1)
+                            .unwrap_or(DEFAULT_GRPC_ADDR_PORT)
+                    );
+                    info!("Using detected: {} as server address", detected_addr);
+                    self.hostname = detected_addr;
+                }
+                Err(e) => {
+                    error!("Failed to detect local ip address: {}", e);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn detect_hostname(&mut self) {
+        if self.hostname.is_empty() {
+            common_telemetry::debug!("detect local IP is not supported on Android");
+        }
+    }
+}
+
+const DEFAULT_GRPC_ADDR_PORT: &str = "4001";
+
+impl Default for GrpcOptions {
+    fn default() -> Self {
+        Self {
+            addr: format!("127.0.0.1:{}", DEFAULT_GRPC_ADDR_PORT),
+            // If hostname is not set, the server will use the local ip address as the hostname.
+            hostname: String::new(),
+            max_recv_message_size: DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE,
+            max_send_message_size: DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE,
+            runtime_size: 8,
+            tls: TlsOption::default(),
+        }
+    }
+}
+
+impl GrpcOptions {
+    pub fn with_addr(mut self, addr: &str) -> Self {
+        self.addr = addr.to_string();
+        self
+    }
+
+    pub fn with_hostname(mut self, hostname: &str) -> Self {
+        self.hostname = hostname.to_string();
+        self
+    }
+}
+
 pub struct GrpcServer {
-    config: GrpcServerConfig,
     // states
     shutdown_tx: Mutex<Option<Sender<()>>>,
-    user_provider: Option<UserProviderRef>,
-
     /// gRPC serving state receiver. Only present if the gRPC server is started.
     /// Used to wait for the server to stop, performing the old blocking fashion.
     serve_state: Mutex<Option<Receiver<Result<()>>>>,
-
     // handlers
-    /// Handler for [DatabaseService] service.
-    database_handler: Option<GreptimeRequestHandler>,
-    /// Handler for Prometheus-compatible PromQL queries ([PrometheusGateway]). Only present for frontend server.
-    prometheus_handler: Option<PrometheusHandlerRef>,
-    /// Handler for [FlightService](arrow_flight::flight_service_server::FlightService).
-    flight_handler: Option<FlightCraftRef>,
-    /// Handler for [RegionServer].
-    region_server_handler: Option<RegionServerRequestHandler>,
+    routes: Mutex<Option<Routes>>,
+    // tls config
+    tls_config: Option<ServerTlsConfig>,
 }
 
 /// Grpc Server configuration
@@ -90,6 +145,7 @@ pub struct GrpcServerConfig {
     pub max_recv_message_size: usize,
     // Max gRPC sending(encoding) message size
     pub max_send_message_size: usize,
+    pub tls: TlsOption,
 }
 
 impl Default for GrpcServerConfig {
@@ -97,47 +153,12 @@ impl Default for GrpcServerConfig {
         Self {
             max_recv_message_size: DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE.as_bytes() as usize,
             max_send_message_size: DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE.as_bytes() as usize,
+            tls: TlsOption::default(),
         }
     }
 }
 
 impl GrpcServer {
-    pub fn new(
-        config: Option<GrpcServerConfig>,
-        query_handler: Option<ServerGrpcQueryHandlerRef>,
-        prometheus_handler: Option<PrometheusHandlerRef>,
-        flight_handler: Option<FlightCraftRef>,
-        region_server_handler: Option<RegionServerHandlerRef>,
-        user_provider: Option<UserProviderRef>,
-        runtime: Arc<Runtime>,
-    ) -> Self {
-        let database_handler = query_handler.map(|handler| {
-            GreptimeRequestHandler::new(handler, user_provider.clone(), runtime.clone())
-        });
-        let region_server_handler = region_server_handler
-            .map(|handler| RegionServerRequestHandler::new(handler, runtime.clone()));
-        Self {
-            config: config.unwrap_or_default(),
-            shutdown_tx: Mutex::new(None),
-            user_provider,
-            serve_state: Mutex::new(None),
-            database_handler,
-            prometheus_handler,
-            flight_handler,
-            region_server_handler,
-        }
-    }
-
-    #[cfg(feature = "testing")]
-    pub fn create_flight_service(&self) -> FlightServiceServer<impl FlightService> {
-        FlightServiceServer::new(FlightCraftWrapper(self.flight_handler.clone().unwrap()))
-    }
-
-    #[cfg(feature = "testing")]
-    pub fn create_region_service(&self) -> RegionServer<impl Region> {
-        RegionServer::new(self.region_server_handler.clone().unwrap())
-    }
-
     pub fn create_healthcheck_service(&self) -> HealthCheckServer<impl HealthCheck> {
         HealthCheckServer::new(HealthCheckHandler)
     }
@@ -150,16 +171,6 @@ impl GrpcServer {
             .with_service_name("greptime.v1.RegionServer")
             .build()
             .unwrap()
-    }
-
-    pub fn create_prom_query_gateway_service(
-        &self,
-        handler: PrometheusHandlerRef,
-    ) -> PrometheusGatewayServer<impl PrometheusGateway> {
-        PrometheusGatewayServer::new(PrometheusGatewayService::new(
-            handler,
-            self.user_provider.clone(),
-        ))
     }
 
     pub async fn wait_for_serve(&self) -> Result<()> {
@@ -208,8 +219,17 @@ impl Server for GrpcServer {
     }
 
     async fn start(&self, addr: SocketAddr) -> Result<SocketAddr> {
-        let max_recv_message_size = self.config.max_recv_message_size;
-        let max_send_message_size = self.config.max_send_message_size;
+        let routes = {
+            let mut routes = self.routes.lock().await;
+            let Some(routes) = routes.take() else {
+                return AlreadyStartedSnafu {
+                    server: self.name(),
+                }
+                .fail();
+            };
+            routes
+        };
+
         let (tx, rx) = oneshot::channel();
         let (incoming, addr) = {
             let mut shutdown_tx = self.shutdown_tx.lock().await;
@@ -231,49 +251,24 @@ impl Server for GrpcServer {
             (incoming, addr)
         };
 
-        let mut builder = tonic::transport::Server::builder()
+        let metrics_layer = tower::ServiceBuilder::new()
+            .layer(MetricsMiddlewareLayer)
+            .into_inner();
+
+        let mut builder = tonic::transport::Server::builder().layer(metrics_layer);
+        if let Some(tls_config) = self.tls_config.clone() {
+            builder = builder.tls_config(tls_config).context(StartGrpcSnafu)?;
+        }
+        let builder = builder
+            .add_routes(routes)
             .add_service(self.create_healthcheck_service())
             .add_service(self.create_reflection_service());
-        if let Some(database_handler) = &self.database_handler {
-            builder = builder.add_service(
-                GreptimeDatabaseServer::new(DatabaseService::new(database_handler.clone()))
-                    .max_decoding_message_size(max_recv_message_size)
-                    .max_encoding_message_size(max_send_message_size),
-            )
-        }
-        if let Some(prometheus_handler) = &self.prometheus_handler {
-            builder = builder
-                .add_service(self.create_prom_query_gateway_service(prometheus_handler.clone()))
-        }
-        if let Some(flight_handler) = &self.flight_handler {
-            builder = builder.add_service(
-                FlightServiceServer::new(FlightCraftWrapper(flight_handler.clone()))
-                    .max_decoding_message_size(max_recv_message_size)
-                    .max_encoding_message_size(max_send_message_size),
-            )
-        } else {
-            // TODO(ruihang): this is a temporary workaround before region server is ready.
-            builder = builder.add_service(
-                FlightServiceServer::new(FlightCraftWrapper(
-                    self.database_handler.clone().unwrap(),
-                ))
-                .max_decoding_message_size(max_recv_message_size)
-                .max_encoding_message_size(max_send_message_size),
-            )
-        }
-        if let Some(region_server_handler) = &self.region_server_handler {
-            builder = builder.add_service(
-                RegionServer::new(region_server_handler.clone())
-                    .max_decoding_message_size(max_recv_message_size)
-                    .max_encoding_message_size(max_send_message_size),
-            );
-        }
 
         let (serve_state_tx, serve_state_rx) = oneshot::channel();
         let mut serve_state = self.serve_state.lock().await;
         *serve_state = Some(serve_state_rx);
 
-        let _handle = common_runtime::spawn_bg(async move {
+        let _handle = common_runtime::spawn_global(async move {
             let result = builder
                 .serve_with_incoming_shutdown(incoming, rx.map(drop))
                 .await

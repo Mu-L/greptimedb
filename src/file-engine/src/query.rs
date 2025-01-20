@@ -21,10 +21,11 @@ use std::task::{Context, Poll};
 
 use common_datasource::object_store::build_backend;
 use common_error::ext::BoxedError;
-use common_query::prelude::Expr;
+use common_recordbatch::adapter::RecordBatchMetrics;
 use common_recordbatch::error::{CastVectorSnafu, ExternalSnafu, Result as RecordBatchResult};
-use common_recordbatch::{RecordBatch, RecordBatchStream, SendableRecordBatchStream};
+use common_recordbatch::{OrderOption, RecordBatch, RecordBatchStream, SendableRecordBatchStream};
 use datafusion::logical_expr::utils as df_logical_expr_utils;
+use datafusion_expr::expr::Expr;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::{ColumnSchema, Schema, SchemaRef};
 use datatypes::vectors::VectorRef;
@@ -112,7 +113,7 @@ impl FileRegion {
 
         let mut aux_column_set = HashSet::new();
         for scan_filter in scan_filters {
-            df_logical_expr_utils::expr_to_columns(scan_filter.df_expr(), &mut aux_column_set)
+            df_logical_expr_utils::expr_to_columns(scan_filter, &mut aux_column_set)
                 .context(ExtractColumnFromFilterSnafu)?;
 
             let all_file_columns = aux_column_set
@@ -150,6 +151,14 @@ struct FileToScanRegionStream {
 impl RecordBatchStream for FileToScanRegionStream {
     fn schema(&self) -> SchemaRef {
         self.scan_schema.clone()
+    }
+
+    fn output_ordering(&self) -> Option<&[OrderOption]> {
+        None
+    }
+
+    fn metrics(&self) -> Option<RecordBatchMetrics> {
+        None
     }
 }
 

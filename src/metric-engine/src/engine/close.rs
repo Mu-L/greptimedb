@@ -14,25 +14,16 @@
 
 //! Close a metric region
 
-use mito2::engine::MITO_ENGINE_NAME;
-use object_store::util::join_dir;
-use snafu::{OptionExt, ResultExt};
-use store_api::metric_engine_consts::{
-    DATA_REGION_SUBDIR, METADATA_REGION_SUBDIR, PHYSICAL_TABLE_METADATA_KEY,
-};
+use common_telemetry::debug;
+use snafu::ResultExt;
 use store_api::region_engine::RegionEngine;
-use store_api::region_request::{
-    AffectedRows, RegionCloseRequest, RegionOpenRequest, RegionRequest,
-};
+use store_api::region_request::{AffectedRows, RegionCloseRequest, RegionRequest};
 use store_api::storage::RegionId;
 
 use super::MetricEngineInner;
-use crate::error::{
-    CloseMitoRegionSnafu, Error, LogicalRegionNotFoundSnafu, OpenMitoRegionSnafu,
-    PhysicalRegionNotFoundSnafu, Result,
-};
+use crate::error::{CloseMitoRegionSnafu, Result};
 use crate::metrics::PHYSICAL_REGION_COUNT;
-use crate::{metadata_region, utils};
+use crate::utils;
 
 impl MetricEngineInner {
     pub async fn close_region(
@@ -44,27 +35,27 @@ impl MetricEngineInner {
         if self
             .state
             .read()
-            .await
-            .physical_regions()
-            .contains_key(&data_region_id)
+            .unwrap()
+            .exist_physical_region(data_region_id)
         {
             self.close_physical_region(data_region_id).await?;
             self.state
                 .write()
-                .await
+                .unwrap()
                 .remove_physical_region(data_region_id)?;
 
             Ok(0)
         } else if self
             .state
             .read()
-            .await
+            .unwrap()
             .logical_regions()
             .contains_key(&region_id)
         {
             Ok(0)
         } else {
-            Err(LogicalRegionNotFoundSnafu { region_id }.build())
+            debug!("Closing a non-existent logical region {}", region_id);
+            Ok(0)
         }
     }
 

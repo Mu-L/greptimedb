@@ -21,7 +21,7 @@ use crate::statements::insert::Insert;
 use crate::statements::statement::Statement;
 
 /// INSERT statement parser implementation
-impl<'a> ParserContext<'a> {
+impl ParserContext<'_> {
     pub(crate) fn parse_insert(&mut self) -> Result<Statement> {
         let _ = self.parser.next_token();
         let spstatement = self.parser.parse_insert().context(error::SyntaxSnafu)?;
@@ -31,7 +31,6 @@ impl<'a> ParserContext<'a> {
                 Ok(Statement::Insert(Box::new(Insert { inner: spstatement })))
             }
             unexp => error::UnsupportedSnafu {
-                sql: self.sql.to_string(),
                 keyword: unexp.to_string(),
             }
             .fail(),
@@ -45,6 +44,7 @@ mod tests {
 
     use super::*;
     use crate::dialect::GreptimeDbDialect;
+    use crate::parser::ParseOptions;
 
     #[test]
     pub fn test_parse_insert() {
@@ -52,7 +52,9 @@ mod tests {
             'test1',1,'true',
             'test2',2,'false')
          ";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).unwrap();
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
         assert_eq!(1, result.len());
         assert_matches!(result[0], Statement::Insert { .. })
     }
@@ -60,7 +62,8 @@ mod tests {
     #[test]
     pub fn test_parse_invalid_insert() {
         let sql = r"INSERT INTO table_1 VALUES ("; // intentionally a bad sql
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         assert!(result.is_err(), "result is: {result:?}");
     }
 }

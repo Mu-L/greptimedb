@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_meta::rpc::router::RegionStatus;
+use common_error::ext::BoxedError;
+use common_meta::rpc::router::LeaderState;
 use snafu::ResultExt;
 
 use crate::error::{self, Result};
@@ -32,8 +33,8 @@ impl UpdateMetadata {
     /// About the failure of updating the [TableRouteValue](common_meta::key::table_region::TableRegionValue):
     ///
     /// - There may be another [RegionMigrationProcedure](crate::procedure::region_migration::RegionMigrationProcedure)
-    /// that is executed concurrently for **other region**.
-    /// It will only update **other region** info. Therefore, It's safe to retry after failure.
+    ///   that is executed concurrently for **other region**.
+    ///   It will only update **other region** info. Therefore, It's safe to retry after failure.
     ///
     /// - There is no other DDL procedure executed concurrently for the current table.
     pub async fn downgrade_leader_region(&self, ctx: &mut Context) -> Result<()> {
@@ -52,7 +53,7 @@ impl UpdateMetadata {
                         .as_ref()
                         .is_some_and(|leader_peer| leader_peer.id == from_peer_id)
                 {
-                    Some(Some(RegionStatus::Downgraded))
+                    Some(Some(LeaderState::Downgrading))
                 } else {
                     None
                 }
@@ -60,13 +61,15 @@ impl UpdateMetadata {
             .await
             .context(error::TableMetadataManagerSnafu)
         {
-            debug_assert!(ctx.remove_table_route_value());
-            return error::RetryLaterSnafu {
-                reason: format!("Failed to update the table route during the downgrading leader region, error: {err}")
-            }.fail();
+            ctx.remove_table_route_value();
+            return Err(BoxedError::new(err)).context(error::RetryLaterWithSourceSnafu {
+                reason: format!(
+                    "Failed to update the table route during the downgrading leader region, region_id: {region_id}, from_peer_id: {from_peer_id}"
+                ),
+            });
         }
 
-        debug_assert!(ctx.remove_table_route_value());
+        ctx.remove_table_route_value();
 
         Ok(())
     }
@@ -78,7 +81,7 @@ mod tests {
 
     use common_meta::key::test_utils::new_test_table_info;
     use common_meta::peer::Peer;
-    use common_meta::rpc::router::{Region, RegionRoute, RegionStatus};
+    use common_meta::rpc::router::{LeaderState, Region, RegionRoute};
     use store_api::storage::RegionId;
 
     use crate::error::Error;
@@ -142,7 +145,8 @@ mod tests {
         let table_metadata_manager = env.table_metadata_manager();
         let original_table_route = table_metadata_manager
             .table_route_manager()
-            .get(table_id)
+            .table_route_storage()
+            .get_with_raw_bytes(table_id)
             .await
             .unwrap()
             .unwrap();
@@ -151,7 +155,7 @@ mod tests {
         table_metadata_manager
             .update_leader_region_status(table_id, &original_table_route, |route| {
                 if route.region.id == RegionId::new(1024, 2) {
-                    Some(Some(RegionStatus::Downgraded))
+                    Some(Some(LeaderState::Downgrading))
                 } else {
                     None
                 }
@@ -163,13 +167,9 @@ mod tests {
         ctx.volatile_ctx.table_route = Some(original_table_route);
 
         let err = state.downgrade_leader_region(&mut ctx).await.unwrap_err();
-
         assert!(ctx.volatile_ctx.table_route.is_none());
-
-        assert_matches!(err, Error::RetryLater { .. });
-
         assert!(err.is_retryable());
-        assert!(err.to_string().contains("Failed to update the table route"));
+        assert!(format!("{err:?}").contains("Failed to update the table route"));
     }
 
     #[tokio::test]
@@ -202,14 +202,15 @@ mod tests {
 
         let latest_table_route = table_metadata_manager
             .table_route_manager()
+            .table_route_storage()
             .get(table_id)
             .await
             .unwrap()
             .unwrap();
 
         // It should remain unchanged.
-        assert_eq!(latest_table_route.version(), 0);
-        assert!(!latest_table_route.region_routes()[0].is_leader_downgraded());
+        assert_eq!(latest_table_route.version().unwrap(), 0);
+        assert!(!latest_table_route.region_routes().unwrap()[0].is_leader_downgrading());
         assert!(ctx.volatile_ctx.table_route.is_none());
     }
 
@@ -244,12 +245,13 @@ mod tests {
 
         let latest_table_route = table_metadata_manager
             .table_route_manager()
+            .table_route_storage()
             .get(table_id)
             .await
             .unwrap()
             .unwrap();
 
-        assert!(latest_table_route.region_routes()[0].is_leader_downgraded());
+        assert!(latest_table_route.region_routes().unwrap()[0].is_leader_downgrading());
         assert!(ctx.volatile_ctx.table_route.is_none());
     }
 }

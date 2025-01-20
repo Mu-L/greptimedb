@@ -166,8 +166,9 @@ async fn test_parquet_exec() {
         .to_string();
     let base_config = scan_config(schema.clone(), None, path);
 
-    let exec = ParquetExec::new(base_config, None, None)
-        .with_parquet_file_reader_factory(Arc::new(DefaultParquetFileReaderFactory::new(store)));
+    let exec = ParquetExec::builder(base_config)
+        .with_parquet_file_reader_factory(Arc::new(DefaultParquetFileReaderFactory::new(store)))
+        .build();
 
     let ctx = SessionContext::new();
 

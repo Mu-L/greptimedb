@@ -15,70 +15,78 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, Bound, HashSet};
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use api::v1::OpType;
-use common_telemetry::{debug, error, trace};
+use common_recordbatch::filter::SimpleFilterEvaluator;
+use common_telemetry::{debug, error};
 use common_time::Timestamp;
-use datafusion::physical_plan::PhysicalExpr;
-use datafusion_common::ScalarValue;
-use datafusion_expr::ColumnarValue;
 use datatypes::arrow;
-use datatypes::arrow::array::{ArrayRef, BooleanArray};
-use datatypes::arrow::record_batch::RecordBatch;
-use datatypes::data_type::DataType;
+use datatypes::arrow::array::ArrayRef;
+use datatypes::data_type::{ConcreteDataType, DataType};
 use datatypes::prelude::{MutableVector, ScalarVectorBuilder, Vector, VectorRef};
-use datatypes::value::ValueRef;
+use datatypes::value::{Value, ValueRef};
 use datatypes::vectors::{
     Helper, UInt64Vector, UInt64VectorBuilder, UInt8Vector, UInt8VectorBuilder,
 };
 use snafu::{ensure, ResultExt};
 use store_api::metadata::RegionMetadataRef;
-use store_api::storage::ColumnId;
+use store_api::storage::{ColumnId, SequenceNumber};
 use table::predicate::Predicate;
 
 use crate::error::{
-    ComputeArrowSnafu, ConvertVectorSnafu, NewRecordBatchSnafu, PrimaryKeyLengthMismatchSnafu,
-    Result,
+    ComputeArrowSnafu, ConvertVectorSnafu, PrimaryKeyLengthMismatchSnafu, Result,
+    UnsupportedOperationSnafu,
 };
 use crate::flush::WriteBufferManagerRef;
+use crate::memtable::key_values::KeyValue;
+use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
-    AllocTracker, BoxedBatchIterator, KeyValues, Memtable, MemtableBuilder, MemtableId,
-    MemtableRef, MemtableStats,
+    AllocTracker, BoxedBatchIterator, BulkPart, IterBuilder, KeyValues, Memtable, MemtableBuilder,
+    MemtableId, MemtableRange, MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats,
 };
 use crate::metrics::{READ_ROWS_TOTAL, READ_STAGE_ELAPSED};
+use crate::read::dedup::LastNonNullIter;
 use crate::read::{Batch, BatchBuilder, BatchColumn};
-use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
+use crate::region::options::MergeMode;
+use crate::row_converter::{DensePrimaryKeyCodec, PrimaryKeyCodec, PrimaryKeyCodecExt};
 
 /// Initial vector builder capacity.
-const INITIAL_BUILDER_CAPACITY: usize = 32;
+const INITIAL_BUILDER_CAPACITY: usize = 0;
 
 /// Builder to build [TimeSeriesMemtable].
 #[derive(Debug, Default)]
 pub struct TimeSeriesMemtableBuilder {
-    id: AtomicU32,
     write_buffer_manager: Option<WriteBufferManagerRef>,
+    dedup: bool,
+    merge_mode: MergeMode,
 }
 
 impl TimeSeriesMemtableBuilder {
     /// Creates a new builder with specific `write_buffer_manager`.
-    pub fn new(write_buffer_manager: Option<WriteBufferManagerRef>) -> Self {
+    pub fn new(
+        write_buffer_manager: Option<WriteBufferManagerRef>,
+        dedup: bool,
+        merge_mode: MergeMode,
+    ) -> Self {
         Self {
-            id: AtomicU32::new(0),
             write_buffer_manager,
+            dedup,
+            merge_mode,
         }
     }
 }
 
 impl MemtableBuilder for TimeSeriesMemtableBuilder {
-    fn build(&self, metadata: &RegionMetadataRef) -> MemtableRef {
-        let id = self.id.fetch_add(1, Ordering::Relaxed);
+    fn build(&self, id: MemtableId, metadata: &RegionMetadataRef) -> MemtableRef {
         Arc::new(TimeSeriesMemtable::new(
             metadata.clone(),
             id,
             self.write_buffer_manager.clone(),
+            self.dedup,
+            self.merge_mode,
         ))
     }
 }
@@ -87,11 +95,16 @@ impl MemtableBuilder for TimeSeriesMemtableBuilder {
 pub struct TimeSeriesMemtable {
     id: MemtableId,
     region_metadata: RegionMetadataRef,
-    row_codec: Arc<McmpRowCodec>,
+    row_codec: Arc<DensePrimaryKeyCodec>,
     series_set: SeriesSet,
     alloc_tracker: AllocTracker,
     max_timestamp: AtomicI64,
     min_timestamp: AtomicI64,
+    max_sequence: AtomicU64,
+    dedup: bool,
+    merge_mode: MergeMode,
+    /// Total written rows in memtable. This also includes deleted and duplicated rows.
+    num_rows: AtomicUsize,
 }
 
 impl TimeSeriesMemtable {
@@ -99,14 +112,16 @@ impl TimeSeriesMemtable {
         region_metadata: RegionMetadataRef,
         id: MemtableId,
         write_buffer_manager: Option<WriteBufferManagerRef>,
+        dedup: bool,
+        merge_mode: MergeMode,
     ) -> Self {
-        let row_codec = Arc::new(McmpRowCodec::new(
-            region_metadata
-                .primary_key_columns()
-                .map(|c| SortField::new(c.column_schema.data_type.clone()))
-                .collect(),
-        ));
+        let row_codec = Arc::new(DensePrimaryKeyCodec::new(&region_metadata));
         let series_set = SeriesSet::new(region_metadata.clone(), row_codec.clone());
+        let dedup = if merge_mode == MergeMode::LastNonNull {
+            false
+        } else {
+            dedup
+        };
         Self {
             id,
             region_metadata,
@@ -115,52 +130,44 @@ impl TimeSeriesMemtable {
             alloc_tracker: AllocTracker::new(write_buffer_manager),
             max_timestamp: AtomicI64::new(i64::MIN),
             min_timestamp: AtomicI64::new(i64::MAX),
+            max_sequence: AtomicU64::new(0),
+            dedup,
+            merge_mode,
+            num_rows: Default::default(),
         }
     }
 
     /// Updates memtable stats.
-    fn update_stats(&self, request_size: usize, min: i64, max: i64) {
-        self.alloc_tracker.on_allocation(request_size);
+    fn update_stats(&self, stats: WriteMetrics) {
+        self.alloc_tracker
+            .on_allocation(stats.key_bytes + stats.value_bytes);
+        stats.update_timestamp_range(&self.max_timestamp, &self.min_timestamp);
+    }
 
-        loop {
-            let current_min = self.min_timestamp.load(Ordering::Relaxed);
-            if min >= current_min {
-                break;
+    fn write_key_value(&self, kv: KeyValue, stats: &mut WriteMetrics) -> Result<()> {
+        ensure!(
+            kv.num_primary_keys() == self.row_codec.num_fields(),
+            PrimaryKeyLengthMismatchSnafu {
+                expect: self.row_codec.num_fields(),
+                actual: kv.num_primary_keys()
             }
+        );
+        let primary_key_encoded = self.row_codec.encode(kv.primary_keys())?;
+        let fields = kv.fields().collect::<Vec<_>>();
 
-            let Err(updated) = self.min_timestamp.compare_exchange(
-                current_min,
-                min,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) else {
-                break;
-            };
+        stats.value_bytes += fields.iter().map(|v| v.data_size()).sum::<usize>();
+        let (series, series_allocated) = self.series_set.get_or_add_series(primary_key_encoded);
+        stats.key_bytes += series_allocated;
 
-            if updated == min {
-                break;
-            }
-        }
+        // safety: timestamp of kv must be both present and a valid timestamp value.
+        let ts = kv.timestamp().as_timestamp().unwrap().unwrap().value();
+        stats.min_ts = stats.min_ts.min(ts);
+        stats.max_ts = stats.max_ts.max(ts);
 
-        loop {
-            let current_max = self.max_timestamp.load(Ordering::Relaxed);
-            if max <= current_max {
-                break;
-            }
+        let mut guard = series.write().unwrap();
+        guard.push(kv.timestamp(), kv.sequence(), kv.op_type(), fields);
 
-            let Err(updated) = self.max_timestamp.compare_exchange(
-                current_max,
-                max,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) else {
-                break;
-            };
-
-            if updated == max {
-                break;
-            }
-        }
+        Ok(())
     }
 }
 
@@ -176,48 +183,61 @@ impl Memtable for TimeSeriesMemtable {
     }
 
     fn write(&self, kvs: &KeyValues) -> Result<()> {
-        let mut allocated = 0;
-        let mut min_ts = i64::MAX;
-        let mut max_ts = i64::MIN;
+        if kvs.is_empty() {
+            return Ok(());
+        }
+
+        let mut local_stats = WriteMetrics::default();
 
         for kv in kvs.iter() {
-            ensure!(
-                kv.num_primary_keys() == self.row_codec.num_fields(),
-                PrimaryKeyLengthMismatchSnafu {
-                    expect: self.row_codec.num_fields(),
-                    actual: kv.num_primary_keys()
-                }
-            );
-            let primary_key_encoded = self.row_codec.encode(kv.primary_keys())?;
-            let fields = kv.fields().collect::<Vec<_>>();
-
-            allocated += fields.iter().map(|v| v.data_size()).sum::<usize>();
-            let (series, series_allocated) = self.series_set.get_or_add_series(primary_key_encoded);
-            allocated += series_allocated;
-
-            // safety: timestamp of kv must be both present and a valid timestamp value.
-            let ts = kv.timestamp().as_timestamp().unwrap().unwrap().value();
-            min_ts = min_ts.min(ts);
-            max_ts = max_ts.max(ts);
-
-            let mut guard = series.write().unwrap();
-            guard.push(kv.timestamp(), kv.sequence(), kv.op_type(), fields);
+            self.write_key_value(kv, &mut local_stats)?;
         }
-        allocated += kvs.num_rows() * std::mem::size_of::<Timestamp>();
-        allocated += kvs.num_rows() * std::mem::size_of::<OpType>();
+        local_stats.value_bytes += kvs.num_rows() * std::mem::size_of::<Timestamp>();
+        local_stats.value_bytes += kvs.num_rows() * std::mem::size_of::<OpType>();
 
         // TODO(hl): this maybe inaccurate since for-iteration may return early.
         // We may lift the primary key length check out of Memtable::write
         // so that we can ensure writing to memtable will succeed.
-        self.update_stats(allocated, min_ts, max_ts);
+        self.update_stats(local_stats);
+
+        // update max_sequence
+        let sequence = kvs.max_sequence();
+        self.max_sequence.fetch_max(sequence, Ordering::Relaxed);
+
+        self.num_rows.fetch_add(kvs.num_rows(), Ordering::Relaxed);
         Ok(())
+    }
+
+    fn write_one(&self, key_value: KeyValue) -> Result<()> {
+        let mut metrics = WriteMetrics::default();
+        let res = self.write_key_value(key_value, &mut metrics);
+        metrics.value_bytes += std::mem::size_of::<Timestamp>() + std::mem::size_of::<OpType>();
+
+        self.update_stats(metrics);
+
+        // update max_sequence
+        if res.is_ok() {
+            self.max_sequence
+                .fetch_max(key_value.sequence(), Ordering::Relaxed);
+        }
+
+        self.num_rows.fetch_add(1, Ordering::Relaxed);
+        res
+    }
+
+    fn write_bulk(&self, _part: BulkPart) -> Result<()> {
+        UnsupportedOperationSnafu {
+            err_msg: "TimeSeriesMemtable does not support write_bulk",
+        }
+        .fail()
     }
 
     fn iter(
         &self,
         projection: Option<&[ColumnId]>,
         filters: Option<Predicate>,
-    ) -> BoxedBatchIterator {
+        sequence: Option<SequenceNumber>,
+    ) -> Result<BoxedBatchIterator> {
         let projection = if let Some(projection) = projection {
             projection.iter().copied().collect()
         } else {
@@ -227,15 +247,56 @@ impl Memtable for TimeSeriesMemtable {
                 .collect()
         };
 
-        Box::new(self.series_set.iter_series(projection, filters))
+        let iter = self
+            .series_set
+            .iter_series(projection, filters, self.dedup, sequence)?;
+
+        if self.merge_mode == MergeMode::LastNonNull {
+            let iter = LastNonNullIter::new(iter);
+            Ok(Box::new(iter))
+        } else {
+            Ok(Box::new(iter))
+        }
+    }
+
+    fn ranges(
+        &self,
+        projection: Option<&[ColumnId]>,
+        predicate: Option<Predicate>,
+        sequence: Option<SequenceNumber>,
+    ) -> MemtableRanges {
+        let projection = if let Some(projection) = projection {
+            projection.iter().copied().collect()
+        } else {
+            self.region_metadata
+                .field_columns()
+                .map(|c| c.column_id)
+                .collect()
+        };
+        let builder = Box::new(TimeSeriesIterBuilder {
+            series_set: self.series_set.clone(),
+            projection,
+            predicate,
+            dedup: self.dedup,
+            merge_mode: self.merge_mode,
+            sequence,
+        });
+        let context = Arc::new(MemtableRangeContext::new(self.id, builder));
+
+        MemtableRanges {
+            ranges: [(0, MemtableRange::new(context))].into(),
+            stats: self.stats(),
+        }
     }
 
     fn is_empty(&self) -> bool {
         self.series_set.series.read().unwrap().is_empty()
     }
 
-    fn mark_immutable(&self) {
+    fn freeze(&self) -> Result<()> {
         self.alloc_tracker.done_allocating();
+
+        Ok(())
     }
 
     fn stats(&self) -> MemtableStats {
@@ -246,6 +307,9 @@ impl Memtable for TimeSeriesMemtable {
             return MemtableStats {
                 estimated_bytes,
                 time_range: None,
+                num_rows: 0,
+                num_ranges: 0,
+                max_sequence: 0,
             };
         }
         let ts_type = self
@@ -261,20 +325,34 @@ impl Memtable for TimeSeriesMemtable {
         MemtableStats {
             estimated_bytes,
             time_range: Some((min_timestamp, max_timestamp)),
+            num_rows: self.num_rows.load(Ordering::Relaxed),
+            num_ranges: 1,
+            max_sequence: self.max_sequence.load(Ordering::Relaxed),
         }
+    }
+
+    fn fork(&self, id: MemtableId, metadata: &RegionMetadataRef) -> MemtableRef {
+        Arc::new(TimeSeriesMemtable::new(
+            metadata.clone(),
+            id,
+            self.alloc_tracker.write_buffer_manager(),
+            self.dedup,
+            self.merge_mode,
+        ))
     }
 }
 
 type SeriesRwLockMap = RwLock<BTreeMap<Vec<u8>, Arc<RwLock<Series>>>>;
 
+#[derive(Clone)]
 struct SeriesSet {
     region_metadata: RegionMetadataRef,
     series: Arc<SeriesRwLockMap>,
-    codec: Arc<McmpRowCodec>,
+    codec: Arc<DensePrimaryKeyCodec>,
 }
 
 impl SeriesSet {
-    fn new(region_metadata: RegionMetadataRef, codec: Arc<McmpRowCodec>) -> Self {
+    fn new(region_metadata: RegionMetadataRef, codec: Arc<DensePrimaryKeyCodec>) -> Self {
         Self {
             region_metadata,
             series: Default::default(),
@@ -304,49 +382,50 @@ impl SeriesSet {
     }
 
     /// Iterates all series in [SeriesSet].
-    fn iter_series(&self, projection: HashSet<ColumnId>, predicate: Option<Predicate>) -> Iter {
-        let (primary_key_builders, primary_key_schema) =
-            primary_key_builders(&self.region_metadata, 1);
+    fn iter_series(
+        &self,
+        projection: HashSet<ColumnId>,
+        predicate: Option<Predicate>,
+        dedup: bool,
+        sequence: Option<SequenceNumber>,
+    ) -> Result<Iter> {
+        let primary_key_schema = primary_key_schema(&self.region_metadata);
+        let primary_key_datatypes = self
+            .region_metadata
+            .primary_key_columns()
+            .map(|pk| pk.column_schema.data_type.clone())
+            .collect();
 
-        let physical_exprs: Vec<_> = predicate
-            .and_then(|p| p.to_physical_exprs(&primary_key_schema).ok())
-            .unwrap_or_default();
-
-        Iter {
-            metadata: self.region_metadata.clone(),
-            series: self.series.clone(),
+        Iter::try_new(
+            self.region_metadata.clone(),
+            self.series.clone(),
             projection,
-            last_key: None,
-            predicate: physical_exprs,
-            pk_schema: primary_key_schema,
-            primary_key_builders,
-            codec: self.codec.clone(),
-            metrics: Metrics::default(),
-        }
+            predicate,
+            primary_key_schema,
+            primary_key_datatypes,
+            self.codec.clone(),
+            dedup,
+            sequence,
+        )
     }
 }
 
-/// Creates primary key array builders and arrow's schema for primary keys of given region schema.
-fn primary_key_builders(
+/// Creates an arrow [SchemaRef](arrow::datatypes::SchemaRef) that only contains primary keys
+/// of given region schema
+pub(crate) fn primary_key_schema(
     region_metadata: &RegionMetadataRef,
-    num_pk_rows: usize,
-) -> (Vec<Box<dyn MutableVector>>, arrow::datatypes::SchemaRef) {
-    let (builders, fields): (_, Vec<_>) = region_metadata
+) -> arrow::datatypes::SchemaRef {
+    let fields = region_metadata
         .primary_key_columns()
         .map(|pk| {
-            (
-                pk.column_schema
-                    .data_type
-                    .create_mutable_vector(num_pk_rows),
-                arrow::datatypes::Field::new(
-                    pk.column_schema.name.clone(),
-                    pk.column_schema.data_type.as_arrow_type(),
-                    pk.column_schema.is_nullable(),
-                ),
+            arrow::datatypes::Field::new(
+                pk.column_schema.name.clone(),
+                pk.column_schema.data_type.as_arrow_type(),
+                pk.column_schema.is_nullable(),
             )
         })
-        .unzip();
-    (builders, Arc::new(arrow::datatypes::Schema::new(fields)))
+        .collect::<Vec<_>>();
+    Arc::new(arrow::datatypes::Schema::new(fields))
 }
 
 /// Metrics for reading the memtable.
@@ -369,11 +448,51 @@ struct Iter {
     series: Arc<SeriesRwLockMap>,
     projection: HashSet<ColumnId>,
     last_key: Option<Vec<u8>>,
-    predicate: Vec<Arc<dyn PhysicalExpr>>,
+    predicate: Vec<SimpleFilterEvaluator>,
     pk_schema: arrow::datatypes::SchemaRef,
-    primary_key_builders: Vec<Box<dyn MutableVector>>,
-    codec: Arc<McmpRowCodec>,
+    pk_datatypes: Vec<ConcreteDataType>,
+    codec: Arc<DensePrimaryKeyCodec>,
+    dedup: bool,
+    sequence: Option<SequenceNumber>,
     metrics: Metrics,
+}
+
+impl Iter {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        metadata: RegionMetadataRef,
+        series: Arc<SeriesRwLockMap>,
+        projection: HashSet<ColumnId>,
+        predicate: Option<Predicate>,
+        pk_schema: arrow::datatypes::SchemaRef,
+        pk_datatypes: Vec<ConcreteDataType>,
+        codec: Arc<DensePrimaryKeyCodec>,
+        dedup: bool,
+        sequence: Option<SequenceNumber>,
+    ) -> Result<Self> {
+        let predicate = predicate
+            .map(|predicate| {
+                predicate
+                    .exprs()
+                    .iter()
+                    .filter_map(SimpleFilterEvaluator::try_new)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            metadata,
+            series,
+            projection,
+            last_key: None,
+            predicate,
+            pk_schema,
+            pk_datatypes,
+            codec,
+            dedup,
+            sequence,
+            metrics: Metrics::default(),
+        })
+    }
 }
 
 impl Drop for Iter {
@@ -415,7 +534,7 @@ impl Iterator for Iter {
                     &self.codec,
                     primary_key.as_slice(),
                     &mut series,
-                    &mut self.primary_key_builders,
+                    &self.pk_datatypes,
                     self.pk_schema.clone(),
                     &self.predicate,
                 )
@@ -427,13 +546,20 @@ impl Iterator for Iter {
             self.last_key = Some(primary_key.clone());
 
             let values = series.compact(&self.metadata);
-            let batch =
-                values.and_then(|v| v.to_batch(primary_key, &self.metadata, &self.projection));
+            let batch = values.and_then(|v| {
+                v.to_batch(primary_key, &self.metadata, &self.projection, self.dedup)
+            });
 
             // Update metrics.
             self.metrics.num_batches += 1;
             self.metrics.num_rows += batch.as_ref().map(|b| b.num_rows()).unwrap_or(0);
             self.metrics.scan_cost += start.elapsed();
+
+            let mut batch = batch;
+            batch = batch.and_then(|mut batch| {
+                batch.filter_by_sequence(self.sequence)?;
+                Ok(batch)
+            });
             return Some(batch);
         }
         self.metrics.scan_cost += start.elapsed();
@@ -443,91 +569,51 @@ impl Iterator for Iter {
 }
 
 fn prune_primary_key(
-    codec: &Arc<McmpRowCodec>,
+    codec: &Arc<DensePrimaryKeyCodec>,
     pk: &[u8],
     series: &mut Series,
-    builders: &mut [Box<dyn MutableVector>],
+    datatypes: &[ConcreteDataType],
     pk_schema: arrow::datatypes::SchemaRef,
-    predicate: &[Arc<dyn PhysicalExpr>],
+    predicates: &[SimpleFilterEvaluator],
 ) -> bool {
     // no primary key, we simply return true.
     if pk_schema.fields().is_empty() {
         return true;
     }
 
-    if let Some(rb) = series.pk_cache.as_ref() {
-        prune_inner(predicate, rb).unwrap_or(true)
+    // retrieve primary key values from cache or decode from bytes.
+    let pk_values = if let Some(pk_values) = series.pk_cache.as_ref() {
+        pk_values
     } else {
-        let rb = match pk_to_record_batch(codec, pk, builders, pk_schema) {
-            Ok(rb) => rb,
-            Err(e) => {
-                error!(e; "Failed to build record batch from primary keys");
-                return true;
-            }
-        };
-        let res = prune_inner(predicate, &rb).unwrap_or(true);
-        series.update_pk_cache(rb);
-        res
-    }
-}
+        let pk_values = codec.decode(pk);
+        if let Err(e) = pk_values {
+            error!(e; "Failed to decode primary key");
+            return true;
+        }
+        series.update_pk_cache(pk_values.unwrap());
+        series.pk_cache.as_ref().unwrap()
+    };
 
-fn prune_inner(predicates: &[Arc<dyn PhysicalExpr>], primary_key: &RecordBatch) -> Result<bool> {
-    for expr in predicates {
-        // evaluate every filter against primary key
-        let Ok(eva) = expr.evaluate(primary_key) else {
+    // evaluate predicates against primary key values
+    let mut result = true;
+    for predicate in predicates {
+        // ignore predicates that are not referencing primary key columns
+        let Ok(index) = pk_schema.index_of(predicate.column_name()) else {
             continue;
         };
-        let result = match eva {
-            ColumnarValue::Array(array) => {
-                let predicate_array = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-                predicate_array
-                    .into_iter()
-                    .map(|x| x.unwrap_or(true))
-                    .next()
-                    .unwrap_or(true)
-            }
-            // result was a column
-            ColumnarValue::Scalar(ScalarValue::Boolean(v)) => v.unwrap_or(true),
-            _ => {
-                unreachable!("Unexpected primary key record batch evaluation result: {:?}, primary key: {:?}", eva, primary_key);
-            }
-        };
-        trace!(
-            "Evaluate primary key {:?} against filter: {:?}, result: {:?}",
-            primary_key,
-            expr,
-            result
-        );
-        if !result {
-            return Ok(false);
-        }
+        // Safety: arrow schema and datatypes are constructed from the same source.
+        let scalar_value = pk_values[index]
+            .try_to_scalar_value(&datatypes[index])
+            .unwrap();
+        result &= predicate.evaluate_scalar(&scalar_value).unwrap_or(true);
     }
-    Ok(true)
-}
 
-fn pk_to_record_batch(
-    codec: &Arc<McmpRowCodec>,
-    bytes: &[u8],
-    builders: &mut [Box<dyn MutableVector>],
-    pk_schema: arrow::datatypes::SchemaRef,
-) -> Result<RecordBatch> {
-    let pk_values = codec.decode(bytes).unwrap();
-
-    let arrays = builders
-        .iter_mut()
-        .zip(pk_values.iter())
-        .map(|(builder, pk_value)| {
-            builder.push_value_ref(pk_value.as_value_ref());
-            builder.to_vector().to_arrow_array()
-        })
-        .collect();
-
-    RecordBatch::try_new(pk_schema, arrays).context(NewRecordBatchSnafu)
+    result
 }
 
 /// A `Series` holds a list of field values of some given primary key.
 struct Series {
-    pk_cache: Option<RecordBatch>,
+    pk_cache: Option<Vec<Value>>,
     active: ValueBuilder,
     frozen: Vec<Values>,
 }
@@ -546,8 +632,8 @@ impl Series {
         self.active.push(ts, sequence, op_type as u8, values);
     }
 
-    fn update_pk_cache(&mut self, pk_batch: RecordBatch) {
-        self.pk_cache = Some(pk_batch);
+    fn update_pk_cache(&mut self, pk_values: Vec<Value>) {
+        self.pk_cache = Some(pk_values);
     }
 
     /// Freezes the active part and push it to `frozen`.
@@ -607,7 +693,8 @@ struct ValueBuilder {
     timestamp: Box<dyn MutableVector>,
     sequence: UInt64VectorBuilder,
     op_type: UInt8VectorBuilder,
-    fields: Vec<Box<dyn MutableVector>>,
+    fields: Vec<Option<Box<dyn MutableVector>>>,
+    field_types: Vec<ConcreteDataType>,
 }
 
 impl ValueBuilder {
@@ -620,16 +707,18 @@ impl ValueBuilder {
         let sequence = UInt64VectorBuilder::with_capacity(capacity);
         let op_type = UInt8VectorBuilder::with_capacity(capacity);
 
-        let fields = region_metadata
+        let field_types = region_metadata
             .field_columns()
-            .map(|c| c.column_schema.data_type.create_mutable_vector(capacity))
-            .collect();
+            .map(|c| c.column_schema.data_type.clone())
+            .collect::<Vec<_>>();
+        let fields = (0..field_types.len()).map(|_| None).collect();
 
         Self {
             timestamp,
             sequence,
             op_type,
             fields,
+            field_types,
         }
     }
 
@@ -640,8 +729,20 @@ impl ValueBuilder {
         self.timestamp.push_value_ref(ts);
         self.sequence.push_value_ref(ValueRef::UInt64(sequence));
         self.op_type.push_value_ref(ValueRef::UInt8(op_type));
+        let num_rows = self.timestamp.len();
         for (idx, field_value) in fields.into_iter().enumerate() {
-            self.fields[idx].push_value_ref(field_value);
+            if !field_value.is_null() || self.fields[idx].is_some() {
+                self.fields[idx]
+                    .get_or_insert_with(|| {
+                        // lazy initialize on first non-null value
+                        let mut mutable_vector =
+                            self.field_types[idx].create_mutable_vector(num_rows);
+                        // fill previous rows with nulls
+                        mutable_vector.push_nulls(num_rows - 1);
+                        mutable_vector
+                    })
+                    .push_value_ref(field_value);
+            }
         }
     }
 
@@ -671,6 +772,7 @@ impl Values {
         primary_key: &[u8],
         metadata: &RegionMetadataRef,
         projection: &HashSet<ColumnId>,
+        dedup: bool,
     ) -> Result<Batch> {
         let builder = BatchBuilder::with_required_columns(
             primary_key.to_vec(),
@@ -691,7 +793,7 @@ impl Values {
             .collect();
 
         let mut batch = builder.with_fields(fields).build()?;
-        batch.sort_and_dedup()?;
+        batch.sort(dedup)?;
         Ok(batch)
     }
 
@@ -726,10 +828,20 @@ impl Values {
 
 impl From<ValueBuilder> for Values {
     fn from(mut value: ValueBuilder) -> Self {
+        let num_rows = value.len();
         let fields = value
             .fields
             .iter_mut()
-            .map(|v| v.to_vector())
+            .enumerate()
+            .map(|(i, v)| {
+                if let Some(v) = v {
+                    v.to_vector()
+                } else {
+                    let mut single_null = value.field_types[i].create_mutable_vector(num_rows);
+                    single_null.push_nulls(num_rows);
+                    single_null.to_vector()
+                }
+            })
             .collect::<Vec<_>>();
         let sequence = Arc::new(value.sequence.finish());
         let op_type = Arc::new(value.op_type.finish());
@@ -752,9 +864,36 @@ impl From<ValueBuilder> for Values {
     }
 }
 
+struct TimeSeriesIterBuilder {
+    series_set: SeriesSet,
+    projection: HashSet<ColumnId>,
+    predicate: Option<Predicate>,
+    dedup: bool,
+    sequence: Option<SequenceNumber>,
+    merge_mode: MergeMode,
+}
+
+impl IterBuilder for TimeSeriesIterBuilder {
+    fn build(&self) -> Result<BoxedBatchIterator> {
+        let iter = self.series_set.iter_series(
+            self.projection.clone(),
+            self.predicate.clone(),
+            self.dedup,
+            self.sequence,
+        )?;
+
+        if self.merge_mode == MergeMode::LastNonNull {
+            let iter = LastNonNullIter::new(iter);
+            Ok(Box::new(iter))
+        } else {
+            Ok(Box::new(iter))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use api::helper::ColumnDataTypeWrapper;
     use api::v1::value::ValueData;
@@ -768,6 +907,7 @@ mod tests {
     use store_api::storage::RegionId;
 
     use super::*;
+    use crate::row_converter::SortField;
 
     fn schema_for_test() -> RegionMetadataRef {
         let mut builder = RegionMetadataBuilder::new(RegionId::new(123, 456));
@@ -863,6 +1003,41 @@ mod tests {
         assert_eq!(1, series.frozen.len());
     }
 
+    #[test]
+    fn test_series_with_nulls() {
+        let region_metadata = schema_for_test();
+        let mut series = Series::new(&region_metadata);
+        // col1: NULL 1 2 3
+        // col2: NULL NULL 10.2 NULL
+        series.push(
+            ts_value_ref(1),
+            0,
+            OpType::Put,
+            vec![ValueRef::Null, ValueRef::Null],
+        );
+        series.push(
+            ts_value_ref(1),
+            0,
+            OpType::Put,
+            vec![ValueRef::Int64(1), ValueRef::Null],
+        );
+        series.push(ts_value_ref(1), 2, OpType::Put, field_value_ref(2, 10.2));
+        series.push(
+            ts_value_ref(1),
+            3,
+            OpType::Put,
+            vec![ValueRef::Int64(2), ValueRef::Null],
+        );
+        assert_eq!(4, series.active.timestamp.len());
+        assert_eq!(0, series.frozen.len());
+
+        let values = series.compact(&region_metadata).unwrap();
+        assert_eq!(values.fields[0].null_count(), 1);
+        assert_eq!(values.fields[1].null_count(), 3);
+        assert_eq!(0, series.active.timestamp.len());
+        assert_eq!(1, series.frozen.len());
+    }
+
     fn check_value(batch: &Batch, expect: Vec<Vec<Value>>) {
         let ts_len = batch.timestamps().len();
         assert_eq!(batch.sequences().len(), ts_len);
@@ -906,7 +1081,12 @@ mod tests {
         };
 
         let batch = values
-            .to_batch(b"test", &schema, &[0, 1, 2, 3, 4].into_iter().collect())
+            .to_batch(
+                b"test",
+                &schema,
+                &[0, 1, 2, 3, 4].into_iter().collect(),
+                true,
+            )
             .unwrap();
         check_value(
             &batch,
@@ -992,7 +1172,7 @@ mod tests {
     #[test]
     fn test_series_set_concurrency() {
         let schema = schema_for_test();
-        let row_codec = Arc::new(McmpRowCodec::new(
+        let row_codec = Arc::new(DensePrimaryKeyCodec::with_fields(
             schema
                 .primary_key_columns()
                 .map(|c| SortField::new(c.column_schema.data_type.clone()))
@@ -1070,18 +1250,29 @@ mod tests {
     #[test]
     fn test_memtable() {
         common_telemetry::init_default_ut_logging();
+        check_memtable_dedup(true);
+        check_memtable_dedup(false);
+    }
+
+    fn check_memtable_dedup(dedup: bool) {
         let schema = schema_for_test();
         let kvs = build_key_values(&schema, "hello".to_string(), 42, 100);
-        let memtable = TimeSeriesMemtable::new(schema, 42, None);
+        let memtable = TimeSeriesMemtable::new(schema, 42, None, dedup, MergeMode::LastRow);
+        memtable.write(&kvs).unwrap();
         memtable.write(&kvs).unwrap();
 
-        let expected_ts = kvs
+        let mut expected_ts: HashMap<i64, usize> = HashMap::new();
+        for ts in kvs
             .iter()
             .map(|kv| kv.timestamp().as_timestamp().unwrap().unwrap().value())
-            .collect::<HashSet<_>>();
+        {
+            *expected_ts.entry(ts).or_default() += if dedup { 1 } else { 2 };
+        }
 
-        let iter = memtable.iter(None, None);
-        let read = iter
+        let iter = memtable.iter(None, None, None).unwrap();
+        let mut read = HashMap::new();
+
+        for ts in iter
             .flat_map(|batch| {
                 batch
                     .unwrap()
@@ -1094,7 +1285,9 @@ mod tests {
                     .into_iter()
             })
             .map(|v| v.unwrap().0.value())
-            .collect::<HashSet<_>>();
+        {
+            *read.entry(ts).or_default() += 1;
+        }
         assert_eq!(expected_ts, read);
 
         let stats = memtable.stats();
@@ -1113,10 +1306,10 @@ mod tests {
         common_telemetry::init_default_ut_logging();
         let schema = schema_for_test();
         let kvs = build_key_values(&schema, "hello".to_string(), 42, 100);
-        let memtable = TimeSeriesMemtable::new(schema, 42, None);
+        let memtable = TimeSeriesMemtable::new(schema, 42, None, true, MergeMode::LastRow);
         memtable.write(&kvs).unwrap();
 
-        let iter = memtable.iter(Some(&[3]), None);
+        let iter = memtable.iter(Some(&[3]), None, None).unwrap();
 
         let mut v0_all = vec![];
 

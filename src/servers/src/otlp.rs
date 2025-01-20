@@ -12,10 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod logs;
 pub mod metrics;
-pub mod plugin;
 pub mod trace;
-
-const GREPTIME_TIMESTAMP: &str = "greptime_timestamp";
-const GREPTIME_VALUE: &str = "greptime_value";
-const GREPTIME_COUNT: &str = "greptime_count";
+mod utils;

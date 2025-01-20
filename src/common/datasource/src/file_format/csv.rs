@@ -29,6 +29,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use derive_builder::Builder;
 use object_store::ObjectStore;
 use snafu::ResultExt;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::SyncIoBridge;
 
 use super::stream_to_file;
@@ -117,7 +118,7 @@ impl CsvConfig {
         let mut builder = csv::ReaderBuilder::new(self.file_schema.clone())
             .with_delimiter(self.delimiter)
             .with_batch_size(self.batch_size)
-            .has_header(self.has_header);
+            .with_header(self.has_header);
 
         if let Some(proj) = &self.file_projection {
             builder = builder.with_projection(proj.clone());
@@ -164,10 +165,19 @@ impl FileOpener for CsvOpener {
 #[async_trait]
 impl FileFormat for CsvFormat {
     async fn infer_schema(&self, store: &ObjectStore, path: &str) -> Result<Schema> {
+        let meta = store
+            .stat(path)
+            .await
+            .context(error::ReadObjectSnafu { path })?;
+
         let reader = store
             .reader(path)
             .await
-            .context(error::ReadObjectSnafu { path })?;
+            .context(error::ReadObjectSnafu { path })?
+            .into_futures_async_read(0..meta.content_length())
+            .await
+            .context(error::ReadObjectSnafu { path })?
+            .compat();
 
         let decoded = self.compression_type.convert_async_read(reader);
 
@@ -175,7 +185,7 @@ impl FileFormat for CsvFormat {
         let schema_infer_max_record = self.schema_infer_max_record;
         let has_header = self.has_header;
 
-        common_runtime::spawn_blocking_read(move || {
+        common_runtime::spawn_blocking_global(move || {
             let reader = SyncIoBridge::new(decoded);
 
             let (schema, _records_read) =
@@ -193,8 +203,9 @@ pub async fn stream_to_csv(
     store: ObjectStore,
     path: &str,
     threshold: usize,
+    concurrency: usize,
 ) -> Result<usize> {
-    stream_to_file(stream, store, path, threshold, |buffer| {
+    stream_to_file(stream, store, path, threshold, concurrency, |buffer| {
         csv::Writer::new(buffer)
     })
     .await

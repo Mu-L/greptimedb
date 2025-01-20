@@ -16,21 +16,23 @@ use std::collections::{BTreeMap, VecDeque};
 use std::mem;
 use std::num::NonZeroUsize;
 use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use common_base::BitVec;
-use common_telemetry::logging;
+use common_telemetry::{debug, error};
 use futures::stream;
+use snafu::ResultExt;
 
-use crate::inverted_index::create::sort::external_provider::ExternalTempFileProvider;
+use crate::external_provider::ExternalTempFileProvider;
 use crate::inverted_index::create::sort::intermediate_rw::{
     IntermediateReader, IntermediateWriter,
 };
 use crate::inverted_index::create::sort::merge_stream::MergeSortedStream;
 use crate::inverted_index::create::sort::{SortOutput, SortedStream, Sorter};
 use crate::inverted_index::create::sort_create::SorterFactory;
-use crate::inverted_index::error::Result;
+use crate::inverted_index::error::{IntermediateSnafu, Result};
 use crate::inverted_index::{Bytes, BytesRef};
 
 /// `ExternalSorter` manages the sorting of data using both in-memory structures and external files.
@@ -48,6 +50,14 @@ pub struct ExternalSorter {
     /// In-memory buffer to hold values and their corresponding bitmaps until memory threshold is exceeded
     values_buffer: BTreeMap<Bytes, BitVec>,
 
+    /// Count of rows in the last dumped buffer, used to streamline memory usage of `values_buffer`.
+    ///
+    /// After data is dumped to external files, `last_dump_row_count` is updated to reflect the new starting point
+    /// for `BitVec` indexing. This means each `BitVec` in `values_buffer` thereafter encodes positions relative to
+    /// this count, not from 0. This mechanism effectively shrinks the memory footprint of each `BitVec`, helping manage
+    /// memory use more efficiently by focusing only on newly ingested data post-dump.
+    last_dump_row_count: usize,
+
     /// Count of all rows ingested so far
     total_row_count: usize,
 
@@ -58,9 +68,20 @@ pub struct ExternalSorter {
     /// Tracks memory usage of the buffer
     current_memory_usage: usize,
 
-    /// The memory usage threshold at which the buffer should be dumped to an external file.
-    /// `None` indicates that the buffer should never be dumped.
-    memory_usage_threshold: Option<usize>,
+    /// The threshold of current memory usage below which the buffer is not dumped, even if the global memory
+    /// usage exceeds `global_memory_usage_sort_limit`. This allows for smaller buffers to remain in memory,
+    /// providing a buffer against unnecessary dumps to external files, which can be costly in terms of performance.
+    /// `None` indicates that only the global memory usage threshold is considered for dumping the buffer.
+    current_memory_usage_threshold: Option<usize>,
+
+    /// Tracks the global memory usage of all sorters
+    global_memory_usage: Arc<AtomicUsize>,
+
+    /// The memory usage limit that, when exceeded by the global memory consumption of all sorters, necessitates
+    /// a reassessment of buffer retention. Surpassing this limit signals that there is a high overall memory pressure,
+    /// potentially requiring buffer dumping to external storage for memory relief.
+    /// `None` value indicates that no specific global memory usage threshold is established for triggering buffer dumps.
+    global_memory_usage_sort_limit: Option<usize>,
 }
 
 #[async_trait]
@@ -72,7 +93,7 @@ impl Sorter for ExternalSorter {
             return Ok(());
         }
 
-        let segment_index_range = self.segment_index_range(n);
+        let segment_index_range = self.segment_index_range(n, value.is_none());
         self.total_row_count += n;
 
         if let Some(value) = value {
@@ -87,15 +108,26 @@ impl Sorter for ExternalSorter {
     /// Finalizes the sorting operation, merging data from both in-memory buffer and external files
     /// into a sorted stream
     async fn output(&mut self) -> Result<SortOutput> {
-        let readers = self.temp_file_provider.read_all(&self.index_name).await?;
+        let readers = self
+            .temp_file_provider
+            .read_all(&self.index_name)
+            .await
+            .context(IntermediateSnafu)?;
 
         // TODO(zhongzc): k-way merge instead of 2-way merge
 
         let mut tree_nodes: VecDeque<SortedStream> = VecDeque::with_capacity(readers.len() + 1);
+        let leading_zeros = self.last_dump_row_count / self.segment_row_count;
         tree_nodes.push_back(Box::new(stream::iter(
-            mem::take(&mut self.values_buffer).into_iter().map(Ok),
+            mem::take(&mut self.values_buffer)
+                .into_iter()
+                .map(move |(value, mut bitmap)| {
+                    bitmap.resize(bitmap.len() + leading_zeros, false);
+                    bitmap.shift_right(leading_zeros);
+                    Ok((value, bitmap))
+                }),
         )));
-        for reader in readers {
+        for (_, reader) in readers {
             tree_nodes.push_back(IntermediateReader::new(reader).into_stream().await?);
         }
 
@@ -121,7 +153,9 @@ impl ExternalSorter {
         index_name: String,
         temp_file_provider: Arc<dyn ExternalTempFileProvider>,
         segment_row_count: NonZeroUsize,
-        memory_usage_threshold: Option<usize>,
+        current_memory_usage_threshold: Option<usize>,
+        global_memory_usage: Arc<AtomicUsize>,
+        global_memory_usage_sort_limit: Option<usize>,
     ) -> Self {
         Self {
             index_name,
@@ -131,24 +165,31 @@ impl ExternalSorter {
             values_buffer: BTreeMap::new(),
 
             total_row_count: 0,
+            last_dump_row_count: 0,
             segment_row_count,
 
             current_memory_usage: 0,
-            memory_usage_threshold,
+            current_memory_usage_threshold,
+            global_memory_usage,
+            global_memory_usage_sort_limit,
         }
     }
 
     /// Generates a factory function that creates new `ExternalSorter` instances
     pub fn factory(
         temp_file_provider: Arc<dyn ExternalTempFileProvider>,
-        memory_usage_threshold: Option<usize>,
+        current_memory_usage_threshold: Option<usize>,
+        global_memory_usage: Arc<AtomicUsize>,
+        global_memory_usage_sort_limit: Option<usize>,
     ) -> SorterFactory {
         Box::new(move |index_name, segment_row_count| {
             Box::new(Self::new(
                 index_name,
                 temp_file_provider.clone(),
                 segment_row_count,
-                memory_usage_threshold,
+                current_memory_usage_threshold,
+                global_memory_usage.clone(),
+                global_memory_usage_sort_limit,
             ))
         })
     }
@@ -183,33 +224,62 @@ impl ExternalSorter {
     /// Checks if the in-memory buffer exceeds the threshold and offloads it to external storage if necessary
     async fn may_dump_buffer(&mut self, memory_diff: usize) -> Result<()> {
         self.current_memory_usage += memory_diff;
-        if self.memory_usage_threshold.is_none()
-            || self.current_memory_usage < self.memory_usage_threshold.unwrap()
+        let memory_usage = self.current_memory_usage;
+        self.global_memory_usage
+            .fetch_add(memory_diff, Ordering::Relaxed);
+
+        if self.global_memory_usage_sort_limit.is_none() {
+            return Ok(());
+        }
+
+        if self.global_memory_usage.load(Ordering::Relaxed)
+            < self.global_memory_usage_sort_limit.unwrap()
         {
             return Ok(());
         }
 
+        if let Some(current_threshold) = self.current_memory_usage_threshold {
+            if memory_usage < current_threshold {
+                return Ok(());
+            }
+        }
+
         let file_id = &format!("{:012}", self.total_row_count);
         let index_name = &self.index_name;
-        let writer = self.temp_file_provider.create(index_name, file_id).await?;
+        let writer = self
+            .temp_file_provider
+            .create(index_name, file_id)
+            .await
+            .context(IntermediateSnafu)?;
 
-        let memory_usage = self.current_memory_usage;
         let values = mem::take(&mut self.values_buffer);
+        self.global_memory_usage
+            .fetch_sub(memory_usage, Ordering::Relaxed);
         self.current_memory_usage = 0;
 
+        let bitmap_leading_zeros = self.last_dump_row_count / self.segment_row_count;
+        self.last_dump_row_count =
+            self.total_row_count - self.total_row_count % self.segment_row_count; // align to segment
+
         let entries = values.len();
-        IntermediateWriter::new(writer).write_all(values).await.inspect(|_|
-            logging::debug!("Dumped {entries} entries ({memory_usage} bytes) to intermediate file {file_id} for index {index_name}")
+        IntermediateWriter::new(writer).write_all(values, bitmap_leading_zeros as _).await.inspect(|_|
+            debug!("Dumped {entries} entries ({memory_usage} bytes) to intermediate file {file_id} for index {index_name}")
         ).inspect_err(|e|
-            logging::error!("Failed to dump {entries} entries to intermediate file {file_id} for index {index_name}. Error: {e}")
+            error!(e; "Failed to dump {entries} entries to intermediate file {file_id} for index {index_name}")
         )
     }
 
     /// Determines the segment index range for the row index range
-    /// `[self.total_row_count, self.total_row_count + n - 1]`
-    fn segment_index_range(&self, n: usize) -> RangeInclusive<usize> {
-        let start = self.segment_index(self.total_row_count);
-        let end = self.segment_index(self.total_row_count + n - 1);
+    /// `[row_begin, row_begin + n - 1]`
+    fn segment_index_range(&self, n: usize, is_null: bool) -> RangeInclusive<usize> {
+        let row_begin = if is_null {
+            self.total_row_count
+        } else {
+            self.total_row_count - self.last_dump_row_count
+        };
+
+        let start = self.segment_index(row_begin);
+        let end = self.segment_index(row_begin + n - 1);
         start..=end
     }
 
@@ -241,10 +311,11 @@ mod tests {
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
     use super::*;
-    use crate::inverted_index::create::sort::external_provider::MockExternalTempFileProvider;
+    use crate::external_provider::MockExternalTempFileProvider;
 
     async fn test_external_sorter(
-        memory_usage_threshold: Option<usize>,
+        current_memory_usage_threshold: Option<usize>,
+        global_memory_usage_sort_limit: Option<usize>,
         segment_row_count: usize,
         row_count: usize,
         batch_push: bool,
@@ -270,7 +341,7 @@ mod tests {
             move |index_name| {
                 assert_eq!(index_name, "test");
                 let mut files = files.lock().unwrap();
-                Ok(files.drain().map(|f| f.1).collect::<Vec<_>>())
+                Ok(files.drain().collect::<Vec<_>>())
             }
         });
 
@@ -278,7 +349,9 @@ mod tests {
             "test".to_owned(),
             Arc::new(mock_provider),
             NonZeroUsize::new(segment_row_count).unwrap(),
-            memory_usage_threshold,
+            current_memory_usage_threshold,
+            Arc::new(AtomicUsize::new(0)),
+            global_memory_usage_sort_limit,
         );
 
         let mut sorted_result = if batch_push {
@@ -321,7 +394,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_external_sorter_pure_in_memory() {
-        let memory_usage_threshold = None;
+        let current_memory_usage_threshold = None;
+        let global_memory_usage_sort_limit = None;
         let total_row_count_cases = vec![0, 100, 1000, 10000];
         let segment_row_count_cases = vec![1, 10, 100, 1000];
         let batch_push_cases = vec![false, true];
@@ -330,7 +404,8 @@ mod tests {
             for segment_row_count in &segment_row_count_cases {
                 for batch_push in &batch_push_cases {
                     test_external_sorter(
-                        memory_usage_threshold,
+                        current_memory_usage_threshold,
+                        global_memory_usage_sort_limit,
                         *segment_row_count,
                         total_row_count,
                         *batch_push,
@@ -343,7 +418,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_external_sorter_pure_external() {
-        let memory_usage_threshold = Some(0);
+        let current_memory_usage_threshold = None;
+        let global_memory_usage_sort_limit = Some(0);
         let total_row_count_cases = vec![0, 100, 1000, 10000];
         let segment_row_count_cases = vec![1, 10, 100, 1000];
         let batch_push_cases = vec![false, true];
@@ -352,7 +428,8 @@ mod tests {
             for segment_row_count in &segment_row_count_cases {
                 for batch_push in &batch_push_cases {
                     test_external_sorter(
-                        memory_usage_threshold,
+                        current_memory_usage_threshold,
+                        global_memory_usage_sort_limit,
                         *segment_row_count,
                         total_row_count,
                         *batch_push,
@@ -365,7 +442,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_external_sorter_mixed() {
-        let memory_usage_threshold = Some(1024);
+        let current_memory_usage_threshold = vec![None, Some(2048)];
+        let global_memory_usage_sort_limit = Some(1024);
         let total_row_count_cases = vec![0, 100, 1000, 10000];
         let segment_row_count_cases = vec![1, 10, 100, 1000];
         let batch_push_cases = vec![false, true];
@@ -373,13 +451,16 @@ mod tests {
         for total_row_count in total_row_count_cases {
             for segment_row_count in &segment_row_count_cases {
                 for batch_push in &batch_push_cases {
-                    test_external_sorter(
-                        memory_usage_threshold,
-                        *segment_row_count,
-                        total_row_count,
-                        *batch_push,
-                    )
-                    .await;
+                    for current_memory_usage_threshold in &current_memory_usage_threshold {
+                        test_external_sorter(
+                            *current_memory_usage_threshold,
+                            global_memory_usage_sort_limit,
+                            *segment_row_count,
+                            total_row_count,
+                            *batch_push,
+                        )
+                        .await;
+                    }
                 }
             }
         }

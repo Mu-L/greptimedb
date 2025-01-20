@@ -16,10 +16,11 @@ use std::ops::ControlFlow;
 
 use datatypes::data_type::DataType as GreptimeDataType;
 use sqlparser::ast::{
-    ColumnDef, DataType, Expr, Function, FunctionArg, FunctionArgExpr, Ident, ObjectName, Value,
+    DataType, Expr, Function, FunctionArg, FunctionArgExpr, Ident, ObjectName, Value,
 };
 
 use crate::error::Result;
+use crate::statements::alter::AlterTableOperation;
 use crate::statements::create::{CreateExternalTable, CreateTable};
 use crate::statements::statement::Statement;
 use crate::statements::transform::TransformRule;
@@ -35,6 +36,7 @@ use crate::statements::{sql_data_type_to_concrete_data_type, TimezoneInfo};
 ///  - `INT32` for `int`
 ///  - `INT64` for `bigint`
 ///  -  And `UINT8`, `UINT16` etc. for `UnsignedTinyint` etc.
+///  -  TinyText, MediumText, LongText for `Text`.
 pub(crate) struct TypeAliasTransformRule;
 
 impl TransformRule for TypeAliasTransformRule {
@@ -43,12 +45,25 @@ impl TransformRule for TypeAliasTransformRule {
             Statement::CreateTable(CreateTable { columns, .. }) => {
                 columns
                     .iter_mut()
-                    .for_each(|ColumnDef { data_type, .. }| replace_type_alias(data_type));
+                    .for_each(|column| replace_type_alias(column.mut_data_type()));
             }
             Statement::CreateExternalTable(CreateExternalTable { columns, .. }) => {
                 columns
                     .iter_mut()
-                    .for_each(|ColumnDef { data_type, .. }| replace_type_alias(data_type));
+                    .for_each(|column| replace_type_alias(column.mut_data_type()));
+            }
+            Statement::AlterTable(alter_table) => {
+                if let AlterTableOperation::ModifyColumnType { target_type, .. } =
+                    alter_table.alter_operation_mut()
+                {
+                    replace_type_alias(target_type)
+                } else if let AlterTableOperation::AddColumns { add_columns, .. } =
+                    alter_table.alter_operation_mut()
+                {
+                    for add_column in add_columns {
+                        replace_type_alias(&mut add_column.column_def.data_type);
+                    }
+                }
             }
             _ => {}
         }
@@ -57,28 +72,56 @@ impl TransformRule for TypeAliasTransformRule {
     }
 
     fn visit_expr(&self, expr: &mut Expr) -> ControlFlow<()> {
+        fn cast_expr_to_arrow_cast_func(expr: Expr, cast_type: String) -> Function {
+            Function {
+                name: ObjectName(vec![Ident::new("arrow_cast")]),
+                args: vec![
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)),
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+                        Value::SingleQuotedString(cast_type),
+                    ))),
+                ],
+                filter: None,
+                null_treatment: None,
+                over: None,
+                distinct: false,
+                special: false,
+                order_by: vec![],
+            }
+        }
+
         match expr {
+            // In new sqlparser, the "INT64" is no longer parsed to custom datatype.
+            // The new "Int64" is not recognizable by Datafusion, cannot directly "CAST" to it.
+            // We have to replace the expr to "arrow_cast" function call here.
+            // Same for "FLOAT64".
+            Expr::Cast {
+                expr: cast_expr,
+                data_type,
+                ..
+            } if matches!(data_type, DataType::Int64 | DataType::Float64) => {
+                if let Some(new_type) = get_data_type_by_alias_name(&data_type.to_string()) {
+                    if let Ok(new_type) = sql_data_type_to_concrete_data_type(&new_type) {
+                        *expr = Expr::Function(cast_expr_to_arrow_cast_func(
+                            (**cast_expr).clone(),
+                            new_type.as_arrow_type().to_string(),
+                        ));
+                    }
+                }
+            }
+
             // Type alias
             Expr::Cast {
                 data_type: DataType::Custom(name, tokens),
                 expr: cast_expr,
+                ..
             } if name.0.len() == 1 && tokens.is_empty() => {
                 if let Some(new_type) = get_data_type_by_alias_name(name.0[0].value.as_str()) {
-                    if let Ok(concrete_type) = sql_data_type_to_concrete_data_type(&new_type) {
-                        let new_type = concrete_type.as_arrow_type();
-                        *expr = Expr::Function(Function {
-                            name: ObjectName(vec![Ident::new("arrow_cast")]),
-                            args: vec![
-                                FunctionArg::Unnamed(FunctionArgExpr::Expr((**cast_expr).clone())),
-                                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-                                    Value::SingleQuotedString(new_type.to_string()),
-                                ))),
-                            ],
-                            over: None,
-                            distinct: false,
-                            special: false,
-                            order_by: vec![],
-                        });
+                    if let Ok(new_type) = sql_data_type_to_concrete_data_type(&new_type) {
+                        *expr = Expr::Function(cast_expr_to_arrow_cast_func(
+                            (**cast_expr).clone(),
+                            new_type.as_arrow_type().to_string(),
+                        ));
                     }
                 }
             }
@@ -88,24 +131,16 @@ impl TransformRule for TypeAliasTransformRule {
             Expr::Cast {
                 data_type: DataType::Timestamp(precision, zone),
                 expr: cast_expr,
+                ..
             } => {
                 if let Ok(concrete_type) =
                     sql_data_type_to_concrete_data_type(&DataType::Timestamp(*precision, *zone))
                 {
                     let new_type = concrete_type.as_arrow_type();
-                    *expr = Expr::Function(Function {
-                        name: ObjectName(vec![Ident::new("arrow_cast")]),
-                        args: vec![
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr((**cast_expr).clone())),
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-                                Value::SingleQuotedString(new_type.to_string()),
-                            ))),
-                        ],
-                        over: None,
-                        distinct: false,
-                        special: false,
-                        order_by: vec![],
-                    });
+                    *expr = Expr::Function(cast_expr_to_arrow_cast_func(
+                        (**cast_expr).clone(),
+                        new_type.to_string(),
+                    ));
                 }
             }
 
@@ -119,7 +154,7 @@ impl TransformRule for TypeAliasTransformRule {
 
 fn replace_type_alias(data_type: &mut DataType) {
     match data_type {
-        // TODO(dennis): The sqlparser latest version contains the Int8 alias for postres Bigint.
+        // TODO(dennis): The sqlparser latest version contains the Int8 alias for Postgres Bigint.
         // Which means 8 bytes in postgres (not 8 bits). If we upgrade the sqlparser, need to process it.
         // See https://docs.rs/sqlparser/latest/sqlparser/ast/enum.DataType.html#variant.Int8
         DataType::Custom(name, tokens) if name.0.len() == 1 && tokens.is_empty() => {
@@ -158,6 +193,8 @@ pub fn get_data_type_by_alias_name(name: &str) -> Option<DataType> {
         "UINT64" => Some(DataType::UnsignedBigInt(None)),
         "FLOAT32" => Some(DataType::Float(None)),
         "FLOAT64" => Some(DataType::Double),
+        // String type alias
+        "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" => Some(DataType::Text),
         _ => None,
     }
 }
@@ -167,7 +204,7 @@ mod tests {
     use sqlparser::dialect::GenericDialect;
 
     use super::*;
-    use crate::parser::ParserContext;
+    use crate::parser::{ParseOptions, ParserContext};
     use crate::statements::transform_statements;
 
     #[test]
@@ -261,11 +298,25 @@ mod tests {
             get_data_type_by_alias_name("Timestamp_ns"),
             Some(DataType::Timestamp(Some(9), TimezoneInfo::None))
         );
+        assert_eq!(
+            get_data_type_by_alias_name("TinyText"),
+            Some(DataType::Text)
+        );
+        assert_eq!(
+            get_data_type_by_alias_name("MediumText"),
+            Some(DataType::Text)
+        );
+        assert_eq!(
+            get_data_type_by_alias_name("LongText"),
+            Some(DataType::Text)
+        );
     }
 
     fn test_timestamp_alias(alias: &str, expected: &str) {
         let sql = format!("SELECT TIMESTAMP '2020-01-01 01:23:45.12345678'::{alias}");
-        let mut stmts = ParserContext::create_with_dialect(&sql, &GenericDialect {}).unwrap();
+        let mut stmts =
+            ParserContext::create_with_dialect(&sql, &GenericDialect {}, ParseOptions::default())
+                .unwrap();
         transform_statements(&mut stmts).unwrap();
 
         match &stmts[0] {
@@ -301,6 +352,9 @@ mod tests {
         let sql = r#"
 CREATE TABLE data_types (
   s string,
+  tt tinytext,
+  mt mediumtext,
+  lt longtext,
   tint int8,
   sint int16,
   i int32,
@@ -318,20 +372,25 @@ CREATE TABLE data_types (
   ts9 TimestampNanosecond DEFAULT CURRENT_TIMESTAMP TIME INDEX,
   PRIMARY KEY(s));"#;
 
-        let mut stmts = ParserContext::create_with_dialect(sql, &GenericDialect {}).unwrap();
+        let mut stmts =
+            ParserContext::create_with_dialect(sql, &GenericDialect {}, ParseOptions::default())
+                .unwrap();
         transform_statements(&mut stmts).unwrap();
 
         match &stmts[0] {
             Statement::CreateTable(c) => {
-                let expected = r#"CREATE TABLE  data_types (
+                let expected = r#"CREATE TABLE data_types (
   s STRING,
+  tt TEXT,
+  mt TEXT,
+  lt TEXT,
   tint INT8,
   sint SMALLINT,
   i INT,
-  bint BIGINT,
+  bint INT64,
   v VARCHAR,
   f FLOAT,
-  d DOUBLE,
+  d FLOAT64,
   b BOOLEAN,
   vb VARBINARY,
   dt DATE,

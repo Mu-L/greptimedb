@@ -13,32 +13,44 @@
 // limitations under the License.
 
 mod alter;
+mod catchup;
 mod close;
 mod create;
+mod drop;
+mod flush;
 mod open;
+mod options;
 mod put;
 mod read;
 mod region_metadata;
 mod state;
 
-use std::sync::Arc;
+use std::any::Any;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
+use api::region::RegionResponse;
 use async_trait::async_trait;
 use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
-use common_query::Output;
-use common_recordbatch::SendableRecordBatchStream;
 use mito2::engine::MitoEngine;
+pub(crate) use options::IndexOptions;
+use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
 use store_api::metric_engine_consts::METRIC_ENGINE_NAME;
-use store_api::region_engine::{RegionEngine, RegionRole, SetReadonlyResponse};
-use store_api::region_request::{AffectedRows, RegionRequest};
+use store_api::region_engine::{
+    RegionEngine, RegionRole, RegionScannerRef, RegionStatistic, SetRegionRoleStateResponse,
+    SettableRegionRoleState,
+};
+use store_api::region_request::RegionRequest;
 use store_api::storage::{RegionId, ScanRequest};
-use tokio::sync::RwLock;
 
 use self::state::MetricEngineState;
+use crate::config::EngineConfig;
 use crate::data_region::DataRegion;
+use crate::error::{self, Result, UnsupportedRegionRequestSnafu};
 use crate::metadata_region::MetadataRegion;
+use crate::utils;
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
 /// # Metric Engine
@@ -81,12 +93,15 @@ use crate::metadata_region::MetadataRegion;
 /// | Operations | Logical Region | Physical Region |
 /// | ---------- | -------------- | --------------- |
 /// |   Create   |       ✅        |        ✅        |
-/// |    Drop    |       ✅        |        ❌        |
+/// |    Drop    |       ✅        |        ❓*       |
 /// |   Write    |       ✅        |        ❌        |
 /// |    Read    |       ✅        |        ✅        |
 /// |   Close    |       ✅        |        ✅        |
 /// |    Open    |       ✅        |        ✅        |
-/// |   Alter    |       ✅        |        ❌        |
+/// |   Alter    |       ✅        |        ❓*       |
+///
+/// *: Physical region can be dropped only when all related logical regions are dropped.
+/// *: Alter: Physical regions only support altering region options.
 ///
 /// ## Internal Columns
 ///
@@ -116,35 +131,55 @@ impl RegionEngine for MetricEngine {
         &self,
         region_id: RegionId,
         request: RegionRequest,
-    ) -> Result<AffectedRows, BoxedError> {
+    ) -> Result<RegionResponse, BoxedError> {
+        let mut extension_return_value = HashMap::new();
+
         let result = match request {
             RegionRequest::Put(put) => self.inner.put_region(region_id, put).await,
-            RegionRequest::Delete(_) => todo!(),
-            RegionRequest::Create(create) => self.inner.create_region(region_id, create).await,
-            RegionRequest::Drop(_) => todo!(),
+            RegionRequest::Create(create) => {
+                self.inner
+                    .create_region(region_id, create, &mut extension_return_value)
+                    .await
+            }
+            RegionRequest::Drop(drop) => self.inner.drop_region(region_id, drop).await,
             RegionRequest::Open(open) => self.inner.open_region(region_id, open).await,
             RegionRequest::Close(close) => self.inner.close_region(region_id, close).await,
-            RegionRequest::Alter(alter) => self.inner.alter_region(region_id, alter).await,
-            RegionRequest::Flush(_) => todo!(),
-            RegionRequest::Compact(_) => todo!(),
-            RegionRequest::Truncate(_) => todo!(),
-            /// It always Ok(0), all data is latest.
-            RegionRequest::Catchup(_) => Ok(0),
+            RegionRequest::Alter(alter) => {
+                self.inner
+                    .alter_region(region_id, alter, &mut extension_return_value)
+                    .await
+            }
+            RegionRequest::Compact(_) => {
+                if self.inner.is_physical_region(region_id) {
+                    self.inner
+                        .mito
+                        .handle_request(region_id, request)
+                        .await
+                        .context(error::MitoFlushOperationSnafu)
+                        .map(|response| response.affected_rows)
+                } else {
+                    UnsupportedRegionRequestSnafu { request }.fail()
+                }
+            }
+            RegionRequest::Flush(req) => self.inner.flush_region(region_id, req).await,
+            RegionRequest::Delete(_) | RegionRequest::Truncate(_) => {
+                UnsupportedRegionRequestSnafu { request }.fail()
+            }
+            RegionRequest::Catchup(req) => self.inner.catchup_region(region_id, req).await,
         };
 
-        result.map_err(BoxedError::new)
+        result.map_err(BoxedError::new).map(|rows| RegionResponse {
+            affected_rows: rows,
+            extensions: extension_return_value,
+        })
     }
 
-    /// Handles substrait query and return a stream of record batches
     async fn handle_query(
         &self,
         region_id: RegionId,
         request: ScanRequest,
-    ) -> Result<SendableRecordBatchStream, BoxedError> {
-        self.inner
-            .read_region(region_id, request)
-            .await
-            .map_err(BoxedError::new)
+    ) -> Result<RegionScannerRef, BoxedError> {
+        self.handle_query(region_id, request).await
     }
 
     /// Retrieves region's metadata.
@@ -156,8 +191,14 @@ impl RegionEngine for MetricEngine {
     }
 
     /// Retrieves region's disk usage.
-    async fn region_disk_usage(&self, region_id: RegionId) -> Option<i64> {
-        todo!()
+    ///
+    /// Note: Returns `None` if it's a logical region.
+    fn region_statistic(&self, region_id: RegionId) -> Option<RegionStatistic> {
+        if self.inner.is_physical_region(region_id) {
+            self.inner.mito.region_statistic(region_id)
+        } else {
+            None
+        }
     }
 
     /// Stops the engine
@@ -166,30 +207,57 @@ impl RegionEngine for MetricEngine {
         Ok(())
     }
 
-    fn set_writable(&self, region_id: RegionId, writable: bool) -> Result<(), BoxedError> {
+    fn set_region_role(&self, region_id: RegionId, role: RegionRole) -> Result<(), BoxedError> {
         // ignore the region not found error
-        let result = self.inner.mito.set_writable(region_id, writable);
+        for x in [
+            utils::to_metadata_region_id(region_id),
+            utils::to_data_region_id(region_id),
+        ] {
+            if let Err(e) = self.inner.mito.set_region_role(x, role)
+                && e.status_code() != StatusCode::RegionNotFound
+            {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
 
-        match result {
-            Err(e) if e.status_code() == StatusCode::RegionNotFound => Ok(()),
-            _ => result,
+    async fn set_region_role_state_gracefully(
+        &self,
+        region_id: RegionId,
+        region_role_state: SettableRegionRoleState,
+    ) -> std::result::Result<SetRegionRoleStateResponse, BoxedError> {
+        self.inner
+            .mito
+            .set_region_role_state_gracefully(
+                utils::to_metadata_region_id(region_id),
+                region_role_state,
+            )
+            .await?;
+        self.inner
+            .mito
+            .set_region_role_state_gracefully(region_id, region_role_state)
+            .await
+    }
+
+    /// Returns the physical region role.
+    ///
+    /// Note: Returns `None` if it's a logical region.
+    fn role(&self, region_id: RegionId) -> Option<RegionRole> {
+        if self.inner.is_physical_region(region_id) {
+            self.inner.mito.role(region_id)
+        } else {
+            None
         }
     }
 
-    async fn set_readonly_gracefully(
-        &self,
-        region_id: RegionId,
-    ) -> std::result::Result<SetReadonlyResponse, BoxedError> {
-        self.inner.mito.set_readonly_gracefully(region_id).await
-    }
-
-    fn role(&self, region_id: RegionId) -> Option<RegionRole> {
-        todo!()
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
 impl MetricEngine {
-    pub fn new(mito: MitoEngine) -> Self {
+    pub fn new(mito: MitoEngine, config: EngineConfig) -> Self {
         let metadata_region = MetadataRegion::new(mito.clone());
         let data_region = DataRegion::new(mito.clone());
         Self {
@@ -198,8 +266,39 @@ impl MetricEngine {
                 metadata_region,
                 data_region,
                 state: RwLock::default(),
+                config,
             }),
         }
+    }
+
+    pub async fn logical_regions(&self, physical_region_id: RegionId) -> Result<Vec<RegionId>> {
+        self.inner
+            .metadata_region
+            .logical_regions(physical_region_id)
+            .await
+    }
+
+    /// Handles substrait query and return a stream of record batches
+    async fn handle_query(
+        &self,
+        region_id: RegionId,
+        request: ScanRequest,
+    ) -> Result<RegionScannerRef, BoxedError> {
+        self.inner
+            .read_region(region_id, request)
+            .await
+            .map_err(BoxedError::new)
+    }
+}
+
+#[cfg(test)]
+impl MetricEngine {
+    pub async fn scan_to_stream(
+        &self,
+        region_id: RegionId,
+        request: ScanRequest,
+    ) -> Result<common_recordbatch::SendableRecordBatchStream, BoxedError> {
+        self.inner.scan_to_stream(region_id, request).await
     }
 }
 
@@ -208,6 +307,9 @@ struct MetricEngineInner {
     metadata_region: MetadataRegion,
     data_region: DataRegion,
     state: RwLock<MetricEngineState>,
+    /// TODO(weny): remove it after the config is used.
+    #[allow(unused)]
+    config: EngineConfig,
 }
 
 #[cfg(test)]
@@ -251,7 +353,7 @@ mod test {
             .await
             .unwrap();
 
-        // close nonexistent region
+        // close nonexistent region won't report error
         let nonexistent_region_id = RegionId::new(12313, 12);
         engine
             .handle_request(
@@ -259,7 +361,7 @@ mod test {
                 RegionRequest::Close(RegionCloseRequest {}),
             )
             .await
-            .unwrap_err();
+            .unwrap();
 
         // open nonexistent region won't report error
         let invalid_open_request = RegionOpenRequest {
@@ -275,5 +377,29 @@ mod test {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_role() {
+        let env = TestEnv::new().await;
+        env.init_metric_region().await;
+
+        let logical_region_id = env.default_logical_region_id();
+        let physical_region_id = env.default_physical_region_id();
+
+        assert!(env.metric().role(logical_region_id).is_none());
+        assert!(env.metric().role(physical_region_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_region_disk_usage() {
+        let env = TestEnv::new().await;
+        env.init_metric_region().await;
+
+        let logical_region_id = env.default_logical_region_id();
+        let physical_region_id = env.default_physical_region_id();
+
+        assert!(env.metric().region_statistic(logical_region_id).is_none());
+        assert!(env.metric().region_statistic(physical_region_id).is_some());
     }
 }

@@ -23,10 +23,9 @@ use datafusion::common::{DFSchema, DFSchemaRef, Result as DataFusionResult, Stat
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::TaskContext;
 use datafusion::logical_expr::{EmptyRelation, Expr, LogicalPlan, UserDefinedLogicalNodeCore};
-use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, RecordBatchStream,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream,
 };
 use datatypes::arrow::array::TimestampMillisecondArray;
@@ -82,15 +81,23 @@ impl UserDefinedLogicalNodeCore for SeriesNormalize {
         )
     }
 
-    fn from_template(&self, _exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
-        assert!(!inputs.is_empty());
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> DataFusionResult<Self> {
+        if inputs.is_empty() {
+            return Err(DataFusionError::Internal(
+                "SeriesNormalize should have at least one input".to_string(),
+            ));
+        }
 
-        Self {
+        Ok(Self {
             offset: self.offset,
             time_index_column_name: self.time_index_column_name.clone(),
             need_filter_out_nan: self.need_filter_out_nan,
-            input: inputs[0].clone(),
-        }
+            input: inputs.into_iter().next().unwrap(),
+        })
     }
 }
 
@@ -170,16 +177,12 @@ impl ExecutionPlan for SeriesNormalizeExec {
         vec![Distribution::SinglePartition]
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        self.input.output_partitioning()
+    fn properties(&self) -> &PlanProperties {
+        self.input.properties()
     }
 
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.input.output_ordering()
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -223,7 +226,7 @@ impl ExecutionPlan for SeriesNormalizeExec {
         Some(self.metric.clone_inner())
     }
 
-    fn statistics(&self) -> Statistics {
+    fn statistics(&self) -> DataFusionResult<Statistics> {
         self.input.statistics()
     }
 }
@@ -255,12 +258,15 @@ pub struct SeriesNormalizeStream {
 
 impl SeriesNormalizeStream {
     pub fn normalize(&self, input: RecordBatch) -> DataFusionResult<RecordBatch> {
-        // TODO(ruihang): maybe the input is not timestamp millisecond array
         let ts_column = input
             .column(self.time_index)
             .as_any()
             .downcast_ref::<TimestampMillisecondArray>()
-            .unwrap();
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "Time index Column downcast to TimestampMillisecondArray failed".into(),
+                )
+            })?;
 
         // bias the timestamp column by offset
         let ts_column_biased = if self.offset == 0 {
@@ -299,7 +305,7 @@ impl SeriesNormalizeStream {
         }
 
         let result = compute::filter_record_batch(&ordered_batch, &BooleanArray::from(filter))
-            .map_err(DataFusionError::ArrowError)?;
+            .map_err(|e| DataFusionError::ArrowError(e, None))?;
         Ok(result)
     }
 }

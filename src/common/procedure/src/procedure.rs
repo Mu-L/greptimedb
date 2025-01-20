@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::Any;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -22,8 +23,10 @@ use smallvec::{smallvec, SmallVec};
 use snafu::{ResultExt, Snafu};
 use uuid::Uuid;
 
-use crate::error::{Error, Result};
+use crate::error::{self, Error, Result};
 use crate::watcher::Watcher;
+
+pub type Output = Arc<dyn Any + Send + Sync>;
 
 /// Procedure execution status.
 #[derive(Debug)]
@@ -40,7 +43,7 @@ pub enum Status {
         persist: bool,
     },
     /// the procedure is done.
-    Done,
+    Done { output: Option<Output> },
 }
 
 impl Status {
@@ -49,13 +52,45 @@ impl Status {
         Status::Executing { persist }
     }
 
+    /// Returns a [Status::Done] without output.
+    pub fn done() -> Status {
+        Status::Done { output: None }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    /// Downcasts [Status::Done]'s output to &T
+    ///  #Panic:
+    /// - if [Status] is not the [Status::Done].
+    /// - if the output is None.
+    pub fn downcast_output_ref<T: 'static>(&self) -> Option<&T> {
+        if let Status::Done { output } = self {
+            output
+                .as_ref()
+                .expect("Try to downcast the output of Status::Done, but the output is None")
+                .downcast_ref()
+        } else {
+            panic!("Expected the Status::Done, but got: {:?}", self)
+        }
+    }
+
+    /// Returns a [Status::Done] with output.
+    pub fn done_with_output<T: Any + Send + Sync>(output: T) -> Status {
+        Status::Done {
+            output: Some(Arc::new(output)),
+        }
+    }
+    /// Returns `true` if the procedure is done.
+    pub fn is_done(&self) -> bool {
+        matches!(self, Status::Done { .. })
+    }
+
     /// Returns `true` if the procedure needs the framework to persist its intermediate state.
     pub fn need_persist(&self) -> bool {
         // If the procedure is done, the framework doesn't need to persist the procedure
         // anymore. It only needs to mark the procedure as committed.
         match self {
             Status::Executing { persist } | Status::Suspended { persist, .. } => *persist,
-            Status::Done => false,
+            Status::Done { .. } => false,
         }
     }
 }
@@ -81,7 +116,7 @@ pub struct Context {
 
 /// A `Procedure` represents an operation or a set of operations to be performed step-by-step.
 #[async_trait]
-pub trait Procedure: Send + Sync {
+pub trait Procedure: Send {
     /// Type name of the procedure.
     fn type_name(&self) -> &str;
 
@@ -90,8 +125,25 @@ pub trait Procedure: Send + Sync {
     /// The implementation must be idempotent.
     async fn execute(&mut self, ctx: &Context) -> Result<Status>;
 
+    /// Rollback the failed procedure.
+    ///
+    /// The implementation must be idempotent.
+    async fn rollback(&mut self, _: &Context) -> Result<()> {
+        error::RollbackNotSupportedSnafu {}.fail()
+    }
+
+    /// Indicates whether it supports rolling back the procedure.
+    fn rollback_supported(&self) -> bool {
+        false
+    }
+
     /// Dump the state of the procedure to a string.
     fn dump(&self) -> Result<String>;
+
+    /// The hook is called after the procedure recovery.
+    fn recover(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     /// Returns the [LockKey] that this procedure needs to acquire.
     fn lock_key(&self) -> LockKey;
@@ -107,6 +159,14 @@ impl<T: Procedure + ?Sized> Procedure for Box<T> {
         (**self).execute(ctx).await
     }
 
+    async fn rollback(&mut self, ctx: &Context) -> Result<()> {
+        (**self).rollback(ctx).await
+    }
+
+    fn rollback_supported(&self) -> bool {
+        (**self).rollback_supported()
+    }
+
     fn dump(&self) -> Result<String> {
         (**self).dump()
     }
@@ -116,22 +176,49 @@ impl<T: Procedure + ?Sized> Procedure for Box<T> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StringKey {
+    Share(String),
+    Exclusive(String),
+}
+
 /// Keys to identify required locks.
 ///
 /// [LockKey] always sorts keys lexicographically so that they can be acquired
 /// in the same order.
-// Most procedures should only acquire 1 ~ 2 locks so we use smallvec to hold keys.
+/// Most procedures should only acquire 1 ~ 2 locks so we use smallvec to hold keys.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LockKey(SmallVec<[String; 2]>);
+pub struct LockKey(SmallVec<[StringKey; 2]>);
+
+impl StringKey {
+    pub fn into_string(self) -> String {
+        match self {
+            StringKey::Share(s) => s,
+            StringKey::Exclusive(s) => s,
+        }
+    }
+
+    pub fn as_string(&self) -> &String {
+        match self {
+            StringKey::Share(s) => s,
+            StringKey::Exclusive(s) => s,
+        }
+    }
+}
 
 impl LockKey {
     /// Returns a new [LockKey] with only one key.
-    pub fn single(key: impl Into<String>) -> LockKey {
+    pub fn single(key: impl Into<StringKey>) -> LockKey {
         LockKey(smallvec![key.into()])
     }
 
+    /// Returns a new [LockKey] with only one key.
+    pub fn single_exclusive(key: impl Into<String>) -> LockKey {
+        LockKey(smallvec![StringKey::Exclusive(key.into())])
+    }
+
     /// Returns a new [LockKey] with keys from specific `iter`.
-    pub fn new(iter: impl IntoIterator<Item = String>) -> LockKey {
+    pub fn new(iter: impl IntoIterator<Item = StringKey>) -> LockKey {
         let mut vec: SmallVec<_> = iter.into_iter().collect();
         vec.sort();
         // Dedup keys to avoid acquiring the same key multiple times.
@@ -139,14 +226,19 @@ impl LockKey {
         LockKey(vec)
     }
 
+    /// Returns a new [LockKey] with keys from specific `iter`.
+    pub fn new_exclusive(iter: impl IntoIterator<Item = String>) -> LockKey {
+        Self::new(iter.into_iter().map(StringKey::Exclusive))
+    }
+
     /// Returns the keys to lock.
-    pub fn keys_to_lock(&self) -> impl Iterator<Item = &String> {
+    pub fn keys_to_lock(&self) -> impl Iterator<Item = &StringKey> {
         self.0.iter()
     }
 
-    /// Returns the keys to unlock.
-    pub fn keys_to_unlock(&self) -> impl Iterator<Item = &String> {
-        self.0.iter().rev()
+    /// Returns the keys to lock.
+    pub fn get_keys(&self) -> Vec<String> {
+        self.0.iter().map(|key| format!("{:?}", key)).collect()
     }
 }
 
@@ -224,9 +316,13 @@ pub enum ProcedureState {
     #[default]
     Running,
     /// The procedure is finished.
-    Done,
+    Done { output: Option<Output> },
     /// The procedure is failed and can be retried.
     Retrying { error: Arc<Error> },
+    /// The procedure is failed and commits state before rolling back the procedure.
+    PrepareRollback { error: Arc<Error> },
+    /// The procedure is failed and can be rollback.
+    RollingBack { error: Arc<Error> },
     /// The procedure is failed and cannot proceed anymore.
     Failed { error: Arc<Error> },
 }
@@ -235,6 +331,16 @@ impl ProcedureState {
     /// Returns a [ProcedureState] with failed state.
     pub fn failed(error: Arc<Error>) -> ProcedureState {
         ProcedureState::Failed { error }
+    }
+
+    /// Returns a [ProcedureState] with prepare rollback state.
+    pub fn prepare_rollback(error: Arc<Error>) -> ProcedureState {
+        ProcedureState::PrepareRollback { error }
+    }
+
+    /// Returns a [ProcedureState] with rolling back state.
+    pub fn rolling_back(error: Arc<Error>) -> ProcedureState {
+        ProcedureState::RollingBack { error }
     }
 
     /// Returns a [ProcedureState] with retrying state.
@@ -249,7 +355,7 @@ impl ProcedureState {
 
     /// Returns true if the procedure state is done.
     pub fn is_done(&self) -> bool {
-        matches!(self, ProcedureState::Done)
+        matches!(self, ProcedureState::Done { .. })
     }
 
     /// Returns true if the procedure state failed.
@@ -262,14 +368,44 @@ impl ProcedureState {
         matches!(self, ProcedureState::Retrying { .. })
     }
 
+    /// Returns true if the procedure state is rolling back.
+    pub fn is_rolling_back(&self) -> bool {
+        matches!(self, ProcedureState::RollingBack { .. })
+    }
+
+    /// Returns true if the procedure state is prepare rollback.
+    pub fn is_prepare_rollback(&self) -> bool {
+        matches!(self, ProcedureState::PrepareRollback { .. })
+    }
+
     /// Returns the error.
     pub fn error(&self) -> Option<&Arc<Error>> {
         match self {
             ProcedureState::Failed { error } => Some(error),
             ProcedureState::Retrying { error } => Some(error),
+            ProcedureState::RollingBack { error } => Some(error),
             _ => None,
         }
     }
+
+    /// Return the string values of the enum field names.
+    pub fn as_str_name(&self) -> &str {
+        match self {
+            ProcedureState::Running => "Running",
+            ProcedureState::Done { .. } => "Done",
+            ProcedureState::Retrying { .. } => "Retrying",
+            ProcedureState::Failed { .. } => "Failed",
+            ProcedureState::PrepareRollback { .. } => "PrepareRollback",
+            ProcedureState::RollingBack { .. } => "RollingBack",
+        }
+    }
+}
+
+/// The initial procedure state.
+#[derive(Debug, Clone)]
+pub enum InitProcedureState {
+    Running,
+    RollingBack,
 }
 
 // TODO(yingwen): Shutdown
@@ -301,10 +437,29 @@ pub trait ProcedureManager: Send + Sync + 'static {
 
     /// Returns a [Watcher] to watch [ProcedureState] of specific procedure.
     fn procedure_watcher(&self, procedure_id: ProcedureId) -> Option<Watcher>;
+
+    /// Returns the details of the procedure.
+    async fn list_procedures(&self) -> Result<Vec<ProcedureInfo>>;
 }
 
 /// Ref-counted pointer to the [ProcedureManager].
 pub type ProcedureManagerRef = Arc<dyn ProcedureManager>;
+
+#[derive(Debug, Clone)]
+pub struct ProcedureInfo {
+    /// Id of this procedure.
+    pub id: ProcedureId,
+    /// Type name of this procedure.
+    pub type_name: String,
+    /// Start execution time of this procedure.
+    pub start_time_ms: i64,
+    /// End execution time of this procedure.
+    pub end_time_ms: i64,
+    /// status of this procedure.
+    pub state: ProcedureState,
+    /// Lock keys of this procedure.
+    pub lock_keys: Vec<String>,
+}
 
 #[cfg(test)]
 mod tests {
@@ -333,27 +488,32 @@ mod tests {
         };
         assert!(status.need_persist());
 
-        let status = Status::Done;
+        let status = Status::done();
         assert!(!status.need_persist());
     }
 
     #[test]
     fn test_lock_key() {
         let entity = "catalog.schema.my_table";
-        let key = LockKey::single(entity);
-        assert_eq!(vec![entity], key.keys_to_lock().collect::<Vec<_>>());
-        assert_eq!(vec![entity], key.keys_to_unlock().collect::<Vec<_>>());
+        let key = LockKey::single_exclusive(entity);
+        assert_eq!(
+            vec![&StringKey::Exclusive(entity.to_string())],
+            key.keys_to_lock().collect::<Vec<_>>()
+        );
 
-        let key = LockKey::new([
+        let key = LockKey::new_exclusive([
             "b".to_string(),
             "c".to_string(),
             "a".to_string(),
             "c".to_string(),
         ]);
-        assert_eq!(vec!["a", "b", "c"], key.keys_to_lock().collect::<Vec<_>>());
         assert_eq!(
-            vec!["c", "b", "a"],
-            key.keys_to_unlock().collect::<Vec<_>>()
+            vec![
+                &StringKey::Exclusive("a".to_string()),
+                &StringKey::Exclusive("b".to_string()),
+                &StringKey::Exclusive("c".to_string())
+            ],
+            key.keys_to_lock().collect::<Vec<_>>()
         );
     }
 
@@ -383,7 +543,7 @@ mod tests {
     fn test_procedure_state() {
         assert!(ProcedureState::Running.is_running());
         assert!(ProcedureState::Running.error().is_none());
-        assert!(ProcedureState::Done.is_done());
+        assert!(ProcedureState::Done { output: None }.is_done());
 
         let state = ProcedureState::failed(Arc::new(Error::external(MockError::new(
             StatusCode::Unexpected,

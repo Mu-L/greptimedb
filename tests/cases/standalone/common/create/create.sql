@@ -26,6 +26,20 @@ CREATE TABLE test2 (i INTEGER, j TIMESTAMP TIME INDEX);
 
 CREATE TABLE 'N.~' (i TIMESTAMP TIME INDEX);
 
+CREATE TABLE `p_perftest001@cc3kvQ_D1D9H9GOZGMIY97TWH20R1LRC8U0SFBA` (i INTEGER, j TIMESTAMP TIME INDEX);
+
+DROP TABLE `p_perftest001@cc3kvQ_D1D9H9GOZGMIY97TWH20R1LRC8U0SFBA`;
+
+CREATE TABLE `p_perftest001#cc3kvQ_D1D9H9GOZGMIY97TWH20R1LRC8U0SFBA` (i INTEGER, j TIMESTAMP TIME INDEX);
+
+DROP TABLE `p_perftest001#cc3kvQ_D1D9H9GOZGMIY97TWH20R1LRC8U0SFBA`;
+
+CREATE TABLE neg_default_value_min(i TIMESTAMP TIME INDEX, j SMALLINT DEFAULT -32768);
+
+DESC TABLE neg_default_value_min;
+
+DROP TABLE neg_default_value_min;
+
 DESC TABLE integers;
 
 DESC TABLE test1;
@@ -52,3 +66,43 @@ CREATE TABLE test_multiple_pk_definitions ("timestamp" TIMESTAMP TIME INDEX, hos
 
 CREATE TABLE test_multiple_inline_pk_definitions ("timestamp" TIMESTAMP TIME INDEX, host STRING PRIMARY KEY, "value" DOUBLE PRIMARY KEY);
 
+CREATE TABLE neg_default_value(i INT DEFAULT -1024, ts TIMESTAMP TIME INDEX);
+
+desc TABLE neg_default_value;
+
+DROP TABLE neg_default_value;
+
+CREATE TABLE test_like_1 (PK STRING PRIMARY KEY, i INTEGER DEFAULT 7, j TIMESTAMP TIME INDEX);
+
+CREATE TABLE test_like_2 LIKE test_like_1;
+
+CREATE TABLE test_like_2 LIKE test_like_1;
+
+CREATE TABLE `ExcePTuRi`(
+non TIMESTAMP(6) TIME INDEX,
+`iUSTO` DOUBLE DEFAULT 0.047318541668048164
+)
+ENGINE=mito;
+
+DESC table `ExcePTuRi`;
+
+DESC TABLE test_like_1;
+
+DESC TABLE test_like_2;
+
+DROP TABLE test_like_1;
+
+DROP TABLE test_like_2;
+
+DROP table `ExcePTuRi`;
+
+CREATE TABLE if not exists monitor (
+  host STRING,
+  ts TIMESTAMP(9) DEFAULT CURRENT_TIMESTAMP() TIME INDEX,
+  cpu FLOAT64 DEFAULT 0,
+  memory FLOAT64,
+  PRIMARY KEY(host)) ENGINE=mito WITH(COMMENT='create by human');
+
+SHOW CREATE TABLE monitor;
+
+DROP TABLE monitor;

@@ -14,15 +14,28 @@
 
 use api::v1::value::ValueData;
 use api::v1::{ColumnDataType, RowInsertRequests};
-use common_grpc::writer::Precision;
+use common_grpc::precision::Precision;
+use hyper::Request;
 use influxdb_line_protocol::{parse_lines, FieldValue};
 use snafu::ResultExt;
 
 use crate::error::{Error, InfluxdbLineProtocolSnafu};
 use crate::row_writer::{self, MultiTableData};
 
-pub const INFLUXDB_TIMESTAMP_COLUMN_NAME: &str = "ts";
-pub const DEFAULT_TIME_PRECISION: Precision = Precision::Nanosecond;
+const INFLUXDB_API_PATH_NAME: &str = "influxdb";
+const INFLUXDB_API_V2_PATH_NAME: &str = "influxdb/api/v2";
+const INFLUXDB_TIMESTAMP_COLUMN_NAME: &str = "ts";
+const DEFAULT_TIME_PRECISION: Precision = Precision::Nanosecond;
+
+#[inline]
+pub(crate) fn is_influxdb_request<T>(req: &Request<T>) -> bool {
+    req.uri().path().contains(INFLUXDB_API_PATH_NAME)
+}
+
+#[inline]
+pub(crate) fn is_influxdb_v2_request<T>(req: &Request<T>) -> bool {
+    req.uri().path().contains(INFLUXDB_API_V2_PATH_NAME)
+}
 
 #[derive(Debug)]
 pub struct InfluxdbRequest {
@@ -39,7 +52,7 @@ impl TryFrom<InfluxdbRequest> for RowInsertRequests {
             .context(InfluxdbLineProtocolSnafu)?;
 
         let mut multi_table_data = MultiTableData::new();
-
+        let precision = unwrap_or_default_precision(value.precision);
         for line in &lines {
             let table_name = line.series.measurement.as_str();
             let tags = &line.series.tag_set;
@@ -53,7 +66,7 @@ impl TryFrom<InfluxdbRequest> for RowInsertRequests {
 
             // tags
             if let Some(tags) = tags {
-                let kvs = tags.iter().map(|(k, v)| (k.to_string(), v.as_str()));
+                let kvs = tags.iter().map(|(k, v)| (k.to_string(), v.to_string()));
                 row_writer::write_tags(table_data, kvs, &mut one_row)?;
             }
 
@@ -74,8 +87,7 @@ impl TryFrom<InfluxdbRequest> for RowInsertRequests {
             row_writer::write_fields(table_data, fields, &mut one_row)?;
 
             // timestamp
-            let precision = unwrap_or_default_precision(value.precision);
-            row_writer::write_ts_precision(
+            row_writer::write_ts_to_nanos(
                 table_data,
                 INFLUXDB_TIMESTAMP_COLUMN_NAME,
                 ts,
@@ -102,9 +114,8 @@ fn unwrap_or_default_precision(precision: Option<Precision>) -> Precision {
 #[cfg(test)]
 mod tests {
     use api::v1::value::ValueData;
-    use api::v1::{ColumnDataType, Rows, SemanticType};
+    use api::v1::{ColumnDataType, RowInsertRequests, Rows, SemanticType};
 
-    use super::*;
     use crate::influxdb::InfluxdbRequest;
 
     #[test]
@@ -182,7 +193,7 @@ monitor2,host=host4 cpu=66.3,memory=1029 1663840496400340003";
                 }
                 "ts" => {
                     assert_eq!(
-                        ColumnDataType::TimestampMillisecond as i32,
+                        ColumnDataType::TimestampNanosecond as i32,
                         column_schema.datatype
                     );
                     assert_eq!(SemanticType::Timestamp as i32, column_schema.semantic_type);
@@ -191,12 +202,12 @@ monitor2,host=host4 cpu=66.3,memory=1029 1663840496400340003";
                         let v = row.values[i].value_data.as_ref();
                         match j {
                             0 => assert_eq!(
-                                1663840496100023100 / 1_000_000,
-                                extract_ts_millis_value(v.as_ref().unwrap())
+                                1663840496100023100,
+                                extract_ts_nanos_value(v.as_ref().unwrap())
                             ),
                             1 => assert_eq!(
-                                1663840496400340001 / 1_000_000,
-                                extract_ts_millis_value(v.as_ref().unwrap())
+                                1663840496400340001,
+                                extract_ts_nanos_value(v.as_ref().unwrap())
                             ),
                             _ => panic!(),
                         }
@@ -257,7 +268,7 @@ monitor2,host=host4 cpu=66.3,memory=1029 1663840496400340003";
                 }
                 "ts" => {
                     assert_eq!(
-                        ColumnDataType::TimestampMillisecond as i32,
+                        ColumnDataType::TimestampNanosecond as i32,
                         column_schema.datatype
                     );
                     assert_eq!(SemanticType::Timestamp as i32, column_schema.semantic_type);
@@ -266,12 +277,12 @@ monitor2,host=host4 cpu=66.3,memory=1029 1663840496400340003";
                         let v = row.values[i].value_data.as_ref();
                         match j {
                             0 => assert_eq!(
-                                1663840496100023102 / 1_000_000,
-                                extract_ts_millis_value(v.as_ref().unwrap())
+                                1663840496100023102,
+                                extract_ts_nanos_value(v.as_ref().unwrap())
                             ),
                             1 => assert_eq!(
-                                1663840496400340003 / 1_000_000,
-                                extract_ts_millis_value(v.as_ref().unwrap())
+                                1663840496400340003,
+                                extract_ts_nanos_value(v.as_ref().unwrap())
                             ),
                             _ => panic!(),
                         }
@@ -285,21 +296,21 @@ monitor2,host=host4 cpu=66.3,memory=1029 1663840496400340003";
     fn extract_string_value(value: &ValueData) -> &str {
         match value {
             ValueData::StringValue(v) => v,
-            _ => panic!(),
+            _ => unreachable!(),
         }
     }
 
     fn extract_f64_value(value: &ValueData) -> f64 {
         match value {
             ValueData::F64Value(v) => *v,
-            _ => panic!(),
+            _ => unreachable!(),
         }
     }
 
-    fn extract_ts_millis_value(value: &ValueData) -> i64 {
+    fn extract_ts_nanos_value(value: &ValueData) -> i64 {
         match value {
-            ValueData::TimestampMillisecondValue(v) => *v,
-            _ => panic!(),
+            ValueData::TimestampNanosecondValue(v) => *v,
+            _ => unreachable!(),
         }
     }
 }

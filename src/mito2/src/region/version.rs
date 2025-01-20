@@ -26,12 +26,15 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use common_telemetry::info;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::SequenceNumber;
 
+use crate::error::Result;
 use crate::manifest::action::RegionEdit;
+use crate::memtable::time_partition::{TimePartitions, TimePartitionsRef};
 use crate::memtable::version::{MemtableVersion, MemtableVersionRef};
-use crate::memtable::{MemtableBuilderRef, MemtableId, MemtableRef};
+use crate::memtable::{MemtableBuilderRef, MemtableId};
 use crate::region::options::RegionOptions;
 use crate::sst::file::FileMeta;
 use crate::sst::file_purger::FilePurgerRef;
@@ -76,14 +79,17 @@ impl VersionControl {
     }
 
     /// Freezes the mutable memtable if it is not empty.
-    pub(crate) fn freeze_mutable(&self, builder: &MemtableBuilderRef) {
+    pub(crate) fn freeze_mutable(&self) -> Result<()> {
         let version = self.current().version;
-        if version.memtables.mutable.is_empty() {
-            return;
-        }
-        let new_mutable = builder.build(&version.metadata);
-        // Safety: Immutable memtable is None.
-        let new_memtables = version.memtables.freeze_mutable(new_mutable).unwrap();
+        let time_window = version.compaction_time_window;
+
+        let Some(new_memtables) = version
+            .memtables
+            .freeze_mutable(&version.metadata, time_window)?
+        else {
+            return Ok(());
+        };
+
         // Create a new version with memtable switched.
         let new_version = Arc::new(
             VersionBuilder::from_version(version)
@@ -91,6 +97,20 @@ impl VersionControl {
                 .build(),
         );
 
+        let mut version_data = self.data.write().unwrap();
+        version_data.version = new_version;
+
+        Ok(())
+    }
+
+    /// Applies region option changes and generates a new version.
+    pub(crate) fn alter_options(&self, options: RegionOptions) {
+        let version = self.current().version;
+        let new_version = Arc::new(
+            VersionBuilder::from_version(version)
+                .options(options)
+                .build(),
+        );
         let mut version_data = self.data.write().unwrap();
         version_data.version = new_version;
     }
@@ -117,7 +137,14 @@ impl VersionControl {
     /// Mark all opened files as deleted and set the delete marker in [VersionControlData]
     pub(crate) fn mark_dropped(&self, memtable_builder: &MemtableBuilderRef) {
         let version = self.current().version;
-        let new_mutable = memtable_builder.build(&version.metadata);
+        let part_duration = version.memtables.mutable.part_duration();
+        let next_memtable_id = version.memtables.mutable.next_memtable_id();
+        let new_mutable = Arc::new(TimePartitions::new(
+            version.metadata.clone(),
+            memtable_builder.clone(),
+            next_memtable_id,
+            part_duration,
+        ));
 
         let mut data = self.data.write().unwrap();
         data.is_dropped = true;
@@ -133,8 +160,15 @@ impl VersionControl {
     /// It replaces existing mutable memtable with a memtable that uses the
     /// new schema. Memtables of the version must be empty.
     pub(crate) fn alter_schema(&self, metadata: RegionMetadataRef, builder: &MemtableBuilderRef) {
-        let new_mutable = builder.build(&metadata);
         let version = self.current().version;
+        let part_duration = version.memtables.mutable.part_duration();
+        let next_memtable_id = version.memtables.mutable.next_memtable_id();
+        let new_mutable = Arc::new(TimePartitions::new(
+            metadata.clone(),
+            builder.clone(),
+            next_memtable_id,
+            part_duration,
+        ));
         debug_assert!(version.memtables.mutable.is_empty());
         debug_assert!(version.memtables.immutables().is_empty());
         let new_version = Arc::new(
@@ -157,7 +191,14 @@ impl VersionControl {
     ) {
         let version = self.current().version;
 
-        let new_mutable = memtable_builder.build(&version.metadata);
+        let part_duration = version.memtables.mutable.part_duration();
+        let next_memtable_id = version.memtables.mutable.next_memtable_id();
+        let new_mutable = Arc::new(TimePartitions::new(
+            version.metadata.clone(),
+            memtable_builder.clone(),
+            next_memtable_id,
+            part_duration,
+        ));
         let new_version = Arc::new(
             VersionBuilder::new(version.metadata.clone(), new_mutable)
                 .flushed_entry_id(truncated_entry_id)
@@ -213,7 +254,10 @@ pub(crate) struct Version {
     ///
     /// Used to check if it is a flush task during the truncating table.
     pub(crate) truncated_entry_id: Option<EntryId>,
-    /// Inferred compaction time window.
+    /// Inferred compaction time window from flush.
+    ///
+    /// If compaction options contain a time window, it will overwrite this value
+    /// when creating a new version from the [VersionBuilder].
     pub(crate) compaction_time_window: Option<Duration>,
     /// Options of the region.
     pub(crate) options: RegionOptions,
@@ -235,7 +279,7 @@ pub(crate) struct VersionBuilder {
 
 impl VersionBuilder {
     /// Returns a new builder.
-    pub(crate) fn new(metadata: RegionMetadataRef, mutable: MemtableRef) -> Self {
+    pub(crate) fn new(metadata: RegionMetadataRef, mutable: TimePartitionsRef) -> Self {
         VersionBuilder {
             metadata,
             memtables: Arc::new(MemtableVersion::new(mutable)),
@@ -349,7 +393,24 @@ impl VersionBuilder {
     }
 
     /// Builds a new [Version] from the builder.
+    /// It overwrites the window size by compaction option.
     pub(crate) fn build(self) -> Version {
+        let compaction_time_window = self
+            .options
+            .compaction
+            .time_window()
+            .or(self.compaction_time_window);
+        if self.compaction_time_window.is_some()
+            && compaction_time_window != self.compaction_time_window
+        {
+            info!(
+                "VersionBuilder overwrites region compaction time window from {:?} to {:?}, region: {}",
+                self.compaction_time_window,
+                compaction_time_window,
+                self.metadata.region_id
+            );
+        }
+
         Version {
             metadata: self.metadata,
             memtables: self.memtables,
@@ -357,7 +418,7 @@ impl VersionBuilder {
             flushed_entry_id: self.flushed_entry_id,
             flushed_sequence: self.flushed_sequence,
             truncated_entry_id: self.truncated_entry_id,
-            compaction_time_window: self.compaction_time_window,
+            compaction_time_window,
             options: self.options,
         }
     }

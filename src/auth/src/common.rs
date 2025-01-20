@@ -14,14 +14,17 @@
 
 use std::sync::Arc;
 
+use common_base::secrets::SecretString;
 use digest::Digest;
-use secrecy::SecretString;
 use sha1::Sha1;
 use snafu::{ensure, OptionExt};
 
 use crate::error::{IllegalParamSnafu, InvalidConfigSnafu, Result, UserPasswordMismatchSnafu};
 use crate::user_info::DefaultUserInfo;
 use crate::user_provider::static_user_provider::{StaticUserProvider, STATIC_USER_PROVIDER};
+use crate::user_provider::watch_file_user_provider::{
+    WatchFileUserProvider, WATCH_FILE_USER_PROVIDER,
+};
 use crate::{UserInfoRef, UserProviderRef};
 
 pub(crate) const DEFAULT_USERNAME: &str = "greptime";
@@ -40,8 +43,11 @@ pub fn user_provider_from_option(opt: &String) -> Result<UserProviderRef> {
     match name {
         STATIC_USER_PROVIDER => {
             let provider =
-                StaticUserProvider::try_from(content).map(|p| Arc::new(p) as UserProviderRef)?;
+                StaticUserProvider::new(content).map(|p| Arc::new(p) as UserProviderRef)?;
             Ok(provider)
+        }
+        WATCH_FILE_USER_PROVIDER => {
+            WatchFileUserProvider::new(content).map(|p| Arc::new(p) as UserProviderRef)
         }
         _ => InvalidConfigSnafu {
             value: name.to_string(),
@@ -67,6 +73,16 @@ pub enum Password<'a> {
     PlainText(SecretString),
     MysqlNativePassword(HashedPassword<'a>, Salt<'a>),
     PgMD5(HashedPassword<'a>, Salt<'a>),
+}
+
+impl Password<'_> {
+    pub fn r#type(&self) -> &str {
+        match self {
+            Password::PlainText(_) => "plain_text",
+            Password::MysqlNativePassword(_, _) => "mysql_native_password",
+            Password::PgMD5(_, _) => "pg_md5",
+        }
+    }
 }
 
 pub fn auth_mysql(

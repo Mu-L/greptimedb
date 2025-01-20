@@ -47,7 +47,7 @@ pub trait ArrowWriterCloser {
 impl<
         T: AsyncWrite + Send + Unpin,
         U: DfRecordBatchEncoder + ArrowWriterCloser,
-        F: FnMut(String) -> Fut,
+        F: Fn(String) -> Fut,
         Fut: Future<Output = Result<T>>,
     > LazyBufferedWriter<T, U, F>
 {
@@ -60,12 +60,6 @@ impl<
             .context(error::BufferedWriterClosedSnafu)?;
         let metadata = encoder.close().await?;
 
-        // Use `rows_written` to keep a track of if any rows have been written.
-        // If no row's been written, then we can simply close the underlying
-        // writer without flush so that no file will be actually created.
-        if self.rows_written != 0 {
-            self.bytes_written += self.try_flush(true).await?;
-        }
         // It's important to shut down! flushes all pending writes
         self.close_inner_writer().await?;
         Ok((metadata, self.bytes_written))
@@ -75,12 +69,19 @@ impl<
 impl<
         T: AsyncWrite + Send + Unpin,
         U: DfRecordBatchEncoder,
-        F: FnMut(String) -> Fut,
+        F: Fn(String) -> Fut,
         Fut: Future<Output = Result<T>>,
     > LazyBufferedWriter<T, U, F>
 {
-    /// Closes the writer without flushing the buffer data.
+    /// Closes the writer and flushes the buffer data.
     pub async fn close_inner_writer(&mut self) -> Result<()> {
+        // Use `rows_written` to keep a track of if any rows have been written.
+        // If no row's been written, then we can simply close the underlying
+        // writer without flush so that no file will be actually created.
+        if self.rows_written != 0 {
+            self.bytes_written += self.try_flush(true).await?;
+        }
+
         if let Some(writer) = &mut self.writer {
             writer.shutdown().await.context(error::AsyncWriteSnafu)?;
         }
@@ -117,7 +118,7 @@ impl<
         Ok(())
     }
 
-    pub async fn try_flush(&mut self, all: bool) -> Result<u64> {
+    async fn try_flush(&mut self, all: bool) -> Result<u64> {
         let mut bytes_written: u64 = 0;
 
         // Once buffered data size reaches threshold, split the data in chunks (typically 4MB)
@@ -149,7 +150,7 @@ impl<
         if let Some(ref mut writer) = self.writer {
             Ok(writer)
         } else {
-            let writer = (self.writer_factory)(self.path.clone()).await?;
+            let writer = (self.writer_factory)(self.path.to_string()).await?;
             Ok(self.writer.insert(writer))
         }
     }

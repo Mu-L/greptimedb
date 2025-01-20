@@ -16,16 +16,14 @@
 
 use std::sync::Arc;
 
-use common_telemetry::{error, info, warn};
-use common_time::util::current_time_millis;
+use common_telemetry::{error, info};
 use store_api::logstore::LogStore;
 use store_api::region_request::RegionFlushRequest;
 use store_api::storage::RegionId;
 
 use crate::config::MitoConfig;
-use crate::error::{RegionTruncatedSnafu, Result};
+use crate::error::{RegionNotFoundSnafu, Result};
 use crate::flush::{FlushReason, RegionFlushTask};
-use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
 use crate::region::MitoRegionRef;
 use crate::request::{FlushFailed, FlushFinished, OnFailure, OptionOutputTx};
 use crate::worker::RegionWorkerLoop;
@@ -38,16 +36,18 @@ impl<S> RegionWorkerLoop<S> {
         request: RegionFlushRequest,
         mut sender: OptionOutputTx,
     ) {
-        let Some(region) = self.regions.writable_region_or(region_id, &mut sender) else {
+        let Some(region) = self.regions.flushable_region_or(region_id, &mut sender) else {
             return;
         };
 
-        let mut task = self.new_flush_task(
-            &region,
-            FlushReason::Manual,
-            request.row_group_size,
-            self.config.clone(),
-        );
+        let reason = if region.is_downgrading() {
+            FlushReason::Downgrading
+        } else {
+            FlushReason::Manual
+        };
+
+        let mut task =
+            self.new_flush_task(&region, reason, request.row_group_size, self.config.clone());
         task.push_sender(sender);
         if let Err(e) =
             self.flush_scheduler
@@ -77,18 +77,18 @@ impl<S> RegionWorkerLoop<S> {
         }
     }
 
-    /// Find some regions to flush to reduce write buffer usage.
+    /// Finds some regions to flush to reduce write buffer usage.
     fn flush_regions_on_engine_full(&mut self) -> Result<()> {
         let regions = self.regions.list_regions();
-        let now = current_time_millis();
+        let now = self.time_provider.current_time_millis();
         let min_last_flush_time = now - self.config.auto_flush_interval.as_millis() as i64;
         let mut max_mutable_size = 0;
         // Region with max mutable memtable size.
         let mut max_mem_region = None;
 
         for region in &regions {
-            if self.flush_scheduler.is_flush_requested(region.region_id) {
-                // Already flushing.
+            if self.flush_scheduler.is_flush_requested(region.region_id) || !region.is_writable() {
+                // Already flushing or not writable.
                 continue;
             }
 
@@ -129,7 +129,38 @@ impl<S> RegionWorkerLoop<S> {
         Ok(())
     }
 
-    /// Create a flush task with specific `reason` for the `region`.
+    /// Flushes regions periodically.
+    pub(crate) fn flush_periodically(&mut self) -> Result<()> {
+        let regions = self.regions.list_regions();
+        let now = self.time_provider.current_time_millis();
+        let min_last_flush_time = now - self.config.auto_flush_interval.as_millis() as i64;
+
+        for region in &regions {
+            if self.flush_scheduler.is_flush_requested(region.region_id) || !region.is_writable() {
+                // Already flushing or not writable.
+                continue;
+            }
+
+            if region.last_flush_millis() < min_last_flush_time {
+                // If flush time of this region is earlier than `min_last_flush_time`, we can flush this region.
+                let task = self.new_flush_task(
+                    region,
+                    FlushReason::Periodically,
+                    None,
+                    self.config.clone(),
+                );
+                self.flush_scheduler.schedule_flush(
+                    region.region_id,
+                    &region.version_control,
+                    task,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Creates a flush task with specific `reason` for the `region`.
     pub(crate) fn new_flush_task(
         &self,
         region: &MitoRegionRef,
@@ -137,18 +168,18 @@ impl<S> RegionWorkerLoop<S> {
         row_group_size: Option<usize>,
         engine_config: Arc<MitoConfig>,
     ) -> RegionFlushTask {
-        // TODO(yingwen): metrics for flush requested.
         RegionFlushTask {
             region_id: region.region_id,
             reason,
             senders: Vec::new(),
             request_sender: self.sender.clone(),
             access_layer: region.access_layer.clone(),
-            memtable_builder: self.memtable_builder.clone(),
-            file_purger: region.file_purger.clone(),
             listener: self.listener.clone(),
             engine_config,
             row_group_size,
+            cache_manager: self.cache_manager.clone(),
+            manifest_ctx: region.manifest_ctx.clone(),
+            index_options: region.version().options.index_options.clone(),
         }
     }
 }
@@ -160,40 +191,24 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         region_id: RegionId,
         mut request: FlushFinished,
     ) {
-        let Some(region) = self.regions.writable_region_or(region_id, &mut request) else {
-            return;
-        };
+        // Notifies other workers. Even the remaining steps of this method fail we still
+        // wake up other workers as we have released some memory by flush.
+        self.notify_group();
 
-        // The flush task before truncating the region fails immediately.
-        let version_data = region.version_control.current();
-        if let Some(truncated_entry_id) = version_data.version.truncated_entry_id {
-            if truncated_entry_id >= request.flushed_entry_id {
-                request.on_failure(RegionTruncatedSnafu { region_id }.build());
+        let region = match self.regions.get_region(region_id) {
+            Some(region) => region,
+            None => {
+                request.on_failure(RegionNotFoundSnafu { region_id }.build());
                 return;
             }
-        }
-
-        // Write region edit to manifest.
-        let edit = RegionEdit {
-            files_to_add: std::mem::take(&mut request.file_metas),
-            files_to_remove: Vec::new(),
-            compaction_time_window: None,
-            flushed_entry_id: Some(request.flushed_entry_id),
-            flushed_sequence: Some(request.flushed_sequence),
         };
-        let action_list = RegionMetaActionList::with_action(RegionMetaAction::Edit(edit.clone()));
-        if let Err(e) = region.manifest_manager.update(action_list).await {
-            error!(e; "Failed to write manifest, region: {}", region_id);
-            request.on_failure(e);
-            return;
-        }
 
-        // Apply edit to region's version.
         region.version_control.apply_edit(
-            edit,
+            request.edit.clone(),
             &request.memtables_to_remove,
             region.file_purger.clone(),
         );
+
         region.update_flush_millis();
 
         // Delete wal.
@@ -203,7 +218,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         );
         if let Err(e) = self
             .wal
-            .obsolete(region_id, request.flushed_entry_id, &region.wal_options)
+            .obsolete(region_id, request.flushed_entry_id, &region.provider)
             .await
         {
             error!(e; "Failed to write wal, region: {}", region_id);
@@ -225,24 +240,10 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         }
 
         // Handle stalled requests.
-        let stalled = std::mem::take(&mut self.stalled_requests);
-        // We already stalled these requests, don't stall them again.
-        self.handle_write_requests(stalled.requests, false).await;
+        self.handle_stalled_requests().await;
 
         // Schedules compaction.
-        if let Err(e) = self.compaction_scheduler.schedule_compaction(
-            region.region_id,
-            &region.version_control,
-            &region.access_layer,
-            &region.file_purger,
-            OptionOutputTx::none(),
-            self.config.clone(),
-        ) {
-            warn!(
-                "Failed to schedule compaction after flush, region: {}, err: {}",
-                region.region_id, e
-            );
-        }
+        self.schedule_compaction(&region).await;
 
         self.listener.on_flush_success(region_id);
     }

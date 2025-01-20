@@ -30,10 +30,10 @@ use snafu::{OptionExt, ResultExt};
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
 
-use crate::cache::CacheManager;
+use crate::cache::CacheStrategy;
 use crate::error::{InvalidRequestSnafu, Result};
 use crate::read::Batch;
-use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
+use crate::row_converter::{DensePrimaryKeyCodec, PrimaryKeyCodec};
 
 /// Only cache vector when its length `<=` this value.
 const MAX_VECTOR_LENGTH_TO_CACHE: usize = 16384;
@@ -47,14 +47,14 @@ pub struct ProjectionMapper {
     /// Output record batch contains tags.
     has_tags: bool,
     /// Decoder for primary key.
-    codec: McmpRowCodec,
+    codec: DensePrimaryKeyCodec,
     /// Schema for converted [RecordBatch].
     output_schema: SchemaRef,
     /// Ids of columns to project. It keeps ids in the same order as the `projection`
     /// indices to build the mapper.
     column_ids: Vec<ColumnId>,
-    /// Ids of field columns in the [Batch].
-    batch_fields: Vec<ColumnId>,
+    /// Ids and DataTypes of field columns in the [Batch].
+    batch_fields: Vec<(ColumnId, ConcreteDataType)>,
 }
 
 impl ProjectionMapper {
@@ -80,12 +80,7 @@ impl ProjectionMapper {
             // Safety: idx is valid.
             column_schemas.push(metadata.schema.column_schemas()[*idx].clone());
         }
-        let codec = McmpRowCodec::new(
-            metadata
-                .primary_key_columns()
-                .map(|c| SortField::new(c.column_schema.data_type.clone()))
-                .collect(),
-        );
+        let codec = DensePrimaryKeyCodec::new(metadata);
         // Safety: Columns come from existing schema.
         let output_schema = Arc::new(Schema::new(column_schemas));
         // Get fields in each batch.
@@ -95,7 +90,7 @@ impl ProjectionMapper {
         let field_id_to_index: HashMap<_, _> = batch_fields
             .iter()
             .enumerate()
-            .map(|(index, column_id)| (*column_id, index))
+            .map(|(index, (column_id, _))| (*column_id, index))
             .collect();
         // For each projected column, compute its index in batches.
         let mut batch_indices = Vec::with_capacity(projection.len());
@@ -151,7 +146,7 @@ impl ProjectionMapper {
     }
 
     /// Returns ids of fields in [Batch]es the mapper expects to convert.
-    pub(crate) fn batch_fields(&self) -> &[ColumnId] {
+    pub(crate) fn batch_fields(&self) -> &[(ColumnId, ConcreteDataType)] {
         &self.batch_fields
     }
 
@@ -160,27 +155,36 @@ impl ProjectionMapper {
         self.output_schema.clone()
     }
 
+    /// Returns an empty [RecordBatch].
+    pub(crate) fn empty_record_batch(&self) -> RecordBatch {
+        RecordBatch::new_empty(self.output_schema.clone())
+    }
+
     /// Converts a [Batch] to a [RecordBatch].
     ///
     /// The batch must match the `projection` using to build the mapper.
     pub(crate) fn convert(
         &self,
         batch: &Batch,
-        cache_manager: Option<&CacheManager>,
+        cache_strategy: &CacheStrategy,
     ) -> common_recordbatch::error::Result<RecordBatch> {
         debug_assert_eq!(self.batch_fields.len(), batch.fields().len());
         debug_assert!(self
             .batch_fields
             .iter()
             .zip(batch.fields())
-            .all(|(id, batch_col)| *id == batch_col.column_id));
+            .all(|((id, _), batch_col)| *id == batch_col.column_id));
 
         // Skips decoding pk if we don't need to output it.
         let pk_values = if self.has_tags {
-            self.codec
-                .decode(batch.primary_key())
-                .map_err(BoxedError::new)
-                .context(ExternalSnafu)?
+            match batch.pk_values() {
+                Some(v) => v.to_vec(),
+                None => self
+                    .codec
+                    .decode_dense(batch.primary_key())
+                    .map_err(BoxedError::new)
+                    .context(ExternalSnafu)?,
+            }
         } else {
             Vec::new()
         };
@@ -195,15 +199,12 @@ impl ProjectionMapper {
             match index {
                 BatchIndex::Tag(idx) => {
                     let value = &pk_values[*idx];
-                    let vector = match cache_manager {
-                        Some(cache) => repeated_vector_with_cache(
-                            &column_schema.data_type,
-                            value,
-                            num_rows,
-                            cache,
-                        )?,
-                        None => new_repeated_vector(&column_schema.data_type, value, num_rows)?,
-                    };
+                    let vector = repeated_vector_with_cache(
+                        &column_schema.data_type,
+                        value,
+                        num_rows,
+                        cache_strategy,
+                    )?;
                     columns.push(vector);
                 }
                 BatchIndex::Timestamp => {
@@ -235,9 +236,9 @@ fn repeated_vector_with_cache(
     data_type: &ConcreteDataType,
     value: &Value,
     num_rows: usize,
-    cache_manager: &CacheManager,
+    cache_strategy: &CacheStrategy,
 ) -> common_recordbatch::error::Result<VectorRef> {
-    if let Some(vector) = cache_manager.get_repeated_vector(value) {
+    if let Some(vector) = cache_strategy.get_repeated_vector(data_type, value) {
         // Tries to get the vector from cache manager. If the vector doesn't
         // have enough length, creates a new one.
         match vector.len().cmp(&num_rows) {
@@ -251,7 +252,7 @@ fn repeated_vector_with_cache(
     let vector = new_repeated_vector(data_type, value, num_rows)?;
     // Updates cache.
     if vector.len() <= MAX_VECTOR_LENGTH_TO_CACHE {
-        cache_manager.put_repeated_vector(value.clone(), vector.clone());
+        cache_strategy.put_repeated_vector(value.clone(), vector.clone());
     }
 
     Ok(vector)
@@ -275,13 +276,17 @@ fn new_repeated_vector(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use api::v1::OpType;
     use datatypes::arrow::array::{Int64Array, TimestampMillisecondArray, UInt64Array, UInt8Array};
     use datatypes::arrow::util::pretty;
     use datatypes::value::ValueRef;
 
     use super::*;
+    use crate::cache::CacheManager;
     use crate::read::BatchBuilder;
+    use crate::row_converter::{PrimaryKeyCodecExt, SortField};
     use crate::test_util::meta_util::TestRegionMetadataBuilder;
 
     fn new_batch(
@@ -290,7 +295,7 @@ mod tests {
         fields: &[(ColumnId, i64)],
         num_rows: usize,
     ) -> Batch {
-        let converter = McmpRowCodec::new(
+        let converter = DensePrimaryKeyCodec::with_fields(
             (0..tags.len())
                 .map(|_| SortField::new(ConcreteDataType::int64_datatype()))
                 .collect(),
@@ -340,11 +345,19 @@ mod tests {
         );
         let mapper = ProjectionMapper::all(&metadata).unwrap();
         assert_eq!([0, 1, 2, 3, 4], mapper.column_ids());
-        assert_eq!([3, 4], mapper.batch_fields());
+        assert_eq!(
+            [
+                (3, ConcreteDataType::int64_datatype()),
+                (4, ConcreteDataType::int64_datatype())
+            ],
+            mapper.batch_fields()
+        );
 
-        let cache = CacheManager::new(0, 1024, 0);
+        // With vector cache.
+        let cache = CacheManager::builder().vector_cache_size(1024).build();
+        let cache = CacheStrategy::EnableAll(Arc::new(cache));
         let batch = new_batch(0, &[1, 2], &[(3, 3), (4, 4)], 3);
-        let record_batch = mapper.convert(&batch, Some(&cache)).unwrap();
+        let record_batch = mapper.convert(&batch, &cache).unwrap();
         let expect = "\
 +---------------------+----+----+----+----+
 | ts                  | k0 | k1 | v0 | v1 |
@@ -355,10 +368,16 @@ mod tests {
 +---------------------+----+----+----+----+";
         assert_eq!(expect, print_record_batch(record_batch));
 
-        assert!(cache.get_repeated_vector(&Value::Int64(1)).is_some());
-        assert!(cache.get_repeated_vector(&Value::Int64(2)).is_some());
-        assert!(cache.get_repeated_vector(&Value::Int64(3)).is_none());
-        let record_batch = mapper.convert(&batch, Some(&cache)).unwrap();
+        assert!(cache
+            .get_repeated_vector(&ConcreteDataType::int64_datatype(), &Value::Int64(1))
+            .is_some());
+        assert!(cache
+            .get_repeated_vector(&ConcreteDataType::int64_datatype(), &Value::Int64(2))
+            .is_some());
+        assert!(cache
+            .get_repeated_vector(&ConcreteDataType::int64_datatype(), &Value::Int64(3))
+            .is_none());
+        let record_batch = mapper.convert(&batch, &cache).unwrap();
         assert_eq!(expect, print_record_batch(record_batch));
     }
 
@@ -373,10 +392,15 @@ mod tests {
         // Columns v1, k0
         let mapper = ProjectionMapper::new(&metadata, [4, 1].into_iter()).unwrap();
         assert_eq!([4, 1], mapper.column_ids());
-        assert_eq!([4], mapper.batch_fields());
+        assert_eq!(
+            [(4, ConcreteDataType::int64_datatype())],
+            mapper.batch_fields()
+        );
 
         let batch = new_batch(0, &[1, 2], &[(4, 4)], 3);
-        let record_batch = mapper.convert(&batch, None).unwrap();
+        let cache = CacheManager::builder().vector_cache_size(1024).build();
+        let cache = CacheStrategy::EnableAll(Arc::new(cache));
+        let record_batch = mapper.convert(&batch, &cache).unwrap();
         let expect = "\
 +----+----+
 | v1 | k0 |

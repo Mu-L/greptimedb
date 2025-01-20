@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::str::FromStr;
-
 use arrow::datatypes::{DataType as ArrowDataType, Date64Type};
 use common_time::DateTime;
 use serde::{Deserialize, Serialize};
@@ -25,9 +23,16 @@ use crate::prelude::{LogicalTypeId, MutableVector, ScalarVectorBuilder, Value, V
 use crate::types::LogicalPrimitiveType;
 use crate::vectors::{DateTimeVector, DateTimeVectorBuilder, PrimitiveVector};
 
+const MILLISECOND_VARIATION: u64 = 3;
 /// Data type for [`DateTime`].
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DateTimeType;
+
+impl DateTimeType {
+    pub fn precision(&self) -> u64 {
+        MILLISECOND_VARIATION
+    }
+}
 
 impl DataType for DateTimeType {
     fn name(&self) -> String {
@@ -54,7 +59,9 @@ impl DataType for DateTimeType {
         match from {
             Value::Int64(v) => Some(Value::DateTime(DateTime::from(v))),
             Value::Timestamp(v) => v.to_chrono_datetime().map(|d| Value::DateTime(d.into())),
-            Value::String(v) => DateTime::from_str(v.as_utf8()).map(Value::DateTime).ok(),
+            Value::String(v) => DateTime::from_str_system(v.as_utf8())
+                .map(Value::DateTime)
+                .ok(),
             _ => None,
         }
     }
@@ -119,15 +126,15 @@ mod tests {
         let dt = ConcreteDataType::datetime_datatype().try_cast(val).unwrap();
         assert_eq!(
             dt,
-            Value::DateTime(DateTime::from_str("1970-01-01 00:00:00+0800").unwrap())
+            Value::DateTime(DateTime::from_str_system("1970-01-01 00:00:00+0800").unwrap())
         );
 
         // cast from Timestamp
-        let val = Value::Timestamp(Timestamp::from_str("2020-09-08 21:42:29+0800").unwrap());
+        let val = Value::Timestamp(Timestamp::from_str_utc("2020-09-08 21:42:29+0800").unwrap());
         let dt = ConcreteDataType::datetime_datatype().try_cast(val).unwrap();
         assert_eq!(
             dt,
-            Value::DateTime(DateTime::from_str("2020-09-08 21:42:29+0800").unwrap())
+            Value::DateTime(DateTime::from_str_system("2020-09-08 21:42:29+0800").unwrap())
         );
     }
 }

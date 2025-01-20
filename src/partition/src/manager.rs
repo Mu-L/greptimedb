@@ -16,12 +16,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use api::v1::Rows;
-use common_meta::key::table_route::TableRouteManager;
+use common_meta::cache::{TableRoute, TableRouteCacheRef};
+use common_meta::key::table_route::{PhysicalTableRouteValue, TableRouteManager};
 use common_meta::kv_backend::KvBackendRef;
 use common_meta::peer::Peer;
-use common_meta::rpc::router::RegionRoutes;
-use common_query::prelude::Expr;
-use datafusion_expr::{BinaryExpr, Expr as DfExpr, Operator};
+use common_meta::rpc::router::{self, RegionRoute};
+use datafusion_expr::{BinaryExpr, Expr, Operator};
 use datatypes::prelude::Value;
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::storage::{RegionId, RegionNumber};
@@ -29,7 +29,7 @@ use table::metadata::TableId;
 
 use crate::columns::RangeColumnsPartitionRule;
 use crate::error::{FindLeaderSnafu, Result};
-use crate::metrics::METRIC_TABLE_ROUTE_GET;
+use crate::multi_dim::MultiDimPartitionRule;
 use crate::partition::{PartitionBound, PartitionDef, PartitionExpr};
 use crate::range::RangePartitionRule;
 use crate::splitter::RowSplitter;
@@ -50,6 +50,7 @@ pub type PartitionRuleManagerRef = Arc<PartitionRuleManager>;
 /// - filters (in case of select, deletion and update)
 pub struct PartitionRuleManager {
     table_route_manager: TableRouteManager,
+    table_route_cache: TableRouteCacheRef,
 }
 
 #[derive(Debug)]
@@ -59,80 +60,129 @@ pub struct PartitionInfo {
 }
 
 impl PartitionRuleManager {
-    pub fn new(kv_backend: KvBackendRef) -> Self {
+    pub fn new(kv_backend: KvBackendRef, table_route_cache: TableRouteCacheRef) -> Self {
         Self {
             table_route_manager: TableRouteManager::new(kv_backend),
+            table_route_cache,
         }
     }
 
-    /// Find table route of given table name.
-    pub async fn find_table_route(&self, table_id: TableId) -> Result<RegionRoutes> {
-        let _timer = METRIC_TABLE_ROUTE_GET.start_timer();
-        let route = self
-            .table_route_manager
+    pub async fn find_physical_table_route(
+        &self,
+        table_id: TableId,
+    ) -> Result<Arc<PhysicalTableRouteValue>> {
+        match self
+            .table_route_cache
             .get(table_id)
             .await
             .context(error::TableRouteManagerSnafu)?
-            .context(error::FindTableRoutesSnafu { table_id })?
-            .into_inner();
+            .context(error::TableRouteNotFoundSnafu { table_id })?
+            .as_ref()
+        {
+            TableRoute::Physical(physical_table_route) => Ok(physical_table_route.clone()),
+            TableRoute::Logical(logical_table_route) => {
+                let physical_table_id = logical_table_route.physical_table_id();
+                let physical_table_route = self
+                    .table_route_cache
+                    .get(physical_table_id)
+                    .await
+                    .context(error::TableRouteManagerSnafu)?
+                    .context(error::TableRouteNotFoundSnafu { table_id })?;
 
-        Ok(RegionRoutes(route.region_routes().clone()))
+                let physical_table_route = physical_table_route
+                    .as_physical_table_route_ref()
+                    .context(error::UnexpectedSnafu{
+                        err_msg: format!(
+                            "Expected the physical table route, but got logical table route, table: {table_id}"
+                        ),
+                    })?;
+
+                Ok(physical_table_route.clone())
+            }
+        }
+    }
+
+    pub async fn batch_find_region_routes(
+        &self,
+        table_ids: &[TableId],
+    ) -> Result<HashMap<TableId, Vec<RegionRoute>>> {
+        let table_routes = self
+            .table_route_manager
+            .batch_get_physical_table_routes(table_ids)
+            .await
+            .context(error::TableRouteManagerSnafu)?;
+
+        let mut table_region_routes = HashMap::with_capacity(table_routes.len());
+
+        for (table_id, table_route) in table_routes {
+            let region_routes = table_route.region_routes;
+            table_region_routes.insert(table_id, region_routes);
+        }
+
+        Ok(table_region_routes)
     }
 
     pub async fn find_table_partitions(&self, table_id: TableId) -> Result<Vec<PartitionInfo>> {
-        let route = self
-            .table_route_manager
-            .get(table_id)
-            .await
-            .context(error::TableRouteManagerSnafu)?
-            .context(error::FindTableRoutesSnafu { table_id })?
-            .into_inner();
-        let region_routes = route.region_routes();
-
+        let region_routes = &self
+            .find_physical_table_route(table_id)
+            .await?
+            .region_routes;
         ensure!(
             !region_routes.is_empty(),
             error::FindTableRoutesSnafu { table_id }
         );
 
-        let mut partitions = Vec::with_capacity(region_routes.len());
-        for r in region_routes {
-            let partition = r
-                .region
-                .partition
-                .clone()
-                .context(error::FindRegionRoutesSnafu {
-                    region_id: r.region.id,
-                    table_id,
-                })?;
-            let partition_def = PartitionDef::try_from(partition)?;
+        create_partitions_from_region_routes(table_id, region_routes)
+    }
 
-            partitions.push(PartitionInfo {
-                id: r.region.id,
-                partition: partition_def,
-            });
-        }
-        partitions.sort_by(|a, b| {
-            a.partition
-                .partition_bounds()
-                .cmp(b.partition.partition_bounds())
-        });
+    pub async fn batch_find_table_partitions(
+        &self,
+        table_ids: &[TableId],
+    ) -> Result<HashMap<TableId, Vec<PartitionInfo>>> {
+        let batch_region_routes = self.batch_find_region_routes(table_ids).await?;
 
-        ensure!(
-            partitions
-                .windows(2)
-                .all(|w| w[0].partition.partition_columns() == w[1].partition.partition_columns()),
-            error::InvalidTableRouteDataSnafu {
+        let mut results = HashMap::with_capacity(table_ids.len());
+
+        for (table_id, region_routes) in batch_region_routes {
+            results.insert(
                 table_id,
-                err_msg: "partition columns of all regions are not the same"
-            }
-        );
+                create_partitions_from_region_routes(table_id, &region_routes)?,
+            );
+        }
 
-        Ok(partitions)
+        Ok(results)
+    }
+
+    pub async fn find_table_partition_rule(&self, table_id: TableId) -> Result<PartitionRuleRef> {
+        let partitions = self.find_table_partitions(table_id).await?;
+
+        let partition_columns = partitions[0].partition.partition_columns();
+
+        let regions = partitions
+            .iter()
+            .map(|x| x.id.region_number())
+            .collect::<Vec<RegionNumber>>();
+
+        let exprs = partitions
+            .iter()
+            .filter_map(|x| match &x.partition.partition_bounds()[0] {
+                PartitionBound::Expr(e) => Some(e.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let rule = MultiDimPartitionRule::try_new(partition_columns.clone(), regions, exprs)?;
+        Ok(Arc::new(rule) as _)
     }
 
     /// Get partition rule of given table.
-    pub async fn find_table_partition_rule(&self, table_id: TableId) -> Result<PartitionRuleRef> {
+    pub async fn find_table_partition_rule_deprecated(
+        &self,
+        table_id: TableId,
+    ) -> Result<PartitionRuleRef> {
         let partitions = self.find_table_partitions(table_id).await?;
+
+        debug_assert!(!partitions.is_empty());
 
         let partition_columns = partitions[0].partition.partition_columns();
 
@@ -150,6 +200,7 @@ impl PartitionRuleManager {
                     .filter_map(|info| match &info.partition.partition_bounds()[0] {
                         PartitionBound::Value(v) => Some(v.clone()),
                         PartitionBound::MaxValue => None,
+                        PartitionBound::Expr(_) => None,
                     })
                     .collect::<Vec<Value>>();
                 Arc::new(RangePartitionRule::new(
@@ -207,14 +258,17 @@ impl PartitionRuleManager {
     }
 
     pub async fn find_region_leader(&self, region_id: RegionId) -> Result<Peer> {
-        let table_route = self.find_table_route(region_id.table_id()).await?;
-        let peer = table_route
-            .find_region_leader(region_id.region_number())
-            .with_context(|| FindLeaderSnafu {
+        let region_routes = &self
+            .find_physical_table_route(region_id.table_id())
+            .await?
+            .region_routes;
+
+        router::find_region_leader(region_routes, region_id.region_number()).context(
+            FindLeaderSnafu {
                 region_id,
                 table_id: region_id.table_id(),
-            })?;
-        Ok(peer.clone())
+            },
+        )
     }
 
     pub async fn split_rows(
@@ -227,13 +281,61 @@ impl PartitionRuleManager {
     }
 }
 
+fn create_partitions_from_region_routes(
+    table_id: TableId,
+    region_routes: &[RegionRoute],
+) -> Result<Vec<PartitionInfo>> {
+    let mut partitions = Vec::with_capacity(region_routes.len());
+    for r in region_routes {
+        let partition = r
+            .region
+            .partition
+            .as_ref()
+            .context(error::FindRegionRoutesSnafu {
+                region_id: r.region.id,
+                table_id,
+            })?;
+        let partition_def = PartitionDef::try_from(partition)?;
+
+        // The region routes belong to the physical table but are shared among all logical tables.
+        // That it to say, the region id points to the physical table, so we need to use the actual
+        // table id (which may be a logical table) to renew the region id.
+        let id = RegionId::new(table_id, r.region.id.region_number());
+        partitions.push(PartitionInfo {
+            id,
+            partition: partition_def,
+        });
+    }
+    partitions.sort_by(|a, b| {
+        a.partition
+            .partition_bounds()
+            .cmp(b.partition.partition_bounds())
+    });
+
+    ensure!(
+        partitions
+            .windows(2)
+            .all(|w| w[0].partition.partition_columns() == w[1].partition.partition_columns()),
+        error::InvalidTableRouteDataSnafu {
+            table_id,
+            err_msg: "partition columns of all regions are not the same"
+        }
+    );
+
+    Ok(partitions)
+}
+
 fn find_regions0(partition_rule: PartitionRuleRef, filter: &Expr) -> Result<HashSet<RegionNumber>> {
-    let expr = filter.df_expr();
-    match expr {
-        DfExpr::BinaryExpr(BinaryExpr { left, op, right }) if is_compare_op(op) => {
+    match filter {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if op.is_comparison_operator() => {
             let column_op_value = match (left.as_ref(), right.as_ref()) {
-                (DfExpr::Column(c), DfExpr::Literal(v)) => Some((&c.name, *op, v)),
-                (DfExpr::Literal(v), DfExpr::Column(c)) => Some((&c.name, reverse_operator(op), v)),
+                (Expr::Column(c), Expr::Literal(v)) => Some((&c.name, *op, v)),
+                (Expr::Literal(v), Expr::Column(c)) => Some((
+                    &c.name,
+                    // Safety: previous branch ensures this is a comparison operator
+                    op.swap().unwrap(),
+                    v,
+                )),
                 _ => None,
             };
             if let Some((column, op, scalar)) = column_op_value {
@@ -248,11 +350,11 @@ fn find_regions0(partition_rule: PartitionRuleRef, filter: &Expr) -> Result<Hash
                     .collect::<HashSet<RegionNumber>>());
             }
         }
-        DfExpr::BinaryExpr(BinaryExpr { left, op, right })
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
             if matches!(op, Operator::And | Operator::Or) =>
         {
-            let left_regions = find_regions0(partition_rule.clone(), &(*left.clone()).into())?;
-            let right_regions = find_regions0(partition_rule.clone(), &(*right.clone()).into())?;
+            let left_regions = find_regions0(partition_rule.clone(), &left.clone())?;
+            let right_regions = find_regions0(partition_rule.clone(), &right.clone())?;
             let regions = match op {
                 Operator::And => left_regions
                     .intersection(&right_regions)
@@ -274,28 +376,4 @@ fn find_regions0(partition_rule: PartitionRuleRef, filter: &Expr) -> Result<Hash
         .find_regions_by_exprs(&[])?
         .into_iter()
         .collect::<HashSet<RegionNumber>>())
-}
-
-#[inline]
-fn is_compare_op(op: &Operator) -> bool {
-    matches!(
-        *op,
-        Operator::Eq
-            | Operator::NotEq
-            | Operator::Lt
-            | Operator::LtEq
-            | Operator::Gt
-            | Operator::GtEq
-    )
-}
-
-#[inline]
-fn reverse_operator(op: &Operator) -> Operator {
-    match *op {
-        Operator::Lt => Operator::Gt,
-        Operator::Gt => Operator::Lt,
-        Operator::LtEq => Operator::GtEq,
-        Operator::GtEq => Operator::LtEq,
-        _ => *op,
-    }
 }

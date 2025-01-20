@@ -13,12 +13,13 @@
 // limitations under the License.
 
 use std::any::Any;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 
 use common_meta::rpc::router::Partition as MetaPartition;
 use datafusion_expr::Operator;
 use datatypes::prelude::Value;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use store_api::storage::RegionNumber;
@@ -48,12 +49,36 @@ pub trait PartitionRule: Sync + Send {
 pub enum PartitionBound {
     Value(Value),
     MaxValue,
+    Expr(crate::expr::PartitionExpr),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitionDef {
     partition_columns: Vec<String>,
     partition_bounds: Vec<PartitionBound>,
+}
+
+impl Display for PartitionBound {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Value(v) => write!(f, "{}", v),
+            Self::MaxValue => write!(f, "MAXVALUE"),
+            Self::Expr(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl Display for PartitionDef {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            self.partition_bounds
+                .iter()
+                .map(|b| format!("{b}"))
+                .join(", ")
+        )
+    }
 }
 
 impl PartitionDef {
@@ -73,23 +98,23 @@ impl PartitionDef {
     }
 }
 
-impl TryFrom<MetaPartition> for PartitionDef {
+impl TryFrom<&MetaPartition> for PartitionDef {
     type Error = Error;
 
-    fn try_from(partition: MetaPartition) -> Result<Self> {
+    fn try_from(partition: &MetaPartition) -> Result<Self> {
         let MetaPartition {
             column_list,
             value_list,
         } = partition;
 
         let partition_columns = column_list
-            .into_iter()
-            .map(|x| String::from_utf8_lossy(&x).to_string())
+            .iter()
+            .map(|x| String::from_utf8_lossy(x).to_string())
             .collect::<Vec<String>>();
 
         let partition_bounds = value_list
-            .into_iter()
-            .map(|x| serde_json::from_str(&String::from_utf8_lossy(&x)))
+            .iter()
+            .map(|x| serde_json::from_str(&String::from_utf8_lossy(x)))
             .collect::<std::result::Result<Vec<PartitionBound>, serde_json::Error>>()
             .context(error::DeserializeJsonSnafu)?;
 
@@ -162,6 +187,8 @@ mod tests {
                 PartitionBound::Value(1_i32.into()),
             ],
         };
+        assert_eq!("MAXVALUE, 1", def.to_string());
+
         let partition: MetaPartition = def.try_into().unwrap();
         assert_eq!(
             r#"{"column_list":["a","b"],"value_list":["\"MaxValue\"","{\"Value\":{\"Int32\":1}}"]}"#,
@@ -169,7 +196,7 @@ mod tests {
         );
 
         // MetaPartition -> PartitionDef
-        let partition = MetaPartition {
+        let partition = &MetaPartition {
             column_list: vec![b"a".to_vec(), b"b".to_vec()],
             value_list: vec![
                 b"\"MaxValue\"".to_vec(),

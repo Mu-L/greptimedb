@@ -12,50 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ops::Add;
 use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{BackoffBuilder, ExponentialBuilder};
-use common_telemetry::logging;
+use common_telemetry::{debug, error, info};
+use rand::Rng;
+use snafu::ResultExt;
 use tokio::time;
 
-use crate::error::{self, ProcedurePanicSnafu, Result};
+use super::rwlock::OwnedKeyRwLockGuard;
+use crate::error::{self, ProcedurePanicSnafu, Result, RollbackTimesExceededSnafu};
 use crate::local::{ManagerContext, ProcedureMeta, ProcedureMetaRef};
-use crate::store::ProcedureStore;
-use crate::ProcedureState::Retrying;
-use crate::{BoxedProcedure, Context, Error, ProcedureId, ProcedureState, ProcedureWithId, Status};
-
-#[derive(Debug)]
-enum ExecResult {
-    Continue,
-    Done,
-    RetryLater,
-    Failed,
-}
-
-#[cfg(test)]
-impl ExecResult {
-    fn is_continue(&self) -> bool {
-        matches!(self, ExecResult::Continue)
-    }
-
-    fn is_done(&self) -> bool {
-        matches!(self, ExecResult::Done)
-    }
-
-    fn is_retry_later(&self) -> bool {
-        matches!(self, ExecResult::RetryLater)
-    }
-
-    fn is_failed(&self) -> bool {
-        matches!(self, ExecResult::Failed)
-    }
-}
+use crate::procedure::{Output, StringKey};
+use crate::store::{ProcedureMessage, ProcedureStore};
+use crate::{
+    BoxedProcedure, Context, Error, Procedure, ProcedureId, ProcedureState, ProcedureWithId, Status,
+};
 
 /// A guard to cleanup procedure state.
 struct ProcedureGuard {
     meta: ProcedureMetaRef,
     manager_ctx: Arc<ManagerContext>,
+    key_guards: Vec<OwnedKeyRwLockGuard>,
     finish: bool,
 }
 
@@ -65,6 +45,7 @@ impl ProcedureGuard {
         ProcedureGuard {
             meta,
             manager_ctx,
+            key_guards: vec![],
             finish: false,
         }
     }
@@ -78,7 +59,7 @@ impl ProcedureGuard {
 impl Drop for ProcedureGuard {
     fn drop(&mut self) {
         if !self.finish {
-            logging::error!("Procedure {} exits unexpectedly", self.meta.id);
+            error!("Procedure {} exits unexpectedly", self.meta.id);
 
             // Set state to failed. This is useful in test as runtime may not abort when the runner task panics.
             // See https://github.com/tokio-rs/tokio/issues/2002 .
@@ -95,10 +76,15 @@ impl Drop for ProcedureGuard {
             self.manager_ctx.notify_by_subprocedure(parent_id);
         }
 
-        // Release lock in reverse order.
-        for key in self.meta.lock_key.keys_to_unlock() {
-            self.manager_ctx.lock_map.release_lock(key, self.meta.id);
+        // Drops the key guards in the reverse order.
+        while !self.key_guards.is_empty() {
+            self.key_guards.pop();
         }
+
+        // Clean the staled locks.
+        self.manager_ctx
+            .key_lock
+            .clean_keys(self.meta.lock_key.keys_to_lock().map(|k| k.as_string()));
     }
 }
 
@@ -121,9 +107,9 @@ impl Runner {
     /// Run the procedure.
     pub(crate) async fn run(mut self) {
         // Ensure we can update the procedure state.
-        let guard = ProcedureGuard::new(self.meta.clone(), self.manager_ctx.clone());
+        let mut guard = ProcedureGuard::new(self.meta.clone(), self.manager_ctx.clone());
 
-        logging::info!(
+        info!(
             "Runner {}-{} starts",
             self.procedure.type_name(),
             self.meta.id
@@ -133,15 +119,21 @@ impl Runner {
         // recursive locking by adding a root procedure id to the meta.
         for key in self.meta.lock_key.keys_to_lock() {
             // Acquire lock for each key.
-            self.manager_ctx
-                .lock_map
-                .acquire_lock(key, self.meta.clone())
-                .await;
+            let key_guard = match key {
+                StringKey::Share(key) => self.manager_ctx.key_lock.read(key.clone()).await.into(),
+                StringKey::Exclusive(key) => {
+                    self.manager_ctx.key_lock.write(key.clone()).await.into()
+                }
+            };
+
+            guard.key_guards.push(key_guard);
         }
 
-        // Execute the procedure. We need to release the lock whenever the the execution
+        // Execute the procedure. We need to release the lock whenever the execution
         // is successful or fail.
+        self.meta.set_start_time_ms();
         self.execute_procedure_in_loop().await;
+        self.meta.set_end_time_ms();
 
         // We can't remove the metadata of the procedure now as users and its parent might
         // need to query its state.
@@ -164,7 +156,7 @@ impl Runner {
 
             for id in procedure_ids {
                 if let Err(e) = self.store.delete_procedure(id).await {
-                    logging::error!(
+                    error!(
                         e;
                         "Runner {}-{} failed to delete procedure {}",
                         self.procedure.type_name(),
@@ -175,7 +167,7 @@ impl Runner {
             }
         }
 
-        logging::info!(
+        info!(
             "Runner {}-{} exits",
             self.procedure.type_name(),
             self.meta.id
@@ -195,129 +187,169 @@ impl Runner {
     async fn execute_once_with_retry(&mut self, ctx: &Context) {
         let mut retry = self.exponential_builder.build();
         let mut retry_times = 0;
+
+        let mut rollback = self.exponential_builder.build();
+        let mut rollback_times = 0;
+
         loop {
             // Don't store state if `ProcedureManager` is stopped.
             if !self.running() {
-                self.meta.set_state(ProcedureState::Failed {
-                    error: Arc::new(error::ManagerNotStartSnafu {}.build()),
-                });
+                self.meta.set_state(ProcedureState::failed(Arc::new(
+                    error::ManagerNotStartSnafu {}.build(),
+                )));
                 return;
             }
-            match self.execute_once(ctx).await {
-                ExecResult::Done | ExecResult::Failed => return,
-                ExecResult::Continue => (),
-                ExecResult::RetryLater => {
+            let state = self.meta.state();
+            match state {
+                ProcedureState::Running => {}
+                ProcedureState::Retrying { error } => {
                     retry_times += 1;
                     if let Some(d) = retry.next() {
+                        let millis = d.as_millis() as u64;
+                        // Add random noise to the retry delay to avoid retry storms.
+                        let noise = rand::thread_rng().gen_range(0..(millis / 4) + 1);
+                        let d = d.add(Duration::from_millis(noise));
+
                         self.wait_on_err(d, retry_times).await;
                     } else {
-                        assert!(self.meta.state().is_retrying());
-                        if let Retrying { error } = self.meta.state() {
-                            self.meta.set_state(ProcedureState::failed(Arc::new(
+                        self.meta
+                            .set_state(ProcedureState::prepare_rollback(Arc::new(
                                 Error::RetryTimesExceeded {
-                                    source: error,
+                                    source: error.clone(),
                                     procedure_id: self.meta.id,
                                 },
-                            )))
-                        }
+                            )));
+                    }
+                }
+                ProcedureState::PrepareRollback { error }
+                | ProcedureState::RollingBack { error } => {
+                    rollback_times += 1;
+                    if let Some(d) = rollback.next() {
+                        self.wait_on_err(d, rollback_times).await;
+                    } else {
+                        let err = Err::<(), Arc<Error>>(error)
+                            .context(RollbackTimesExceededSnafu {
+                                procedure_id: self.meta.id,
+                            })
+                            .unwrap_err();
+                        self.meta.set_state(ProcedureState::failed(Arc::new(err)));
                         return;
                     }
                 }
+                ProcedureState::Done { .. } => return,
+                ProcedureState::Failed { .. } => return,
+            }
+            self.execute_once(ctx).await;
+        }
+    }
+
+    async fn rollback(&mut self, ctx: &Context, err: Arc<Error>) {
+        if self.procedure.rollback_supported() {
+            if let Err(e) = self.procedure.rollback(ctx).await {
+                self.meta
+                    .set_state(ProcedureState::rolling_back(Arc::new(e)));
+                return;
             }
         }
+        self.meta.set_state(ProcedureState::failed(err));
     }
 
-    async fn rollback(&mut self, error: Arc<Error>) -> ExecResult {
-        if let Err(e) = self.rollback_procedure().await {
-            self.rolling_back = true;
-            self.meta.set_state(ProcedureState::retrying(Arc::new(e)));
-            return ExecResult::RetryLater;
+    async fn prepare_rollback(&mut self, err: Arc<Error>) {
+        if let Err(e) = self.write_procedure_state(err.to_string()).await {
+            self.meta
+                .set_state(ProcedureState::prepare_rollback(Arc::new(e)));
+            return;
         }
-        self.meta.set_state(ProcedureState::failed(error));
-        ExecResult::Failed
+        if self.procedure.rollback_supported() {
+            self.meta.set_state(ProcedureState::rolling_back(err));
+        } else {
+            self.meta.set_state(ProcedureState::failed(err));
+        }
     }
 
-    async fn execute_once(&mut self, ctx: &Context) -> ExecResult {
-        // if rolling_back, there is no need to execute again.
-        if self.rolling_back {
-            // We can definitely get the previous error here.
-            let state = self.meta.state();
-            let err = state.error().unwrap();
-            return self.rollback(err.clone()).await;
-        }
-        match self.procedure.execute(ctx).await {
-            Ok(status) => {
-                logging::debug!(
-                    "Execute procedure {}-{} once, status: {:?}, need_persist: {}",
-                    self.procedure.type_name(),
-                    self.meta.id,
-                    status,
-                    status.need_persist(),
-                );
+    async fn execute_once(&mut self, ctx: &Context) {
+        match self.meta.state() {
+            ProcedureState::Running | ProcedureState::Retrying { .. } => {
+                match self.procedure.execute(ctx).await {
+                    Ok(status) => {
+                        debug!(
+                            "Execute procedure {}-{} once, status: {:?}, need_persist: {}",
+                            self.procedure.type_name(),
+                            self.meta.id,
+                            status,
+                            status.need_persist(),
+                        );
 
-                // Don't store state if `ProcedureManager` is stopped.
-                if !self.running() {
-                    self.meta.set_state(ProcedureState::Failed {
-                        error: Arc::new(error::ManagerNotStartSnafu {}.build()),
-                    });
-                    return ExecResult::Failed;
-                }
-
-                if status.need_persist() {
-                    if let Err(err) = self.persist_procedure().await {
-                        self.meta.set_state(ProcedureState::retrying(Arc::new(err)));
-                        return ExecResult::RetryLater;
-                    }
-                }
-
-                match status {
-                    Status::Executing { .. } => (),
-                    Status::Suspended { subprocedures, .. } => {
-                        self.on_suspended(subprocedures).await;
-                    }
-                    Status::Done => {
-                        if let Err(e) = self.commit_procedure().await {
-                            self.meta.set_state(ProcedureState::retrying(Arc::new(e)));
-                            return ExecResult::RetryLater;
+                        // Don't store state if `ProcedureManager` is stopped.
+                        if !self.running() {
+                            self.meta.set_state(ProcedureState::failed(Arc::new(
+                                error::ManagerNotStartSnafu {}.build(),
+                            )));
+                            return;
                         }
 
-                        self.done();
-                        return ExecResult::Done;
+                        if status.need_persist() {
+                            if let Err(err) = self.persist_procedure().await {
+                                self.meta.set_state(ProcedureState::retrying(Arc::new(err)));
+                                return;
+                            }
+                        }
+
+                        match status {
+                            Status::Executing { .. } => (),
+                            Status::Suspended { subprocedures, .. } => {
+                                self.on_suspended(subprocedures).await;
+                            }
+                            Status::Done { output } => {
+                                if let Err(e) = self.commit_procedure().await {
+                                    self.meta.set_state(ProcedureState::retrying(Arc::new(e)));
+                                    return;
+                                }
+
+                                self.done(output);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            e;
+                            "Failed to execute procedure {}-{}, retry: {}",
+                            self.procedure.type_name(),
+                            self.meta.id,
+                            e.is_retry_later(),
+                        );
+
+                        // Don't store state if `ProcedureManager` is stopped.
+                        if !self.running() {
+                            self.meta.set_state(ProcedureState::failed(Arc::new(
+                                error::ManagerNotStartSnafu {}.build(),
+                            )));
+                            return;
+                        }
+
+                        if e.is_retry_later() {
+                            self.meta.set_state(ProcedureState::retrying(Arc::new(e)));
+                            return;
+                        }
+
+                        self.meta
+                            .set_state(ProcedureState::prepare_rollback(Arc::new(e)));
                     }
                 }
-
-                ExecResult::Continue
             }
-            Err(e) => {
-                logging::error!(
-                    e;
-                    "Failed to execute procedure {}-{}, retry: {}",
-                    self.procedure.type_name(),
-                    self.meta.id,
-                    e.is_retry_later(),
-                );
-
-                // Don't store state if `ProcedureManager` is stopped.
-                if !self.running() {
-                    self.meta.set_state(ProcedureState::Failed {
-                        error: Arc::new(error::ManagerNotStartSnafu {}.build()),
-                    });
-                    return ExecResult::Failed;
-                }
-
-                if e.is_retry_later() {
-                    self.meta.set_state(ProcedureState::retrying(Arc::new(e)));
-                    return ExecResult::RetryLater;
-                }
-
-                // Write rollback key so we can skip this procedure while recovering procedures.
-                self.rollback(Arc::new(e)).await
-            }
+            ProcedureState::PrepareRollback { error } => self.prepare_rollback(error).await,
+            ProcedureState::RollingBack { error } => self.rollback(ctx, error).await,
+            ProcedureState::Failed { .. } | ProcedureState::Done { .. } => (),
         }
     }
 
     /// Submit a subprocedure with specific `procedure_id`.
-    fn submit_subprocedure(&self, procedure_id: ProcedureId, mut procedure: BoxedProcedure) {
+    fn submit_subprocedure(
+        &self,
+        procedure_id: ProcedureId,
+        procedure_state: ProcedureState,
+        mut procedure: BoxedProcedure,
+    ) {
         if self.manager_ctx.contains_procedure(procedure_id) {
             // If the parent has already submitted this procedure, don't submit it again.
             return;
@@ -337,15 +369,17 @@ impl Runner {
 
         let meta = Arc::new(ProcedureMeta::new(
             procedure_id,
+            procedure_state,
             Some(self.meta.id),
             procedure.lock_key(),
+            procedure.type_name(),
         ));
         let runner = Runner {
             meta: meta.clone(),
             procedure,
             manager_ctx: self.manager_ctx.clone(),
             step,
-            exponential_builder: self.exponential_builder.clone(),
+            exponential_builder: self.exponential_builder,
             store: self.store.clone(),
             rolling_back: false,
         };
@@ -365,15 +399,15 @@ impl Runner {
         // Add the id of the subprocedure to the metadata.
         self.meta.push_child(procedure_id);
 
-        let _handle = common_runtime::spawn_bg(async move {
+        let _handle = common_runtime::spawn_global(async move {
             // Run the root procedure.
             runner.run().await
         });
     }
 
     /// Extend the retry time to wait for the next retry.
-    async fn wait_on_err(&self, d: Duration, i: u64) {
-        logging::info!(
+    async fn wait_on_err(&mut self, d: Duration, i: u64) {
+        info!(
             "Procedure {}-{} retry for the {} times after {} millis",
             self.procedure.type_name(),
             self.meta.id,
@@ -383,10 +417,10 @@ impl Runner {
         time::sleep(d).await;
     }
 
-    async fn on_suspended(&self, subprocedures: Vec<ProcedureWithId>) {
+    async fn on_suspended(&mut self, subprocedures: Vec<ProcedureWithId>) {
         let has_child = !subprocedures.is_empty();
         for subprocedure in subprocedures {
-            logging::info!(
+            info!(
                 "Procedure {}-{} submit subprocedure {}-{}",
                 self.procedure.type_name(),
                 self.meta.id,
@@ -394,10 +428,14 @@ impl Runner {
                 subprocedure.id,
             );
 
-            self.submit_subprocedure(subprocedure.id, subprocedure.procedure);
+            self.submit_subprocedure(
+                subprocedure.id,
+                ProcedureState::Running,
+                subprocedure.procedure,
+            );
         }
 
-        logging::info!(
+        info!(
             "Procedure {}-{} is waiting for subprocedures",
             self.procedure.type_name(),
             self.meta.id,
@@ -407,7 +445,7 @@ impl Runner {
         if has_child {
             self.meta.child_notify.notified().await;
 
-            logging::info!(
+            info!(
                 "Procedure {}-{} is waked up",
                 self.procedure.type_name(),
                 self.meta.id,
@@ -416,16 +454,20 @@ impl Runner {
     }
 
     async fn persist_procedure(&mut self) -> Result<()> {
+        let type_name = self.procedure.type_name().to_string();
+        let data = self.procedure.dump()?;
+
         self.store
             .store_procedure(
                 self.meta.id,
                 self.step,
-                &self.procedure,
+                type_name,
+                data,
                 self.meta.parent_id,
             )
             .await
             .map_err(|e| {
-                logging::error!(
+                error!(
                     e; "Failed to persist procedure {}-{}",
                     self.procedure.type_name(),
                     self.meta.id
@@ -441,7 +483,7 @@ impl Runner {
             .commit_procedure(self.meta.id, self.step)
             .await
             .map_err(|e| {
-                logging::error!(
+                error!(
                     e; "Failed to commit procedure {}-{}",
                     self.procedure.type_name(),
                     self.meta.id
@@ -452,12 +494,22 @@ impl Runner {
         Ok(())
     }
 
-    async fn rollback_procedure(&mut self) -> Result<()> {
+    async fn write_procedure_state(&mut self, error: String) -> Result<()> {
+        // Persists procedure state
+        let type_name = self.procedure.type_name().to_string();
+        let data = self.procedure.dump()?;
+        let message = ProcedureMessage {
+            type_name,
+            data,
+            parent_id: self.meta.parent_id,
+            step: self.step,
+            error: Some(error),
+        };
         self.store
-            .rollback_procedure(self.meta.id, self.step)
+            .rollback_procedure(self.meta.id, message)
             .await
             .map_err(|e| {
-                logging::error!(
+                error!(
                     e; "Failed to write rollback key for procedure {}-{}",
                     self.procedure.type_name(),
                     self.meta.id
@@ -468,16 +520,16 @@ impl Runner {
         Ok(())
     }
 
-    fn done(&self) {
+    fn done(&self, output: Option<Output>) {
         // TODO(yingwen): Add files to remove list.
-        logging::info!(
+        info!(
             "Procedure {}-{} done",
             self.procedure.type_name(),
             self.meta.id,
         );
 
         // Mark the state of this procedure to done.
-        self.meta.set_state(ProcedureState::Done);
+        self.meta.set_state(ProcedureState::Done { output });
     }
 }
 
@@ -492,7 +544,8 @@ mod tests {
     use common_test_util::temp_dir::create_temp_dir;
     use futures_util::future::BoxFuture;
     use futures_util::FutureExt;
-    use object_store::ObjectStore;
+    use object_store::{EntryMode, ObjectStore};
+    use tokio::sync::mpsc;
 
     use super::*;
     use crate::local::test_util;
@@ -525,7 +578,11 @@ mod tests {
     ) {
         let dir = proc_path!(procedure_store, "{procedure_id}/");
         let lister = object_store.list(&dir).await.unwrap();
-        let mut files_in_dir: Vec<_> = lister.into_iter().map(|de| de.name().to_string()).collect();
+        let mut files_in_dir: Vec<_> = lister
+            .into_iter()
+            .filter(|x| x.metadata().mode() == EntryMode::FILE)
+            .map(|de| de.name().to_string())
+            .collect();
         files_in_dir.sort_unstable();
         assert_eq!(files, files_in_dir);
     }
@@ -549,11 +606,13 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
+    type RollbackFn = Box<dyn FnMut(Context) -> BoxFuture<'static, Result<()>> + Send>;
+
     struct ProcedureAdapter<F> {
         data: String,
         lock_key: LockKey,
         exec_fn: F,
+        rollback_fn: Option<RollbackFn>,
     }
 
     impl<F> ProcedureAdapter<F> {
@@ -580,6 +639,17 @@ mod tests {
             f.await
         }
 
+        async fn rollback(&mut self, ctx: &Context) -> Result<()> {
+            if let Some(f) = &mut self.rollback_fn {
+                return (f)(ctx.clone()).await;
+            }
+            Ok(())
+        }
+
+        fn rollback_supported(&self) -> bool {
+            self.rollback_fn.is_some()
+        }
+
         fn dump(&self) -> Result<String> {
             Ok(self.data.clone())
         }
@@ -597,15 +667,16 @@ mod tests {
                 if times == 1 {
                     Ok(Status::Executing { persist })
                 } else {
-                    Ok(Status::Done)
+                    Ok(Status::done())
                 }
             }
             .boxed()
         };
         let normal = ProcedureAdapter {
             data: "normal".to_string(),
-            lock_key: LockKey::single("catalog.schema.table"),
+            lock_key: LockKey::single_exclusive("catalog.schema.table"),
             exec_fn,
+            rollback_fn: None,
         };
 
         let dir = create_temp_dir("normal");
@@ -616,8 +687,9 @@ mod tests {
         let mut runner = new_runner(meta, Box::new(normal), procedure_store.clone());
         runner.manager_ctx.start();
 
-        let res = runner.execute_once(&ctx).await;
-        assert!(res.is_continue(), "{res:?}");
+        runner.execute_once(&ctx).await;
+        let state = runner.meta.state();
+        assert!(state.is_running(), "{state:?}");
         check_files(
             &object_store,
             &procedure_store,
@@ -626,8 +698,9 @@ mod tests {
         )
         .await;
 
-        let res = runner.execute_once(&ctx).await;
-        assert!(res.is_done(), "{res:?}");
+        runner.execute_once(&ctx).await;
+        let state = runner.meta.state();
+        assert!(state.is_done(), "{state:?}");
         check_files(
             &object_store,
             &procedure_store,
@@ -665,8 +738,9 @@ mod tests {
         };
         let suspend = ProcedureAdapter {
             data: "suspend".to_string(),
-            lock_key: LockKey::single("catalog.schema.table"),
+            lock_key: LockKey::single_exclusive("catalog.schema.table"),
             exec_fn,
+            rollback_fn: None,
         };
 
         let dir = create_temp_dir("suspend");
@@ -677,8 +751,9 @@ mod tests {
         let mut runner = new_runner(meta, Box::new(suspend), procedure_store);
         runner.manager_ctx.start();
 
-        let res = runner.execute_once(&ctx).await;
-        assert!(res.is_continue(), "{res:?}");
+        runner.execute_once(&ctx).await;
+        let state = runner.meta.state();
+        assert!(state.is_running(), "{state:?}");
     }
 
     fn new_child_procedure(procedure_id: ProcedureId, keys: &[&str]) -> ProcedureWithId {
@@ -690,15 +765,16 @@ mod tests {
                     time::sleep(Duration::from_millis(200)).await;
                     Ok(Status::Executing { persist: true })
                 } else {
-                    Ok(Status::Done)
+                    Ok(Status::done())
                 }
             }
             .boxed()
         };
         let child = ProcedureAdapter {
             data: "child".to_string(),
-            lock_key: LockKey::new(keys.iter().map(|k| k.to_string())),
+            lock_key: LockKey::new_exclusive(keys.iter().map(|k| k.to_string())),
             exec_fn,
+            rollback_fn: None,
         };
 
         ProcedureWithId {
@@ -751,7 +827,7 @@ mod tests {
                         }
                     }
                     if all_child_done {
-                        Ok(Status::Done)
+                        Ok(Status::done())
                     } else {
                         // Return suspended to wait for notify.
                         Ok(Status::Suspended {
@@ -765,8 +841,9 @@ mod tests {
         };
         let parent = ProcedureAdapter {
             data: "parent".to_string(),
-            lock_key: LockKey::single("catalog.schema.table"),
+            lock_key: LockKey::single_exclusive("catalog.schema.table"),
             exec_fn,
+            rollback_fn: None,
         };
 
         let dir = create_temp_dir("parent");
@@ -784,6 +861,7 @@ mod tests {
         runner.manager_ctx = manager_ctx.clone();
 
         runner.run().await;
+        assert!(manager_ctx.key_lock.is_empty());
 
         // Check child procedures.
         for child_id in children_ids {
@@ -810,8 +888,9 @@ mod tests {
         let exec_fn = move |_| async move { Ok(Status::Executing { persist: true }) }.boxed();
         let normal = ProcedureAdapter {
             data: "normal".to_string(),
-            lock_key: LockKey::single("catalog.schema.table"),
+            lock_key: LockKey::single_exclusive("catalog.schema.table"),
             exec_fn,
+            rollback_fn: None,
         };
 
         let dir = create_temp_dir("test_running_is_stopped");
@@ -822,8 +901,9 @@ mod tests {
         let mut runner = new_runner(meta, Box::new(normal), procedure_store.clone());
         runner.manager_ctx.start();
 
-        let res = runner.execute_once(&ctx).await;
-        assert!(res.is_continue(), "{res:?}");
+        runner.execute_once(&ctx).await;
+        let state = runner.meta.state();
+        assert!(state.is_running(), "{state:?}");
         check_files(
             &object_store,
             &procedure_store,
@@ -833,8 +913,9 @@ mod tests {
         .await;
 
         runner.manager_ctx.stop();
-        let res = runner.execute_once(&ctx).await;
-        assert!(res.is_failed());
+        runner.execute_once(&ctx).await;
+        let state = runner.meta.state();
+        assert!(state.is_failed(), "{state:?}");
         // Shouldn't write any files
         check_files(
             &object_store,
@@ -851,8 +932,9 @@ mod tests {
             |_| async { Err(Error::external(MockError::new(StatusCode::Unexpected))) }.boxed();
         let normal = ProcedureAdapter {
             data: "fail".to_string(),
-            lock_key: LockKey::single("catalog.schema.table"),
+            lock_key: LockKey::single_exclusive("catalog.schema.table"),
             exec_fn,
+            rollback_fn: None,
         };
 
         let dir = create_temp_dir("test_running_is_stopped_on_error");
@@ -863,8 +945,9 @@ mod tests {
         let mut runner = new_runner(meta, Box::new(normal), procedure_store.clone());
         runner.manager_ctx.stop();
 
-        let res = runner.execute_once(&ctx).await;
-        assert!(res.is_failed(), "{res:?}");
+        runner.execute_once(&ctx).await;
+        let state = runner.meta.state();
+        assert!(state.is_failed(), "{state:?}");
         // Shouldn't write any files
         check_files(&object_store, &procedure_store, ctx.procedure_id, &[]).await;
     }
@@ -875,8 +958,9 @@ mod tests {
             |_| async { Err(Error::external(MockError::new(StatusCode::Unexpected))) }.boxed();
         let fail = ProcedureAdapter {
             data: "fail".to_string(),
-            lock_key: LockKey::single("catalog.schema.table"),
+            lock_key: LockKey::single_exclusive("catalog.schema.table"),
             exec_fn,
+            rollback_fn: None,
         };
 
         let dir = create_temp_dir("fail");
@@ -887,9 +971,53 @@ mod tests {
         let mut runner = new_runner(meta.clone(), Box::new(fail), procedure_store.clone());
         runner.manager_ctx.start();
 
-        let res = runner.execute_once(&ctx).await;
-        assert!(res.is_failed(), "{res:?}");
-        assert!(meta.state().is_failed());
+        runner.execute_once(&ctx).await;
+        let state = runner.meta.state();
+        assert!(state.is_prepare_rollback(), "{state:?}");
+
+        runner.execute_once(&ctx).await;
+        let state = runner.meta.state();
+        assert!(state.is_failed(), "{state:?}");
+        check_files(
+            &object_store,
+            &procedure_store,
+            ctx.procedure_id,
+            &["0000000000.rollback"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_rollback_on_error() {
+        let exec_fn =
+            |_| async { Err(Error::external(MockError::new(StatusCode::Unexpected))) }.boxed();
+        let rollback_fn = move |_| async move { Ok(()) }.boxed();
+        let fail = ProcedureAdapter {
+            data: "fail".to_string(),
+            lock_key: LockKey::single_exclusive("catalog.schema.table"),
+            exec_fn,
+            rollback_fn: Some(Box::new(rollback_fn)),
+        };
+
+        let dir = create_temp_dir("fail");
+        let meta = fail.new_meta(ROOT_ID);
+        let ctx = context_without_provider(meta.id);
+        let object_store = test_util::new_object_store(&dir);
+        let procedure_store = Arc::new(ProcedureStore::from_object_store(object_store.clone()));
+        let mut runner = new_runner(meta.clone(), Box::new(fail), procedure_store.clone());
+        runner.manager_ctx.start();
+
+        runner.execute_once(&ctx).await;
+        let state = runner.meta.state();
+        assert!(state.is_prepare_rollback(), "{state:?}");
+
+        runner.execute_once(&ctx).await;
+        let state = runner.meta.state();
+        assert!(state.is_rolling_back(), "{state:?}");
+
+        runner.execute_once(&ctx).await;
+        let state = runner.meta.state();
+        assert!(state.is_failed(), "{state:?}");
         check_files(
             &object_store,
             &procedure_store,
@@ -909,7 +1037,7 @@ mod tests {
                 if times == 1 {
                     Err(Error::retry_later(MockError::new(StatusCode::Unexpected)))
                 } else {
-                    Ok(Status::Done)
+                    Ok(Status::done())
                 }
             }
             .boxed()
@@ -917,8 +1045,9 @@ mod tests {
 
         let retry_later = ProcedureAdapter {
             data: "retry_later".to_string(),
-            lock_key: LockKey::single("catalog.schema.table"),
+            lock_key: LockKey::single_exclusive("catalog.schema.table"),
             exec_fn,
+            rollback_fn: None,
         };
 
         let dir = create_temp_dir("retry_later");
@@ -928,13 +1057,13 @@ mod tests {
         let procedure_store = Arc::new(ProcedureStore::from_object_store(object_store.clone()));
         let mut runner = new_runner(meta.clone(), Box::new(retry_later), procedure_store.clone());
         runner.manager_ctx.start();
+        runner.execute_once(&ctx).await;
+        let state = runner.meta.state();
+        assert!(state.is_retrying(), "{state:?}");
 
-        let res = runner.execute_once(&ctx).await;
-        assert!(res.is_retry_later(), "{res:?}");
-        assert!(meta.state().is_retrying());
-
-        let res = runner.execute_once(&ctx).await;
-        assert!(res.is_done(), "{res:?}");
+        runner.execute_once(&ctx).await;
+        let state = runner.meta.state();
+        assert!(state.is_done(), "{state:?}");
         assert!(meta.state().is_done());
         check_files(
             &object_store,
@@ -952,8 +1081,9 @@ mod tests {
 
         let exceed_max_retry_later = ProcedureAdapter {
             data: "exceed_max_retry_later".to_string(),
-            lock_key: LockKey::single("catalog.schema.table"),
+            lock_key: LockKey::single_exclusive("catalog.schema.table"),
             exec_fn,
+            rollback_fn: None,
         };
 
         let dir = create_temp_dir("exceed_max_retry_later");
@@ -978,6 +1108,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rollback_exceed_max_retry_later() {
+        let exec_fn =
+            |_| async { Err(Error::retry_later(MockError::new(StatusCode::Unexpected))) }.boxed();
+        let rollback_fn = move |_| {
+            async move { Err(Error::retry_later(MockError::new(StatusCode::Unexpected))) }.boxed()
+        };
+        let exceed_max_retry_later = ProcedureAdapter {
+            data: "exceed_max_rollback".to_string(),
+            lock_key: LockKey::single_exclusive("catalog.schema.table"),
+            exec_fn,
+            rollback_fn: Some(Box::new(rollback_fn)),
+        };
+
+        let dir = create_temp_dir("exceed_max_rollback");
+        let meta = exceed_max_retry_later.new_meta(ROOT_ID);
+        let object_store = test_util::new_object_store(&dir);
+        let procedure_store = Arc::new(ProcedureStore::from_object_store(object_store.clone()));
+        let mut runner = new_runner(
+            meta.clone(),
+            Box::new(exceed_max_retry_later),
+            procedure_store,
+        );
+        runner.manager_ctx.start();
+        runner.exponential_builder = ExponentialBuilder::default()
+            .with_min_delay(Duration::from_millis(1))
+            .with_max_times(3);
+
+        // Run the runner and execute the procedure.
+        runner.execute_procedure_in_loop().await;
+        let err = meta.state().error().unwrap().to_string();
+        assert!(err.contains("Procedure rollback exceeded max times"));
+    }
+
+    #[tokio::test]
+    async fn test_rollback_after_retry_fail() {
+        let exec_fn = move |_| {
+            async move { Err(Error::retry_later(MockError::new(StatusCode::Unexpected))) }.boxed()
+        };
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let rollback_fn = move |_| {
+            let tx = tx.clone();
+            async move {
+                tx.send(()).await.unwrap();
+                Ok(())
+            }
+            .boxed()
+        };
+        let retry_later = ProcedureAdapter {
+            data: "rollback_after_retry_fail".to_string(),
+            lock_key: LockKey::single_exclusive("catalog.schema.table"),
+            exec_fn,
+            rollback_fn: Some(Box::new(rollback_fn)),
+        };
+
+        let dir = create_temp_dir("retry_later");
+        let meta = retry_later.new_meta(ROOT_ID);
+        let ctx = context_without_provider(meta.id);
+        let object_store = test_util::new_object_store(&dir);
+        let procedure_store = Arc::new(ProcedureStore::from_object_store(object_store.clone()));
+        let mut runner = new_runner(meta.clone(), Box::new(retry_later), procedure_store.clone());
+        runner.manager_ctx.start();
+        runner.exponential_builder = ExponentialBuilder::default()
+            .with_min_delay(Duration::from_millis(1))
+            .with_max_times(3);
+        // Run the runner and execute the procedure.
+        runner.execute_procedure_in_loop().await;
+        rx.recv().await.unwrap();
+        assert_eq!(rx.try_recv().unwrap_err(), mpsc::error::TryRecvError::Empty);
+        check_files(
+            &object_store,
+            &procedure_store,
+            ctx.procedure_id,
+            &["0000000000.rollback"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_child_error() {
         let mut times = 0;
         let child_id = ProcedureId::random();
@@ -993,8 +1202,9 @@ mod tests {
                     };
                     let fail = ProcedureAdapter {
                         data: "fail".to_string(),
-                        lock_key: LockKey::single("catalog.schema.table.region-0"),
+                        lock_key: LockKey::single_exclusive("catalog.schema.table.region-0"),
                         exec_fn,
+                        rollback_fn: None,
                     };
 
                     Ok(Status::Suspended {
@@ -1027,8 +1237,9 @@ mod tests {
         };
         let parent = ProcedureAdapter {
             data: "parent".to_string(),
-            lock_key: LockKey::single("catalog.schema.table"),
+            lock_key: LockKey::single_exclusive("catalog.schema.table"),
             exec_fn,
+            rollback_fn: None,
         };
 
         let dir = create_temp_dir("child_err");
@@ -1042,10 +1253,11 @@ mod tests {
         // Manually add this procedure to the manager ctx.
         assert!(manager_ctx.try_insert_procedure(meta.clone()));
         // Replace the manager ctx.
-        runner.manager_ctx = manager_ctx;
+        runner.manager_ctx = manager_ctx.clone();
 
         // Run the runner and execute the procedure.
         runner.run().await;
+        assert!(manager_ctx.key_lock.is_empty());
         let err = meta.state().error().unwrap().output_msg();
         assert!(err.contains("subprocedure failed"), "{err}");
     }

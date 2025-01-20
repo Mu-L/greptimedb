@@ -17,8 +17,9 @@ use std::sync::Arc;
 
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_error::ext::BoxedError;
+use common_recordbatch::adapter::RecordBatchMetrics;
 use common_recordbatch::error::Result as RecordBatchResult;
-use common_recordbatch::{RecordBatch, RecordBatchStream, SendableRecordBatchStream};
+use common_recordbatch::{OrderOption, RecordBatch, RecordBatchStream, SendableRecordBatchStream};
 use datatypes::prelude::*;
 use datatypes::schema::{ColumnSchema, Schema, SchemaRef};
 use datatypes::vectors::UInt32Vector;
@@ -32,8 +33,7 @@ use crate::error::{SchemaConversionSnafu, TableProjectionSnafu, TablesRecordBatc
 use crate::metadata::{
     FilterPushDownType, TableId, TableInfoBuilder, TableMetaBuilder, TableType, TableVersion,
 };
-use crate::thin_table::{ThinTable, ThinTableAdapter};
-use crate::TableRef;
+use crate::{Table, TableRef};
 
 pub struct MemTable;
 
@@ -93,14 +93,18 @@ impl MemTable {
                 .unwrap(),
         );
 
-        let thin_table = ThinTable::new(info, FilterPushDownType::Unsupported);
         let data_source = Arc::new(MemtableDataSource { recordbatch });
-        Arc::new(ThinTableAdapter::new(thin_table, data_source))
+        let table = Table::new(info, FilterPushDownType::Unsupported, data_source);
+        Arc::new(table)
     }
 
     /// Creates a 1 column 100 rows table, with table name "numbers", column name "uint32s" and
     /// column type "uint32". Column data increased from 0 to 100.
     pub fn default_numbers_table() -> TableRef {
+        Self::specified_numbers_table(100)
+    }
+
+    pub fn specified_numbers_table(rows: u32) -> TableRef {
         let column_schemas = vec![ColumnSchema::new(
             "uint32s",
             ConcreteDataType::uint32_datatype(),
@@ -108,7 +112,7 @@ impl MemTable {
         )];
         let schema = Arc::new(Schema::new(column_schemas));
         let columns: Vec<VectorRef> = vec![Arc::new(UInt32Vector::from_slice(
-            (0..100).collect::<Vec<_>>(),
+            (0..rows).collect::<Vec<_>>(),
         ))];
         let recordbatch = RecordBatch::new(schema, columns).unwrap();
         MemTable::table("numbers", recordbatch)
@@ -164,6 +168,14 @@ impl DataSource for MemtableDataSource {
 impl RecordBatchStream for MemtableStream {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    fn output_ordering(&self) -> Option<&[OrderOption]> {
+        None
+    }
+
+    fn metrics(&self) -> Option<RecordBatchMetrics> {
+        None
     }
 }
 

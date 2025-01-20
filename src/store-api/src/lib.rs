@@ -15,11 +15,13 @@
 
 //! Storage related APIs
 
+pub mod codec;
 pub mod data_source;
 pub mod logstore;
 pub mod manifest;
 pub mod metadata;
 pub mod metric_engine_consts;
+pub mod mito_engine_options;
 pub mod path_utils;
 pub mod region_engine;
 pub mod region_request;

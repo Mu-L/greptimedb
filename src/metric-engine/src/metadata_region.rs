@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use api::v1::value::ValueData;
 use api::v1::{ColumnDataType, ColumnSchema, Row, Rows, SemanticType, Value};
@@ -21,7 +22,7 @@ use base64::Engine;
 use common_recordbatch::util::collect;
 use datafusion::prelude::{col, lit};
 use mito2::engine::MitoEngine;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use store_api::metadata::ColumnMetadata;
 use store_api::metric_engine_consts::{
     METADATA_SCHEMA_KEY_COLUMN_INDEX, METADATA_SCHEMA_KEY_COLUMN_NAME,
@@ -29,13 +30,14 @@ use store_api::metric_engine_consts::{
     METADATA_SCHEMA_VALUE_COLUMN_NAME,
 };
 use store_api::region_engine::RegionEngine;
-use store_api::region_request::RegionPutRequest;
+use store_api::region_request::{RegionDeleteRequest, RegionPutRequest};
 use store_api::storage::{RegionId, ScanRequest};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use crate::error::{
     CollectRecordBatchStreamSnafu, DecodeColumnValueSnafu, DeserializeColumnMetadataSnafu,
-    MitoReadOperationSnafu, MitoWriteOperationSnafu, ParseRegionIdSnafu, RegionAlreadyExistsSnafu,
-    Result,
+    LogicalRegionNotFoundSnafu, MitoReadOperationSnafu, MitoWriteOperationSnafu,
+    ParseRegionIdSnafu, RegionAlreadyExistsSnafu, Result,
 };
 use crate::utils;
 
@@ -56,11 +58,19 @@ const COLUMN_PREFIX: &str = "__column_";
 /// itself.
 pub struct MetadataRegion {
     mito: MitoEngine,
+    /// Logical lock for operations that need to be serialized. Like update & read region columns.
+    ///
+    /// Region entry will be registered on creating and opening logical region, and deregistered on
+    /// removing logical region.
+    logical_region_lock: RwLock<HashMap<RegionId, Arc<RwLock<()>>>>,
 }
 
 impl MetadataRegion {
     pub fn new(mito: MitoEngine) -> Self {
-        Self { mito }
+        Self {
+            mito,
+            logical_region_lock: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Add a new table key to metadata.
@@ -85,8 +95,19 @@ impl MetadataRegion {
             }
             .fail()
         } else {
+            self.logical_region_lock
+                .write()
+                .await
+                .insert(logical_region_id, Arc::new(RwLock::new(())));
             Ok(())
         }
+    }
+
+    pub async fn open_logical_region(&self, logical_region_id: RegionId) {
+        self.logical_region_lock
+            .write()
+            .await
+            .insert(logical_region_id, Arc::new(RwLock::new(())));
     }
 
     /// Add a new column key to metadata.
@@ -111,6 +132,73 @@ impl MetadataRegion {
         .await
     }
 
+    /// Retrieve a read lock guard of given logical region id.
+    pub async fn read_lock_logical_region(
+        &self,
+        logical_region_id: RegionId,
+    ) -> Result<OwnedRwLockReadGuard<()>> {
+        let lock = self
+            .logical_region_lock
+            .read()
+            .await
+            .get(&logical_region_id)
+            .context(LogicalRegionNotFoundSnafu {
+                region_id: logical_region_id,
+            })?
+            .clone();
+        Ok(RwLock::read_owned(lock).await)
+    }
+
+    /// Retrieve a write lock guard of given logical region id.
+    pub async fn write_lock_logical_region(
+        &self,
+        logical_region_id: RegionId,
+    ) -> Result<OwnedRwLockWriteGuard<()>> {
+        let lock = self
+            .logical_region_lock
+            .read()
+            .await
+            .get(&logical_region_id)
+            .context(LogicalRegionNotFoundSnafu {
+                region_id: logical_region_id,
+            })?
+            .clone();
+        Ok(RwLock::write_owned(lock).await)
+    }
+
+    /// Remove a registered logical region from metadata.
+    ///
+    /// This method doesn't check if the previous key exists.
+    pub async fn remove_logical_region(
+        &self,
+        physical_region_id: RegionId,
+        logical_region_id: RegionId,
+    ) -> Result<()> {
+        // concat region key
+        let region_id = utils::to_metadata_region_id(physical_region_id);
+        let region_key = Self::concat_region_key(logical_region_id);
+
+        // concat column keys
+        let logical_columns = self
+            .logical_columns(physical_region_id, logical_region_id)
+            .await?;
+        let mut column_keys = logical_columns
+            .into_iter()
+            .map(|(col, _)| Self::concat_column_key(logical_region_id, &col))
+            .collect::<Vec<_>>();
+
+        // remove region key and column keys
+        column_keys.push(region_key);
+        self.delete(region_id, &column_keys).await?;
+
+        self.logical_region_lock
+            .write()
+            .await
+            .remove(&logical_region_id);
+
+        Ok(())
+    }
+
     /// Check if the given logical region exists.
     pub async fn is_logical_region_exists(
         &self,
@@ -123,6 +211,7 @@ impl MetadataRegion {
     }
 
     /// Check if the given column exists. Return the semantic type if exists.
+    #[cfg(test)]
     pub async fn column_semantic_type(
         &self,
         physical_region_id: RegionId,
@@ -139,7 +228,7 @@ impl MetadataRegion {
 
     // TODO(ruihang): avoid using `get_all`
     /// Get all the columns of a given logical region.
-    /// Return a list of (column_name, semantic_type).
+    /// Return a list of (column_name, column_metadata).
     pub async fn logical_columns(
         &self,
         physical_region_id: RegionId,
@@ -201,13 +290,11 @@ impl MetadataRegion {
         format!("{COLUMN_PREFIX}{}_", region_id.as_u64())
     }
 
-    #[allow(dead_code)]
     pub fn parse_region_key(key: &str) -> Option<&str> {
         key.strip_prefix(REGION_PREFIX)
     }
 
     /// Parse column key to (logical_region_id, column_name)
-    #[allow(dead_code)]
     pub fn parse_column_key(key: &str) -> Result<Option<(RegionId, String)>> {
         if let Some(stripped) = key.strip_prefix(COLUMN_PREFIX) {
             let mut iter = stripped.split('_');
@@ -243,7 +330,6 @@ impl MetadataRegion {
 // simulate to `KvBackend`
 //
 // methods in this block assume the given region id is transformed.
-#[allow(unused_variables)]
 impl MetadataRegion {
     /// Put if not exist, return if this put operation is successful (error other
     /// than "key already exist" will be wrapped in [Err]).
@@ -275,7 +361,7 @@ impl MetadataRegion {
         let scan_req = Self::build_read_request(key);
         let record_batch_stream = self
             .mito
-            .handle_query(region_id, scan_req)
+            .scan_to_stream(region_id, scan_req)
             .await
             .context(MitoReadOperationSnafu)?;
         let scan_result = collect(record_batch_stream)
@@ -288,11 +374,12 @@ impl MetadataRegion {
 
     /// Retrieves the value associated with the given key in the specified region.
     /// Returns `Ok(None)` if the key is not found.
+    #[cfg(test)]
     pub async fn get(&self, region_id: RegionId, key: &str) -> Result<Option<String>> {
         let scan_req = Self::build_read_request(key);
         let record_batch_stream = self
             .mito
-            .handle_query(region_id, scan_req)
+            .scan_to_stream(region_id, scan_req)
             .await
             .context(MitoReadOperationSnafu)?;
         let scan_result = collect(record_batch_stream)
@@ -323,10 +410,12 @@ impl MetadataRegion {
             filters: vec![],
             output_ordering: None,
             limit: None,
+            series_row_selector: None,
+            sequence: None,
         };
         let record_batch_stream = self
             .mito
-            .handle_query(region_id, scan_req)
+            .scan_to_stream(region_id, scan_req)
             .await
             .context(MitoReadOperationSnafu)?;
         let scan_result = collect(record_batch_stream)
@@ -354,6 +443,20 @@ impl MetadataRegion {
         Ok(result)
     }
 
+    /// Delete the given keys. For performance consideration, this method
+    /// doesn't check if those keys exist or not.
+    async fn delete(&self, region_id: RegionId, keys: &[String]) -> Result<()> {
+        let delete_request = Self::build_delete_request(keys);
+        self.mito
+            .handle_request(
+                region_id,
+                store_api::region_request::RegionRequest::Delete(delete_request),
+            )
+            .await
+            .context(MitoWriteOperationSnafu)?;
+        Ok(())
+    }
+
     /// Builds a [ScanRequest] to read metadata for a given key.
     /// The request will contains a EQ filter on the key column.
     ///
@@ -363,9 +466,11 @@ impl MetadataRegion {
 
         ScanRequest {
             projection: Some(vec![METADATA_SCHEMA_VALUE_COLUMN_INDEX]),
-            filters: vec![filter_expr.into()],
+            filters: vec![filter_expr],
             output_ordering: None,
             limit: None,
+            series_row_selector: None,
+            sequence: None,
         }
     }
 
@@ -408,6 +513,39 @@ impl MetadataRegion {
         };
 
         RegionPutRequest { rows }
+    }
+
+    fn build_delete_request(keys: &[String]) -> RegionDeleteRequest {
+        let cols = vec![
+            ColumnSchema {
+                column_name: METADATA_SCHEMA_TIMESTAMP_COLUMN_NAME.to_string(),
+                datatype: ColumnDataType::TimestampMillisecond as _,
+                semantic_type: SemanticType::Timestamp as _,
+                ..Default::default()
+            },
+            ColumnSchema {
+                column_name: METADATA_SCHEMA_KEY_COLUMN_NAME.to_string(),
+                datatype: ColumnDataType::String as _,
+                semantic_type: SemanticType::Tag as _,
+                ..Default::default()
+            },
+        ];
+        let rows = keys
+            .iter()
+            .map(|key| Row {
+                values: vec![
+                    Value {
+                        value_data: Some(ValueData::TimestampMillisecondValue(0)),
+                    },
+                    Value {
+                        value_data: Some(ValueData::StringValue(key.to_string())),
+                    },
+                ],
+            })
+            .collect();
+        let rows = Rows { schema: cols, rows };
+
+        RegionDeleteRequest { rows }
     }
 }
 
@@ -490,9 +628,11 @@ mod test {
         let expected_filter_expr = col(METADATA_SCHEMA_KEY_COLUMN_NAME).eq(lit(key));
         let expected_scan_request = ScanRequest {
             projection: Some(vec![METADATA_SCHEMA_VALUE_COLUMN_INDEX]),
-            filters: vec![expected_filter_expr.into()],
+            filters: vec![expected_filter_expr],
             output_ordering: None,
             limit: None,
+            series_row_selector: None,
+            sequence: None,
         };
         let actual_scan_request = MetadataRegion::build_read_request(key);
         assert_eq!(actual_scan_request, expected_scan_request);
@@ -518,7 +658,7 @@ mod test {
         let scan_req = MetadataRegion::build_read_request("test_key");
         let record_batch_stream = metadata_region
             .mito
-            .handle_query(region_id, scan_req)
+            .scan_to_stream(region_id, scan_req)
             .await
             .unwrap();
         let scan_result = collect(record_batch_stream).await.unwrap();

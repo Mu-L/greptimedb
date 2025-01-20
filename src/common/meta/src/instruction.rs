@@ -20,9 +20,13 @@ use serde::{Deserialize, Serialize};
 use store_api::storage::{RegionId, RegionNumber};
 use strum::Display;
 use table::metadata::TableId;
+use table::table_name::TableName;
 
-use crate::table_name::TableName;
-use crate::{ClusterId, DatanodeId};
+use crate::flow_name::FlowName;
+use crate::key::schema_name::SchemaName;
+use crate::key::FlowId;
+use crate::peer::Peer;
+use crate::{ClusterId, DatanodeId, FlownodeId};
 
 #[derive(Eq, Hash, PartialEq, Clone, Debug, Serialize, Deserialize)]
 pub struct RegionIdent {
@@ -92,13 +96,15 @@ impl Display for OpenRegion {
     }
 }
 
+#[serde_with::serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OpenRegion {
     pub region_ident: RegionIdent,
     pub region_storage_path: String,
     pub region_options: HashMap<String, String>,
     #[serde(default)]
-    pub region_wal_options: HashMap<String, String>,
+    #[serde_as(as = "HashMap<serde_with::DisplayFromStr, _>")]
+    pub region_wal_options: HashMap<RegionNumber, String>,
     #[serde(default)]
     pub skip_wal_replay: bool,
 }
@@ -108,7 +114,7 @@ impl OpenRegion {
         region_ident: RegionIdent,
         path: &str,
         region_options: HashMap<String, String>,
-        region_wal_options: HashMap<String, String>,
+        region_wal_options: HashMap<RegionNumber, String>,
         skip_wal_replay: bool,
     ) -> Self {
         Self {
@@ -122,20 +128,31 @@ impl OpenRegion {
 }
 
 /// The instruction of downgrading leader region.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DowngradeRegion {
     /// The [RegionId].
     pub region_id: RegionId,
+    /// The timeout of waiting for flush the region.
+    ///
+    /// `None` stands for don't flush before downgrading the region.
+    #[serde(default)]
+    pub flush_timeout: Option<Duration>,
+    /// Rejects all write requests after flushing.
+    pub reject_write: bool,
 }
 
 impl Display for DowngradeRegion {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DowngradeRegion(region_id={})", self.region_id)
+        write!(
+            f,
+            "DowngradeRegion(region_id={}, flush_timeout={:?}, rejct_write={})",
+            self.region_id, self.flush_timeout, self.reject_write
+        )
     }
 }
 
 /// Upgrades a follower region to leader region.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpgradeRegion {
     /// The [RegionId].
     pub region_id: RegionId,
@@ -146,10 +163,37 @@ pub struct UpgradeRegion {
     /// `None` stands for no wait,
     /// it's helpful to verify whether the leader region is ready.
     #[serde(with = "humantime_serde")]
-    pub wait_for_replay_timeout: Option<Duration>,
+    pub replay_timeout: Option<Duration>,
+    /// The hint for replaying memtable.
+    #[serde(default)]
+    pub location_id: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Display)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// The identifier of cache.
+pub enum CacheIdent {
+    FlowId(FlowId),
+    FlowName(FlowName),
+    TableId(TableId),
+    TableName(TableName),
+    SchemaName(SchemaName),
+    CreateFlow(CreateFlow),
+    DropFlow(DropFlow),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateFlow {
+    pub source_table_ids: Vec<TableId>,
+    pub flownodes: Vec<Peer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DropFlow {
+    pub source_table_ids: Vec<TableId>,
+    pub flownode_ids: Vec<FlownodeId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Display, PartialEq)]
 pub enum Instruction {
     /// Opens a region.
     ///
@@ -163,10 +207,8 @@ pub enum Instruction {
     UpgradeRegion(UpgradeRegion),
     /// Downgrades a region.
     DowngradeRegion(DowngradeRegion),
-    /// Invalidates a specified table cache.
-    InvalidateTableIdCache(TableId),
-    /// Invalidates a specified table name index cache.
-    InvalidateTableNameCache(TableName),
+    /// Invalidates batch cache.
+    InvalidateCaches(Vec<CacheIdent>),
 }
 
 /// The reply of [UpgradeRegion].
@@ -196,7 +238,6 @@ pub enum InstructionReply {
     OpenRegion(SimpleReply),
     CloseRegion(SimpleReply),
     UpgradeRegion(UpgradeRegionReply),
-    InvalidateTableCache(SimpleReply),
     DowngradeRegion(DowngradeRegionReply),
 }
 
@@ -206,9 +247,6 @@ impl Display for InstructionReply {
             Self::OpenRegion(reply) => write!(f, "InstructionReply::OpenRegion({})", reply),
             Self::CloseRegion(reply) => write!(f, "InstructionReply::CloseRegion({})", reply),
             Self::UpgradeRegion(reply) => write!(f, "InstructionReply::UpgradeRegion({})", reply),
-            Self::InvalidateTableCache(reply) => {
-                write!(f, "InstructionReply::Invalidate({})", reply)
-            }
             Self::DowngradeRegion(reply) => {
                 write!(f, "InstructionReply::DowngradeRegion({})", reply)
             }

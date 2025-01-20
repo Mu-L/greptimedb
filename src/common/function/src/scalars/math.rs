@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod clamp;
+mod modulo;
 mod pow;
 mod rate;
 
 use std::fmt;
 use std::sync::Arc;
 
+pub use clamp::ClampFunction;
 use common_query::error::{GeneralDataFusionSnafu, Result};
 use common_query::prelude::Signature;
 use datafusion::error::DataFusionError;
@@ -30,14 +33,17 @@ use snafu::ResultExt;
 
 use crate::function::{Function, FunctionContext};
 use crate::function_registry::FunctionRegistry;
+use crate::scalars::math::modulo::ModuloFunction;
 
 pub(crate) struct MathFunction;
 
 impl MathFunction {
     pub fn register(registry: &FunctionRegistry) {
+        registry.register(Arc::new(ModuloFunction));
         registry.register(Arc::new(PowFunction));
         registry.register(Arc::new(RateFunction));
-        registry.register(Arc::new(RangeFunction))
+        registry.register(Arc::new(RangeFunction));
+        registry.register(Arc::new(ClampFunction));
     }
 }
 
@@ -71,7 +77,7 @@ impl Function for RangeFunction {
     /// `range_fn` will never been used. As long as a legal signature is returned, the specific content of the signature does not matter.
     /// In fact, the arguments loaded by `range_fn` are very complicated, and it is difficult to use `Signature` to describe
     fn signature(&self) -> Signature {
-        Signature::any(0, Volatility::Immutable)
+        Signature::variadic_any(Volatility::Immutable)
     }
 
     fn eval(&self, _func_ctx: FunctionContext, _columns: &[VectorRef]) -> Result<VectorRef> {

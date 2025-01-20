@@ -17,15 +17,22 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, Weak};
 
+use async_stream::{stream, try_stream};
 use common_catalog::build_db_string;
 use common_catalog::consts::{
-    DEFAULT_CATALOG_NAME, DEFAULT_PRIVATE_SCHEMA_NAME, DEFAULT_SCHEMA_NAME, INFORMATION_SCHEMA_NAME,
+    DEFAULT_CATALOG_NAME, DEFAULT_PRIVATE_SCHEMA_NAME, DEFAULT_SCHEMA_NAME,
+    INFORMATION_SCHEMA_NAME, PG_CATALOG_NAME,
 };
+use common_meta::key::flow::FlowMetadataManager;
+use common_meta::kv_backend::memory::MemoryKvBackend;
+use futures_util::stream::BoxStream;
+use session::context::QueryContext;
 use snafu::OptionExt;
 use table::TableRef;
 
 use crate::error::{CatalogNotFoundSnafu, Result, SchemaNotFoundSnafu, TableExistsSnafu};
 use crate::information_schema::InformationSchemaProvider;
+use crate::system_schema::SystemSchemaProvider;
 use crate::{CatalogManager, DeregisterTableRequest, RegisterSchemaRequest, RegisterTableRequest};
 
 type SchemaEntries = HashMap<String, HashMap<String, TableRef>>;
@@ -39,8 +46,82 @@ pub struct MemoryCatalogManager {
 
 #[async_trait::async_trait]
 impl CatalogManager for MemoryCatalogManager {
-    async fn schema_exists(&self, catalog: &str, schema: &str) -> Result<bool> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn catalog_names(&self) -> Result<Vec<String>> {
+        Ok(self.catalogs.read().unwrap().keys().cloned().collect())
+    }
+
+    async fn schema_names(
+        &self,
+        catalog: &str,
+        _query_ctx: Option<&QueryContext>,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .catalogs
+            .read()
+            .unwrap()
+            .get(catalog)
+            .with_context(|| CatalogNotFoundSnafu {
+                catalog_name: catalog,
+            })?
+            .keys()
+            .cloned()
+            .collect())
+    }
+
+    async fn table_names(
+        &self,
+        catalog: &str,
+        schema: &str,
+        _query_ctx: Option<&QueryContext>,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .catalogs
+            .read()
+            .unwrap()
+            .get(catalog)
+            .with_context(|| CatalogNotFoundSnafu {
+                catalog_name: catalog,
+            })?
+            .get(schema)
+            .with_context(|| SchemaNotFoundSnafu { catalog, schema })?
+            .keys()
+            .cloned()
+            .collect())
+    }
+
+    async fn catalog_exists(&self, catalog: &str) -> Result<bool> {
+        self.catalog_exist_sync(catalog)
+    }
+
+    async fn schema_exists(
+        &self,
+        catalog: &str,
+        schema: &str,
+        _query_ctx: Option<&QueryContext>,
+    ) -> Result<bool> {
         self.schema_exist_sync(catalog, schema)
+    }
+
+    async fn table_exists(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        _query_ctx: Option<&QueryContext>,
+    ) -> Result<bool> {
+        let catalogs = self.catalogs.read().unwrap();
+        Ok(catalogs
+            .get(catalog)
+            .with_context(|| CatalogNotFoundSnafu {
+                catalog_name: catalog,
+            })?
+            .get(schema)
+            .with_context(|| SchemaNotFoundSnafu { catalog, schema })?
+            .contains_key(table))
     }
 
     async fn table(
@@ -48,6 +129,7 @@ impl CatalogManager for MemoryCatalogManager {
         catalog: &str,
         schema: &str,
         table_name: &str,
+        _query_ctx: Option<&QueryContext>,
     ) -> Result<Option<TableRef>> {
         let result = try {
             self.catalogs
@@ -61,57 +143,36 @@ impl CatalogManager for MemoryCatalogManager {
         Ok(result)
     }
 
-    async fn catalog_exists(&self, catalog: &str) -> Result<bool> {
-        self.catalog_exist_sync(catalog)
-    }
-
-    async fn table_exists(&self, catalog: &str, schema: &str, table: &str) -> Result<bool> {
+    fn tables<'a>(
+        &'a self,
+        catalog: &'a str,
+        schema: &'a str,
+        _query_ctx: Option<&QueryContext>,
+    ) -> BoxStream<'a, Result<TableRef>> {
         let catalogs = self.catalogs.read().unwrap();
-        Ok(catalogs
-            .get(catalog)
-            .with_context(|| CatalogNotFoundSnafu {
-                catalog_name: catalog,
-            })?
-            .get(schema)
-            .with_context(|| SchemaNotFoundSnafu { catalog, schema })?
-            .contains_key(table))
-    }
 
-    async fn catalog_names(&self) -> Result<Vec<String>> {
-        Ok(self.catalogs.read().unwrap().keys().cloned().collect())
-    }
+        let Some(schemas) = catalogs.get(catalog) else {
+            return Box::pin(stream!({
+                yield CatalogNotFoundSnafu {
+                    catalog_name: catalog,
+                }
+                .fail();
+            }));
+        };
 
-    async fn schema_names(&self, catalog_name: &str) -> Result<Vec<String>> {
-        Ok(self
-            .catalogs
-            .read()
-            .unwrap()
-            .get(catalog_name)
-            .with_context(|| CatalogNotFoundSnafu { catalog_name })?
-            .keys()
-            .cloned()
-            .collect())
-    }
+        let Some(tables) = schemas.get(schema) else {
+            return Box::pin(stream!({
+                yield SchemaNotFoundSnafu { catalog, schema }.fail();
+            }));
+        };
 
-    async fn table_names(&self, catalog_name: &str, schema_name: &str) -> Result<Vec<String>> {
-        Ok(self
-            .catalogs
-            .read()
-            .unwrap()
-            .get(catalog_name)
-            .with_context(|| CatalogNotFoundSnafu { catalog_name })?
-            .get(schema_name)
-            .with_context(|| SchemaNotFoundSnafu {
-                catalog: catalog_name,
-                schema: schema_name,
-            })?
-            .keys()
-            .cloned()
-            .collect())
-    }
+        let tables = tables.values().cloned().collect::<Vec<_>>();
 
-    fn as_any(&self) -> &dyn Any {
-        self
+        Box::pin(try_stream!({
+            for table in tables {
+                yield table;
+            }
+        }))
     }
 }
 
@@ -146,6 +207,12 @@ impl MemoryCatalogManager {
         manager
             .register_schema_sync(RegisterSchemaRequest {
                 catalog: DEFAULT_CATALOG_NAME.to_string(),
+                schema: PG_CATALOG_NAME.to_string(),
+            })
+            .unwrap();
+        manager
+            .register_schema_sync(RegisterSchemaRequest {
+                catalog: DEFAULT_CATALOG_NAME.to_string(),
                 schema: INFORMATION_SCHEMA_NAME.to_string(),
             })
             .unwrap();
@@ -166,7 +233,7 @@ impl MemoryCatalogManager {
     }
 
     fn catalog_exist_sync(&self, catalog: &str) -> Result<bool> {
-        Ok(self.catalogs.read().unwrap().get(catalog).is_some())
+        Ok(self.catalogs.read().unwrap().contains_key(catalog))
     }
 
     /// Registers a catalog if it does not exist and returns false if the schema exists.
@@ -260,6 +327,7 @@ impl MemoryCatalogManager {
         let information_schema_provider = InformationSchemaProvider::new(
             catalog,
             Arc::downgrade(self) as Weak<dyn CatalogManager>,
+            Arc::new(FlowMetadataManager::new(Arc::new(MemoryKvBackend::new()))),
         );
         let information_schema = information_schema_provider.tables().clone();
 
@@ -307,6 +375,7 @@ pub fn new_memory_catalog_manager() -> Result<Arc<MemoryCatalogManager>> {
 #[cfg(test)]
 mod tests {
     use common_catalog::consts::*;
+    use futures_util::TryStreamExt;
     use table::table::numbers::{NumbersTable, NUMBERS_TABLE_NAME};
 
     use super::*;
@@ -329,12 +398,26 @@ mod tests {
                 DEFAULT_CATALOG_NAME,
                 DEFAULT_SCHEMA_NAME,
                 NUMBERS_TABLE_NAME,
+                None,
             )
             .await
+            .unwrap()
             .unwrap();
-        let _ = table.unwrap();
+        let stream = catalog_list.tables(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, None);
+        let tables = stream.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(
+            table.table_info().table_id(),
+            tables[0].table_info().table_id()
+        );
+
         assert!(catalog_list
-            .table(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, "not_exists")
+            .table(
+                DEFAULT_CATALOG_NAME,
+                DEFAULT_SCHEMA_NAME,
+                "not_exists",
+                None
+            )
             .await
             .unwrap()
             .is_none());
@@ -361,7 +444,7 @@ mod tests {
         };
         catalog.register_table_sync(register_table_req).unwrap();
         assert!(catalog
-            .table(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, table_name)
+            .table(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, table_name, None)
             .await
             .unwrap()
             .is_some());
@@ -373,7 +456,7 @@ mod tests {
         };
         catalog.deregister_table_sync(deregister_table_req).unwrap();
         assert!(catalog
-            .table(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, table_name)
+            .table(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, table_name, None)
             .await
             .unwrap()
             .is_none());

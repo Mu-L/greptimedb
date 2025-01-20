@@ -12,41 +12,56 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use common_catalog::consts::default_engine;
+use datafusion_common::ScalarValue;
+use datatypes::arrow::datatypes::{DataType as ArrowDataType, IntervalUnit};
+use datatypes::data_type::ConcreteDataType;
 use itertools::Itertools;
-use once_cell::sync::Lazy;
 use snafu::{ensure, OptionExt, ResultExt};
-use sqlparser::ast::{ColumnOption, ColumnOptionDef, DataType, Value};
+use sqlparser::ast::{ColumnOption, ColumnOptionDef, DataType, Expr};
 use sqlparser::dialect::keywords::Keyword;
 use sqlparser::keywords::ALL_KEYWORDS;
 use sqlparser::parser::IsOptional::Mandatory;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Token, TokenWithLocation, Word};
-use table::requests::valid_table_option;
+use table::requests::validate_table_option;
 
-use crate::ast::{ColumnDef, Ident, TableConstraint, Value as SqlValue};
+use super::utils;
+use crate::ast::{ColumnDef, Ident};
 use crate::error::{
-    self, InvalidColumnOptionSnafu, InvalidTableOptionSnafu, InvalidTimeIndexSnafu,
-    MissingTimeIndexSnafu, Result, SyntaxSnafu,
+    self, InvalidColumnOptionSnafu, InvalidDatabaseOptionSnafu, InvalidIntervalSnafu,
+    InvalidSqlSnafu, InvalidTableOptionSnafu, InvalidTimeIndexSnafu, MissingTimeIndexSnafu, Result,
+    SyntaxSnafu, UnexpectedSnafu, UnsupportedSnafu,
 };
-use crate::parser::ParserContext;
+use crate::parser::{ParserContext, FLOW};
+use crate::parsers::utils::{
+    validate_column_fulltext_create_option, validate_column_skipping_index_create_option,
+};
 use crate::statements::create::{
-    CreateDatabase, CreateExternalTable, CreateTable, PartitionEntry, Partitions, TIME_INDEX,
+    Column, ColumnExtensions, CreateDatabase, CreateExternalTable, CreateFlow, CreateTable,
+    CreateTableLike, CreateView, Partitions, TableConstraint, VECTOR_OPT_DIM,
 };
 use crate::statements::statement::Statement;
 use crate::statements::{
-    get_data_type_by_alias_name, sql_data_type_to_concrete_data_type, sql_value_to_value,
+    get_data_type_by_alias_name, sql_data_type_to_concrete_data_type, OptionMap,
 };
 use crate::util::parse_option_string;
 
 pub const ENGINE: &str = "ENGINE";
 pub const MAXVALUE: &str = "MAXVALUE";
+pub const SINK: &str = "SINK";
+pub const EXPIRE: &str = "EXPIRE";
+pub const AFTER: &str = "AFTER";
+pub const INVERTED: &str = "INVERTED";
+pub const SKIPPING: &str = "SKIPPING";
 
-static LESS: Lazy<Token> = Lazy::new(|| Token::make_keyword("LESS"));
-static THAN: Lazy<Token> = Lazy::new(|| Token::make_keyword("THAN"));
+const DB_OPT_KEY_TTL: &str = "ttl";
+
+fn validate_database_option(key: &str) -> bool {
+    [DB_OPT_KEY_TTL].contains(&key)
+}
 
 /// Parses create [table] statement
 impl<'a> ParserContext<'a> {
@@ -59,57 +74,110 @@ impl<'a> ParserContext<'a> {
 
                 Keyword::EXTERNAL => self.parse_create_external_table(),
 
+                Keyword::OR => {
+                    let _ = self.parser.next_token();
+                    self.parser
+                        .expect_keyword(Keyword::REPLACE)
+                        .context(SyntaxSnafu)?;
+                    match self.parser.next_token().token {
+                        Token::Word(w) => match w.keyword {
+                            Keyword::VIEW => self.parse_create_view(true),
+                            Keyword::NoKeyword => {
+                                let uppercase = w.value.to_uppercase();
+                                match uppercase.as_str() {
+                                    FLOW => self.parse_create_flow(true),
+                                    _ => self.unsupported(w.to_string()),
+                                }
+                            }
+                            _ => self.unsupported(w.to_string()),
+                        },
+                        _ => self.unsupported(w.to_string()),
+                    }
+                }
+
+                Keyword::VIEW => {
+                    let _ = self.parser.next_token();
+                    self.parse_create_view(false)
+                }
+
+                Keyword::NoKeyword => {
+                    let _ = self.parser.next_token();
+                    let uppercase = w.value.to_uppercase();
+                    match uppercase.as_str() {
+                        FLOW => self.parse_create_flow(false),
+                        _ => self.unsupported(w.to_string()),
+                    }
+                }
                 _ => self.unsupported(w.to_string()),
             },
             unexpected => self.unsupported(unexpected.to_string()),
         }
     }
 
+    /// Parse `CREAVE VIEW` statement.
+    fn parse_create_view(&mut self, or_replace: bool) -> Result<Statement> {
+        let if_not_exists = self.parse_if_not_exist()?;
+        let view_name = self.intern_parse_table_name()?;
+
+        let columns = self.parse_view_columns()?;
+
+        self.parser
+            .expect_keyword(Keyword::AS)
+            .context(SyntaxSnafu)?;
+
+        let query = self.parse_query()?;
+
+        Ok(Statement::CreateView(CreateView {
+            name: view_name,
+            columns,
+            or_replace,
+            query: Box::new(query),
+            if_not_exists,
+        }))
+    }
+
+    fn parse_view_columns(&mut self) -> Result<Vec<Ident>> {
+        let mut columns = vec![];
+        if !self.parser.consume_token(&Token::LParen) || self.parser.consume_token(&Token::RParen) {
+            return Ok(columns);
+        }
+
+        loop {
+            let name = self.parse_column_name().context(SyntaxSnafu)?;
+
+            columns.push(name);
+
+            let comma = self.parser.consume_token(&Token::Comma);
+            if self.parser.consume_token(&Token::RParen) {
+                // allow a trailing comma, even though it's not in standard
+                break;
+            } else if !comma {
+                return self.expected("',' or ')' after column name", self.parser.peek_token());
+            }
+        }
+
+        Ok(columns)
+    }
+
     fn parse_create_external_table(&mut self) -> Result<Statement> {
         let _ = self.parser.next_token();
         self.parser
             .expect_keyword(Keyword::TABLE)
-            .context(error::SyntaxSnafu)?;
-        let if_not_exists =
-            self.parser
-                .parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-        let raw_table_name = self
-            .parser
-            .parse_object_name()
-            .context(error::UnexpectedSnafu {
-                sql: self.sql,
-                expected: "a table name",
-                actual: self.peek_token_as_string(),
-            })?;
-        let table_name = Self::canonicalize_object_name(raw_table_name);
+            .context(SyntaxSnafu)?;
+        let if_not_exists = self.parse_if_not_exist()?;
+        let table_name = self.intern_parse_table_name()?;
         let (columns, constraints) = self.parse_columns()?;
-        let engine = self.parse_table_engine(common_catalog::consts::FILE_ENGINE)?;
-        let options = self
-            .parser
-            .parse_options(Keyword::WITH)
-            .context(error::SyntaxSnafu)?
-            .into_iter()
-            .filter_map(|option| {
-                if let Some(v) = parse_option_string(option.value) {
-                    Some((option.name.value.to_lowercase(), v))
-                } else {
-                    None
-                }
-            })
-            .collect::<HashMap<String, String>>();
-        for key in options.keys() {
-            ensure!(
-                valid_table_option(key),
-                InvalidTableOptionSnafu {
-                    key: key.to_string()
-                }
-            );
+        if !columns.is_empty() {
+            validate_time_index(&columns, &constraints)?;
         }
+
+        let engine = self.parse_table_engine(common_catalog::consts::FILE_ENGINE)?;
+        let options = self.parse_create_table_options()?;
         Ok(Statement::CreateExternalTable(CreateExternalTable {
             name: table_name,
             columns,
             constraints,
-            options: options.into(),
+            options,
             if_not_exists,
             engine,
         }))
@@ -117,61 +185,63 @@ impl<'a> ParserContext<'a> {
 
     fn parse_create_database(&mut self) -> Result<Statement> {
         let _ = self.parser.next_token();
+        let if_not_exists = self.parse_if_not_exist()?;
+        let database_name = self.parse_object_name().context(error::UnexpectedSnafu {
+            expected: "a database name",
+            actual: self.peek_token_as_string(),
+        })?;
+        let database_name = Self::canonicalize_object_name(database_name);
 
-        let if_not_exists =
-            self.parser
-                .parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-
-        let database_name = self
+        let options = self
             .parser
-            .parse_object_name()
-            .context(error::UnexpectedSnafu {
-                sql: self.sql,
-                expected: "a database name",
-                actual: self.peek_token_as_string(),
-            })?;
+            .parse_options(Keyword::WITH)
+            .context(SyntaxSnafu)?
+            .into_iter()
+            .map(parse_option_string)
+            .collect::<Result<HashMap<String, String>>>()?;
+
+        for key in options.keys() {
+            ensure!(
+                validate_database_option(key),
+                InvalidDatabaseOptionSnafu {
+                    key: key.to_string()
+                }
+            );
+        }
 
         Ok(Statement::CreateDatabase(CreateDatabase {
             name: database_name,
             if_not_exists,
+            options: options.into(),
         }))
     }
 
     fn parse_create_table(&mut self) -> Result<Statement> {
         let _ = self.parser.next_token();
-        let if_not_exists =
-            self.parser
-                .parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
 
-        let raw_table_name = self
-            .parser
-            .parse_object_name()
-            .context(error::UnexpectedSnafu {
-                sql: self.sql,
-                expected: "a table name",
-                actual: self.peek_token_as_string(),
-            })?;
-        let table_name = Self::canonicalize_object_name(raw_table_name);
+        let if_not_exists = self.parse_if_not_exist()?;
+
+        let table_name = self.intern_parse_table_name()?;
+
+        if self.parser.parse_keyword(Keyword::LIKE) {
+            let source_name = self.intern_parse_table_name()?;
+
+            return Ok(Statement::CreateTableLike(CreateTableLike {
+                table_name,
+                source_name,
+            }));
+        }
 
         let (columns, constraints) = self.parse_columns()?;
+        validate_time_index(&columns, &constraints)?;
 
         let partitions = self.parse_partitions()?;
+        if let Some(partitions) = &partitions {
+            validate_partitions(&columns, partitions)?;
+        }
 
         let engine = self.parse_table_engine(default_engine())?;
-        let options = self
-            .parser
-            .parse_options(Keyword::WITH)
-            .context(error::SyntaxSnafu)?;
-        for option in options.iter() {
-            ensure!(
-                valid_table_option(&option.name.value),
-                InvalidTableOptionSnafu {
-                    key: option.name.value.to_string()
-                }
-            );
-        }
-        // Sorts options so that `test_display_create_table` can always pass.
-        let options = options.into_iter().sorted().collect();
+        let options = self.parse_create_table_options()?;
         let create_table = CreateTable {
             if_not_exists,
             name: table_name,
@@ -182,22 +252,140 @@ impl<'a> ParserContext<'a> {
             table_id: 0, // table id is assigned by catalog manager
             partitions,
         };
-        validate_create(&create_table)?;
 
         Ok(Statement::CreateTable(create_table))
     }
 
-    // "PARTITION BY ..." syntax:
-    // https://dev.mysql.com/doc/refman/8.0/en/partitioning-columns-range.html
+    /// "CREATE FLOW" clause
+    fn parse_create_flow(&mut self, or_replace: bool) -> Result<Statement> {
+        let if_not_exists = self.parse_if_not_exist()?;
+
+        let flow_name = self.intern_parse_table_name()?;
+
+        // make `SINK` case in-sensitive
+        if let Token::Word(word) = self.parser.peek_token().token
+            && word.value.eq_ignore_ascii_case(SINK)
+        {
+            self.parser.next_token();
+        } else {
+            Err(ParserError::ParserError(
+                "Expect `SINK` keyword".to_string(),
+            ))
+            .context(SyntaxSnafu)?
+        }
+        self.parser
+            .expect_keyword(Keyword::TO)
+            .context(SyntaxSnafu)?;
+
+        let output_table_name = self.intern_parse_table_name()?;
+
+        let expire_after = if self
+            .parser
+            .consume_tokens(&[Token::make_keyword(EXPIRE), Token::make_keyword(AFTER)])
+        {
+            let expire_after_expr = self.parser.parse_expr().context(error::SyntaxSnafu)?;
+            let expire_after_lit = utils::parser_expr_to_scalar_value(expire_after_expr.clone())?
+                .cast_to(&ArrowDataType::Interval(IntervalUnit::MonthDayNano))
+                .ok()
+                .with_context(|| InvalidIntervalSnafu {
+                    reason: format!("cannot cast {} to interval type", expire_after_expr),
+                })?;
+            if let ScalarValue::IntervalMonthDayNano(Some(nanoseconds)) = expire_after_lit {
+                Some(
+                    i64::try_from(nanoseconds / 1_000_000_000)
+                        .ok()
+                        .with_context(|| InvalidIntervalSnafu {
+                            reason: format!("interval {} overflows", nanoseconds),
+                        })?,
+                )
+            } else {
+                unreachable!()
+            }
+        } else {
+            None
+        };
+
+        let comment = if self.parser.parse_keyword(Keyword::COMMENT) {
+            match self.parser.next_token() {
+                TokenWithLocation {
+                    token: Token::SingleQuotedString(value, ..),
+                    ..
+                } => Some(value),
+                unexpected => {
+                    return self
+                        .parser
+                        .expected("string", unexpected)
+                        .context(SyntaxSnafu)
+                }
+            }
+        } else {
+            None
+        };
+
+        self.parser
+            .expect_keyword(Keyword::AS)
+            .context(SyntaxSnafu)?;
+
+        let query = Box::new(self.parser.parse_query().context(error::SyntaxSnafu)?);
+
+        Ok(Statement::CreateFlow(CreateFlow {
+            flow_name,
+            sink_table_name: output_table_name,
+            or_replace,
+            if_not_exists,
+            expire_after,
+            comment,
+            query,
+        }))
+    }
+
+    fn parse_if_not_exist(&mut self) -> Result<bool> {
+        match self.parser.peek_token().token {
+            Token::Word(w) if Keyword::IF != w.keyword => return Ok(false),
+            _ => {}
+        }
+
+        if self.parser.parse_keywords(&[Keyword::IF, Keyword::NOT]) {
+            return self
+                .parser
+                .expect_keyword(Keyword::EXISTS)
+                .map(|_| true)
+                .context(UnexpectedSnafu {
+                    expected: "EXISTS",
+                    actual: self.peek_token_as_string(),
+                });
+        }
+
+        if self.parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]) {
+            return UnsupportedSnafu { keyword: "EXISTS" }.fail();
+        }
+
+        Ok(false)
+    }
+
+    fn parse_create_table_options(&mut self) -> Result<OptionMap> {
+        let options = self
+            .parser
+            .parse_options(Keyword::WITH)
+            .context(SyntaxSnafu)?
+            .into_iter()
+            .map(parse_option_string)
+            .collect::<Result<HashMap<String, String>>>()?;
+        for key in options.keys() {
+            ensure!(validate_table_option(key), InvalidTableOptionSnafu { key });
+        }
+        Ok(options.into())
+    }
+
+    /// "PARTITION ON COLUMNS (...)" clause
     fn parse_partitions(&mut self) -> Result<Option<Partitions>> {
         if !self.parser.parse_keyword(Keyword::PARTITION) {
             return Ok(None);
         }
         self.parser
-            .expect_keywords(&[Keyword::BY, Keyword::RANGE, Keyword::COLUMNS])
+            .expect_keywords(&[Keyword::ON, Keyword::COLUMNS])
             .context(error::UnexpectedSnafu {
-                sql: self.sql,
-                expected: "BY, RANGE, COLUMNS",
+                expected: "ON, COLUMNS",
                 actual: self.peek_token_as_string(),
             })?;
 
@@ -210,46 +398,13 @@ impl<'a> ParserContext<'a> {
             .map(Self::canonicalize_identifier)
             .collect();
 
-        let entries = self.parse_comma_separated(Self::parse_partition_entry)?;
+        let exprs = self.parse_comma_separated(Self::parse_partition_entry)?;
 
-        Ok(Some(Partitions {
-            column_list,
-            entries,
-        }))
+        Ok(Some(Partitions { column_list, exprs }))
     }
 
-    fn parse_partition_entry(&mut self) -> Result<PartitionEntry> {
-        self.parser
-            .expect_keyword(Keyword::PARTITION)
-            .context(error::UnexpectedSnafu {
-                sql: self.sql,
-                expected: "PARTITION",
-                actual: self.peek_token_as_string(),
-            })?;
-
-        let name = self.parser.parse_identifier().context(error::SyntaxSnafu)?;
-
-        self.parser
-            .expect_keyword(Keyword::VALUES)
-            .and_then(|_| self.parser.expect_token(&LESS))
-            .and_then(|_| self.parser.expect_token(&THAN))
-            .context(error::SyntaxSnafu)?;
-
-        let value_list = self.parse_comma_separated(Self::parse_value_list)?;
-
-        Ok(PartitionEntry { name, value_list })
-    }
-
-    fn parse_value_list(&mut self) -> Result<SqlValue> {
-        let token = self.parser.peek_token().token;
-        let value = match token {
-            Token::Word(Word { value, .. }) if value == MAXVALUE => {
-                let _ = self.parser.next_token();
-                SqlValue::Number(MAXVALUE.to_string(), false)
-            }
-            _ => self.parser.parse_value().context(error::SyntaxSnafu)?,
-        };
-        Ok(value)
+    fn parse_partition_entry(&mut self) -> Result<Expr> {
+        self.parser.parse_expr().context(error::SyntaxSnafu)
     }
 
     /// Parse a comma-separated list wrapped by "()", and of which all items accepted by `F`
@@ -260,7 +415,6 @@ impl<'a> ParserContext<'a> {
         self.parser
             .expect_token(&Token::LParen)
             .context(error::UnexpectedSnafu {
-                sql: self.sql,
                 expected: "(",
                 actual: self.peek_token_as_string(),
             })?;
@@ -276,7 +430,6 @@ impl<'a> ParserContext<'a> {
         self.parser
             .expect_token(&Token::RParen)
             .context(error::UnexpectedSnafu {
-                sql: self.sql,
                 expected: ")",
                 actual: self.peek_token_as_string(),
             })?;
@@ -284,7 +437,7 @@ impl<'a> ParserContext<'a> {
         Ok(values)
     }
 
-    fn parse_columns(&mut self) -> Result<(Vec<ColumnDef>, Vec<TableConstraint>)> {
+    fn parse_columns(&mut self) -> Result<(Vec<Column>, Vec<TableConstraint>)> {
         let mut columns = vec![];
         let mut constraints = vec![];
         if !self.parser.consume_token(&Token::LParen) || self.parser.consume_token(&Token::RParen) {
@@ -319,13 +472,13 @@ impl<'a> ParserContext<'a> {
 
     fn parse_column(
         &mut self,
-        columns: &mut Vec<ColumnDef>,
+        columns: &mut Vec<Column>,
         constraints: &mut Vec<TableConstraint>,
     ) -> Result<()> {
-        let mut column = self.parse_column_def().context(SyntaxSnafu)?;
+        let mut column = self.parse_column_def()?;
 
         let mut time_index_opt_idx = None;
-        for (index, opt) in column.options.iter().enumerate() {
+        for (index, opt) in column.options().iter().enumerate() {
             if let ColumnOption::DialectSpecific(tokens) = &opt.option {
                 if matches!(
                     &tokens[..],
@@ -343,22 +496,17 @@ impl<'a> ParserContext<'a> {
                     ensure!(
                         time_index_opt_idx.is_none(),
                         InvalidColumnOptionSnafu {
-                            name: column.name.to_string(),
+                            name: column.name().to_string(),
                             msg: "duplicated time index",
                         }
                     );
                     time_index_opt_idx = Some(index);
 
-                    let constraint = TableConstraint::Unique {
-                        name: Some(Ident {
-                            value: TIME_INDEX.to_owned(),
+                    let constraint = TableConstraint::TimeIndex {
+                        column: Ident {
+                            value: column.name().value.clone(),
                             quote_style: None,
-                        }),
-                        columns: vec![Ident {
-                            value: column.name.value.clone(),
-                            quote_style: None,
-                        }],
-                        is_primary: false,
+                        },
                     };
                     constraints.push(constraint);
                 }
@@ -367,22 +515,22 @@ impl<'a> ParserContext<'a> {
 
         if let Some(index) = time_index_opt_idx {
             ensure!(
-                !column.options.contains(&ColumnOptionDef {
+                !column.options().contains(&ColumnOptionDef {
                     option: ColumnOption::Null,
                     name: None,
                 }),
                 InvalidColumnOptionSnafu {
-                    name: column.name.to_string(),
+                    name: column.name().to_string(),
                     msg: "time index column can't be null",
                 }
             );
 
             // The timestamp type may be an alias type, we have to retrieve the actual type.
-            let data_type = get_real_timestamp_type(&column.data_type);
+            let data_type = get_unalias_type(column.data_type());
             ensure!(
                 matches!(data_type, DataType::Timestamp(_, _)),
                 InvalidColumnOptionSnafu {
-                    name: column.name.to_string(),
+                    name: column.name().to_string(),
                     msg: "time index column data type should be timestamp",
                 }
             );
@@ -392,11 +540,11 @@ impl<'a> ParserContext<'a> {
                 name: None,
             };
 
-            if !column.options.contains(&not_null_opt) {
-                column.options.push(not_null_opt);
+            if !column.options().contains(&not_null_opt) {
+                column.mut_options().push(not_null_opt);
             }
 
-            let _ = column.options.remove(index);
+            let _ = column.mut_options().remove(index);
         }
 
         columns.push(column);
@@ -404,12 +552,11 @@ impl<'a> ParserContext<'a> {
         Ok(())
     }
 
-    pub fn parse_column_def(&mut self) -> std::result::Result<ColumnDef, ParserError> {
-        let parser = &mut self.parser;
-
-        let name = parser.parse_identifier()?;
+    /// Parse the column name and check if it's valid.
+    fn parse_column_name(&mut self) -> std::result::Result<Ident, ParserError> {
+        let name = self.parser.parse_identifier(false)?;
         if name.quote_style.is_none() &&
-            // "ALL_KEYWORDS" are sorted.
+        // "ALL_KEYWORDS" are sorted.
             ALL_KEYWORDS.binary_search(&name.value.to_uppercase().as_str()).is_ok()
         {
             return Err(ParserError::ParserError(format!(
@@ -418,44 +565,68 @@ impl<'a> ParserContext<'a> {
             )));
         }
 
-        let data_type = parser.parse_data_type()?;
+        Ok(name)
+    }
+
+    pub fn parse_column_def(&mut self) -> Result<Column> {
+        let name = self.parse_column_name().context(SyntaxSnafu)?;
+        let parser = &mut self.parser;
+
+        ensure!(
+            !(name.quote_style.is_none() &&
+            // "ALL_KEYWORDS" are sorted.
+            ALL_KEYWORDS.binary_search(&name.value.to_uppercase().as_str()).is_ok()),
+            InvalidSqlSnafu {
+                msg: format!(
+                    "Cannot use keyword '{}' as column name. Hint: add quotes to the name.",
+                    &name.value
+                ),
+            }
+        );
+
+        let data_type = parser.parse_data_type().context(SyntaxSnafu)?;
         let collation = if parser.parse_keyword(Keyword::COLLATE) {
-            Some(parser.parse_object_name()?)
+            Some(parser.parse_object_name(false).context(SyntaxSnafu)?)
         } else {
             None
         };
         let mut options = vec![];
+        let mut extensions = ColumnExtensions::default();
         loop {
             if parser.parse_keyword(Keyword::CONSTRAINT) {
-                let name = Some(parser.parse_identifier()?);
+                let name = Some(parser.parse_identifier(false).context(SyntaxSnafu)?);
                 if let Some(option) = Self::parse_optional_column_option(parser)? {
                     options.push(ColumnOptionDef { name, option });
                 } else {
-                    return parser.expected(
-                        "constraint details after CONSTRAINT <name>",
-                        parser.peek_token(),
-                    );
+                    return parser
+                        .expected(
+                            "constraint details after CONSTRAINT <name>",
+                            parser.peek_token(),
+                        )
+                        .context(SyntaxSnafu);
                 }
             } else if let Some(option) = Self::parse_optional_column_option(parser)? {
                 options.push(ColumnOptionDef { name: None, option });
-            } else {
+            } else if !Self::parse_column_extensions(parser, &name, &data_type, &mut extensions)? {
                 break;
             };
         }
-        Ok(ColumnDef {
-            name: Self::canonicalize_identifier(name),
-            data_type,
-            collation,
-            options,
+
+        Ok(Column {
+            column_def: ColumnDef {
+                name: Self::canonicalize_identifier(name),
+                data_type,
+                collation,
+                options,
+            },
+            extensions,
         })
     }
 
-    fn parse_optional_column_option(
-        parser: &mut Parser<'a>,
-    ) -> std::result::Result<Option<ColumnOption>, ParserError> {
+    fn parse_optional_column_option(parser: &mut Parser<'_>) -> Result<Option<ColumnOption>> {
         if parser.parse_keywords(&[Keyword::CHARACTER, Keyword::SET]) {
             Ok(Some(ColumnOption::CharacterSet(
-                parser.parse_object_name()?,
+                parser.parse_object_name(false).context(SyntaxSnafu)?,
             )))
         } else if parser.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
             Ok(Some(ColumnOption::NotNull))
@@ -465,16 +636,24 @@ impl<'a> ParserContext<'a> {
                     token: Token::SingleQuotedString(value, ..),
                     ..
                 } => Ok(Some(ColumnOption::Comment(value))),
-                unexpected => parser.expected("string", unexpected),
+                unexpected => parser.expected("string", unexpected).context(SyntaxSnafu),
             }
         } else if parser.parse_keyword(Keyword::NULL) {
             Ok(Some(ColumnOption::Null))
         } else if parser.parse_keyword(Keyword::DEFAULT) {
-            Ok(Some(ColumnOption::Default(parser.parse_expr()?)))
+            Ok(Some(ColumnOption::Default(
+                parser.parse_expr().context(SyntaxSnafu)?,
+            )))
         } else if parser.parse_keywords(&[Keyword::PRIMARY, Keyword::KEY]) {
-            Ok(Some(ColumnOption::Unique { is_primary: true }))
+            Ok(Some(ColumnOption::Unique {
+                is_primary: true,
+                characteristics: None,
+            }))
         } else if parser.parse_keyword(Keyword::UNIQUE) {
-            Ok(Some(ColumnOption::Unique { is_primary: false }))
+            Ok(Some(ColumnOption::Unique {
+                is_primary: false,
+                characteristics: None,
+            }))
         } else if parser.parse_keywords(&[Keyword::TIME, Keyword::INDEX]) {
             // Use a DialectSpecific option for time index
             Ok(Some(ColumnOption::DialectSpecific(vec![
@@ -494,13 +673,124 @@ impl<'a> ParserContext<'a> {
         }
     }
 
+    fn parse_column_extensions(
+        parser: &mut Parser<'_>,
+        column_name: &Ident,
+        column_type: &DataType,
+        column_extensions: &mut ColumnExtensions,
+    ) -> Result<bool> {
+        if let DataType::Custom(name, tokens) = column_type
+            && name.0.len() == 1
+            && &name.0[0].value.to_uppercase() == "VECTOR"
+        {
+            ensure!(
+                tokens.len() == 1,
+                InvalidColumnOptionSnafu {
+                    name: column_name.to_string(),
+                    msg: "VECTOR type should have dimension",
+                }
+            );
+
+            let dimension =
+                tokens[0]
+                    .parse::<u32>()
+                    .ok()
+                    .with_context(|| InvalidColumnOptionSnafu {
+                        name: column_name.to_string(),
+                        msg: "dimension should be a positive integer",
+                    })?;
+
+            let options = HashMap::from_iter([(VECTOR_OPT_DIM.to_string(), dimension.to_string())]);
+            column_extensions.vector_options = Some(options.into());
+        }
+
+        let mut is_index_declared = false;
+
+        if let Token::Word(word) = parser.peek_token().token
+            && word.value.eq_ignore_ascii_case(SKIPPING)
+        {
+            parser.next_token();
+            // Consume `INDEX` keyword
+            ensure!(
+                parser.parse_keyword(Keyword::INDEX),
+                InvalidColumnOptionSnafu {
+                    name: column_name.to_string(),
+                    msg: "expect INDEX after SKIPPING keyword",
+                }
+            );
+            ensure!(
+                column_extensions.skipping_index_options.is_none(),
+                InvalidColumnOptionSnafu {
+                    name: column_name.to_string(),
+                    msg: "duplicated SKIPPING index option",
+                }
+            );
+
+            let options = parser
+                .parse_options(Keyword::WITH)
+                .context(error::SyntaxSnafu)?
+                .into_iter()
+                .map(parse_option_string)
+                .collect::<Result<HashMap<String, String>>>()?;
+
+            for key in options.keys() {
+                ensure!(
+                    validate_column_skipping_index_create_option(key),
+                    InvalidColumnOptionSnafu {
+                        name: column_name.to_string(),
+                        msg: format!("invalid SKIP option: {key}"),
+                    }
+                );
+            }
+
+            column_extensions.skipping_index_options = Some(options.into());
+            is_index_declared |= true;
+        }
+
+        if parser.parse_keyword(Keyword::FULLTEXT) {
+            ensure!(
+                column_extensions.fulltext_options.is_none(),
+                InvalidColumnOptionSnafu {
+                    name: column_name.to_string(),
+                    msg: "duplicated FULLTEXT option",
+                }
+            );
+
+            let column_type = get_unalias_type(column_type);
+            let data_type = sql_data_type_to_concrete_data_type(&column_type)?;
+            ensure!(
+                data_type == ConcreteDataType::string_datatype(),
+                InvalidColumnOptionSnafu {
+                    name: column_name.to_string(),
+                    msg: "FULLTEXT index only supports string type",
+                }
+            );
+
+            let options = parser
+                .parse_options(Keyword::WITH)
+                .context(error::SyntaxSnafu)?
+                .into_iter()
+                .map(parse_option_string)
+                .collect::<Result<HashMap<String, String>>>()?;
+
+            for key in options.keys() {
+                ensure!(
+                    validate_column_fulltext_create_option(key),
+                    InvalidColumnOptionSnafu {
+                        name: column_name.to_string(),
+                        msg: format!("invalid FULLTEXT option: {key}"),
+                    }
+                );
+            }
+
+            column_extensions.fulltext_options = Some(options.into());
+            is_index_declared |= true;
+        }
+
+        Ok(is_index_declared)
+    }
+
     fn parse_optional_table_constraint(&mut self) -> Result<Option<TableConstraint>> {
-        let name = if self.parser.parse_keyword(Keyword::CONSTRAINT) {
-            let raw_name = self.parser.parse_identifier().context(error::SyntaxSnafu)?;
-            Some(Self::canonicalize_identifier(raw_name))
-        } else {
-            None
-        };
         match self.parser.next_token() {
             TokenWithLocation {
                 token: Token::Word(w),
@@ -509,7 +799,6 @@ impl<'a> ParserContext<'a> {
                 self.parser
                     .expect_keyword(Keyword::KEY)
                     .context(error::UnexpectedSnafu {
-                        sql: self.sql,
                         expected: "KEY",
                         actual: self.peek_token_as_string(),
                     })?;
@@ -521,11 +810,7 @@ impl<'a> ParserContext<'a> {
                     .into_iter()
                     .map(Self::canonicalize_identifier)
                     .collect();
-                Ok(Some(TableConstraint::Unique {
-                    name,
-                    columns,
-                    is_primary: true,
-                }))
+                Ok(Some(TableConstraint::PrimaryKey { columns }))
             }
             TokenWithLocation {
                 token: Token::Word(w),
@@ -534,7 +819,6 @@ impl<'a> ParserContext<'a> {
                 self.parser
                     .expect_keyword(Keyword::INDEX)
                     .context(error::UnexpectedSnafu {
-                        sql: self.sql,
                         expected: "INDEX",
                         actual: self.peek_token_as_string(),
                     })?;
@@ -543,7 +827,7 @@ impl<'a> ParserContext<'a> {
                     .parser
                     .parse_parenthesized_column_list(Mandatory, false)
                     .context(error::SyntaxSnafu)?;
-                let columns = raw_columns
+                let mut columns = raw_columns
                     .into_iter()
                     .map(Self::canonicalize_identifier)
                     .collect::<Vec<_>>();
@@ -555,24 +839,35 @@ impl<'a> ParserContext<'a> {
                     }
                 );
 
-                // TODO(dennis): TableConstraint doesn't support dialect right now,
-                // so we use unique constraint with special key to represent TIME INDEX.
-                Ok(Some(TableConstraint::Unique {
-                    name: Some(Ident {
-                        value: TIME_INDEX.to_owned(),
-                        quote_style: None,
-                    }),
-                    columns,
-                    is_primary: false,
+                Ok(Some(TableConstraint::TimeIndex {
+                    column: columns.pop().unwrap(),
                 }))
             }
-            unexpected => {
-                if name.is_some() {
-                    self.expected("PRIMARY, TIME", unexpected)
-                } else {
-                    self.parser.prev_token();
-                    Ok(None)
-                }
+            TokenWithLocation {
+                token: Token::Word(w),
+                ..
+            } if w.value.eq_ignore_ascii_case(INVERTED) => {
+                self.parser
+                    .expect_keyword(Keyword::INDEX)
+                    .context(error::UnexpectedSnafu {
+                        expected: "INDEX",
+                        actual: self.peek_token_as_string(),
+                    })?;
+
+                let raw_columns = self
+                    .parser
+                    // allow empty list to unset inverted index
+                    .parse_parenthesized_column_list(Mandatory, true)
+                    .context(error::SyntaxSnafu)?;
+                let columns = raw_columns
+                    .into_iter()
+                    .map(Self::canonicalize_identifier)
+                    .collect::<Vec<_>>();
+                Ok(Some(TableConstraint::InvertedIndex { columns }))
+            }
+            _ => {
+                self.parser.prev_token();
+                Ok(None)
             }
         }
     }
@@ -586,7 +881,6 @@ impl<'a> ParserContext<'a> {
         self.parser
             .expect_token(&Token::Eq)
             .context(error::UnexpectedSnafu {
-                sql: self.sql,
                 expected: "=",
                 actual: self.peek_token_as_string(),
             })?;
@@ -600,34 +894,12 @@ impl<'a> ParserContext<'a> {
     }
 }
 
-fn validate_create(create_table: &CreateTable) -> Result<()> {
-    if let Some(partitions) = &create_table.partitions {
-        validate_partitions(&create_table.columns, partitions)?;
-    }
-    validate_time_index(create_table)?;
-
-    Ok(())
-}
-
-fn validate_time_index(create_table: &CreateTable) -> Result<()> {
-    let time_index_constraints: Vec<_> = create_table
-        .constraints
+fn validate_time_index(columns: &[Column], constraints: &[TableConstraint]) -> Result<()> {
+    let time_index_constraints: Vec<_> = constraints
         .iter()
-        .filter_map(|c| {
-            if let TableConstraint::Unique {
-                name: Some(ident),
-                columns,
-                is_primary: false,
-            } = c
-            {
-                if ident.value == TIME_INDEX {
-                    Some(columns)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+        .filter_map(|c| match c {
+            TableConstraint::TimeIndex { column } => Some(column),
+            _ => None,
         })
         .unique()
         .collect();
@@ -642,20 +914,13 @@ fn validate_time_index(create_table: &CreateTable) -> Result<()> {
             ),
         }
     );
-    ensure!(
-        time_index_constraints[0].len() == 1,
-        InvalidTimeIndexSnafu {
-            msg: "it should contain only one column in time index",
-        }
-    );
 
     // It's safe to use time_index_constraints[0][0],
     // we already check the bound above.
-    let time_index_column_ident = &time_index_constraints[0][0];
-    let time_index_column = create_table
-        .columns
+    let time_index_column_ident = &time_index_constraints[0];
+    let time_index_column = columns
         .iter()
-        .find(|c| c.name.value == *time_index_column_ident.value)
+        .find(|c| c.name().value == *time_index_column_ident.value)
         .with_context(|| InvalidTimeIndexSnafu {
             msg: format!(
                 "time index column {} not found in columns",
@@ -663,11 +928,11 @@ fn validate_time_index(create_table: &CreateTable) -> Result<()> {
             ),
         })?;
 
-    let time_index_data_type = get_real_timestamp_type(&time_index_column.data_type);
+    let time_index_data_type = get_unalias_type(time_index_column.data_type());
     ensure!(
         matches!(time_index_data_type, DataType::Timestamp(_, _)),
         InvalidColumnOptionSnafu {
-            name: time_index_column.name.to_string(),
+            name: time_index_column.name().to_string(),
             msg: "time index column data type should be timestamp",
         }
     );
@@ -675,7 +940,7 @@ fn validate_time_index(create_table: &CreateTable) -> Result<()> {
     Ok(())
 }
 
-fn get_real_timestamp_type(data_type: &DataType) -> DataType {
+fn get_unalias_type(data_type: &DataType) -> DataType {
     match data_type {
         DataType::Custom(name, tokens) if name.0.len() == 1 && tokens.is_empty() => {
             if let Some(real_type) = get_data_type_by_alias_name(name.0[0].value.as_str()) {
@@ -688,152 +953,86 @@ fn get_real_timestamp_type(data_type: &DataType) -> DataType {
     }
 }
 
-fn validate_partitions(columns: &[ColumnDef], partitions: &Partitions) -> Result<()> {
+fn validate_partitions(columns: &[Column], partitions: &Partitions) -> Result<()> {
     let partition_columns = ensure_partition_columns_defined(columns, partitions)?;
 
-    ensure_partition_names_no_duplicate(partitions)?;
-
-    ensure_value_list_len_matches_columns(partitions, &partition_columns)?;
-
-    let value_lists = ensure_value_lists_strictly_increased(partitions, partition_columns)?;
-
-    ensure_value_lists_bounded_by_maxvalue(value_lists)?;
+    ensure_exprs_are_binary(&partitions.exprs, &partition_columns)?;
 
     Ok(())
 }
 
-/// Ensure that partition ranges fully cover all values.
-// Simply check the last partition is bounded by "MAXVALUE"s.
-// MySQL does not have this restriction. However, I think we'd better have it because:
-//   - It might save user from adding more partitions in the future by hand, which is often
-//     a tedious task. Why not provide an extra partition at the beginning and leave all
-//     other partition related jobs to us? I think it's a reasonable argument to user.
-//   - It might save us from some ugly designs and codings. The "MAXVALUE" bound is natural
-//     in dealing with values that are unspecified upfront. Without it, we have to store
-//     and use the user defined max bound everywhere, starting from calculating regions by
-//     partition rule in Frontend, to automatically split and merge regions in Meta.
-fn ensure_value_lists_bounded_by_maxvalue(value_lists: Vec<&Vec<Value>>) -> Result<()> {
-    let is_maxvalue_bound = value_lists.last().map(|v| {
-        v.iter()
-            .all(|x| matches!(x, SqlValue::Number(s, _) if s == MAXVALUE))
-    });
-    ensure!(
-        matches!(is_maxvalue_bound, Some(true)),
-        error::InvalidSqlSnafu {
-            msg: "Please provide an extra partition that is bounded by 'MAXVALUE'."
+/// Ensure all exprs are binary expr and all the columns are defined in the column list.
+fn ensure_exprs_are_binary(exprs: &[Expr], columns: &[&Column]) -> Result<()> {
+    for expr in exprs {
+        // The first level must be binary expr
+        if let Expr::BinaryOp { left, op: _, right } = expr {
+            ensure_one_expr(left, columns)?;
+            ensure_one_expr(right, columns)?;
+        } else {
+            return error::InvalidSqlSnafu {
+                msg: format!("Partition rule expr {:?} is not a binary expr", expr),
+            }
+            .fail();
         }
-    );
-    Ok(())
-}
-
-/// Ensure that value lists of partitions are strictly increasing.
-fn ensure_value_lists_strictly_increased<'a>(
-    partitions: &'a Partitions,
-    partition_columns: Vec<&'a ColumnDef>,
-) -> Result<Vec<&'a Vec<Value>>> {
-    let value_lists = partitions
-        .entries
-        .iter()
-        .map(|x| &x.value_list)
-        .collect::<Vec<_>>();
-    for i in 1..value_lists.len() {
-        let mut equal_tuples = 0;
-        for (n, (x, y)) in value_lists[i - 1]
-            .iter()
-            .zip(value_lists[i].iter())
-            .enumerate()
-        {
-            let column = partition_columns[n];
-            let is_x_maxvalue = matches!(x, SqlValue::Number(s, _) if s == MAXVALUE);
-            let is_y_maxvalue = matches!(y, SqlValue::Number(s, _) if s == MAXVALUE);
-            match (is_x_maxvalue, is_y_maxvalue) {
-                (true, true) => {
-                    equal_tuples += 1;
-                }
-                (false, false) => {
-                    let column_name = &column.name.value;
-                    let cdt = sql_data_type_to_concrete_data_type(&column.data_type)?;
-                    let x = sql_value_to_value(column_name, &cdt, x)?;
-                    let y = sql_value_to_value(column_name, &cdt, y)?;
-                    match x.cmp(&y) {
-                        Ordering::Less => break,
-                        Ordering::Equal => equal_tuples += 1,
-                        Ordering::Greater => return error::InvalidSqlSnafu {
-                            msg: "VALUES LESS THAN value must be strictly increasing for each partition.",
-                        }.fail()
-                    }
-                }
-                (true, false) => return error::InvalidSqlSnafu {
-                    msg: "VALUES LESS THAN value must be strictly increasing for each partition.",
-                }
-                .fail(),
-                (false, true) => break,
-            }
-        }
-        ensure!(
-            equal_tuples < partition_columns.len(),
-            error::InvalidSqlSnafu {
-                msg: "VALUES LESS THAN value must be strictly increasing for each partition.",
-            }
-        );
-    }
-    Ok(value_lists)
-}
-
-/// Ensure that value list's length matches the column list.
-fn ensure_value_list_len_matches_columns(
-    partitions: &Partitions,
-    partition_columns: &[&ColumnDef],
-) -> Result<()> {
-    for entry in partitions.entries.iter() {
-        ensure!(
-            entry.value_list.len() == partition_columns.len(),
-            error::InvalidSqlSnafu {
-                msg: "Partition value list does not match column list.",
-            }
-        );
     }
     Ok(())
 }
 
-/// Ensure that all columns used in "PARTITION BY RANGE COLUMNS" are defined in create table.
+/// Check if the expr is a binary expr, an ident or a literal value.
+/// If is ident, then check it is in the column list.
+/// This recursive function is intended to be used by [ensure_exprs_are_binary].
+fn ensure_one_expr(expr: &Expr, columns: &[&Column]) -> Result<()> {
+    match expr {
+        Expr::BinaryOp { left, op: _, right } => {
+            ensure_one_expr(left, columns)?;
+            ensure_one_expr(right, columns)?;
+            Ok(())
+        }
+        Expr::Identifier(ident) => {
+            let column_name = &ident.value;
+            ensure!(
+                columns.iter().any(|c| &c.name().value == column_name),
+                error::InvalidSqlSnafu {
+                    msg: format!(
+                        "Column {:?} in rule expr is not referenced in PARTITION ON",
+                        column_name
+                    ),
+                }
+            );
+            Ok(())
+        }
+        Expr::Value(_) => Ok(()),
+        Expr::UnaryOp { expr, .. } => {
+            ensure_one_expr(expr, columns)?;
+            Ok(())
+        }
+        _ => error::InvalidSqlSnafu {
+            msg: format!("Partition rule expr {:?} is not a binary expr", expr),
+        }
+        .fail(),
+    }
+}
+
+/// Ensure that all columns used in "PARTITION ON COLUMNS" are defined in create table.
 fn ensure_partition_columns_defined<'a>(
-    columns: &'a [ColumnDef],
+    columns: &'a [Column],
     partitions: &'a Partitions,
-) -> Result<Vec<&'a ColumnDef>> {
+) -> Result<Vec<&'a Column>> {
     partitions
         .column_list
         .iter()
         .map(|x| {
+            let x = ParserContext::canonicalize_identifier(x.clone());
             // Normally the columns in "create table" won't be too many,
             // a linear search to find the target every time is fine.
             columns
                 .iter()
-                .find(|c| &c.name == x)
+                .find(|c| *c.name().value == x.value)
                 .context(error::InvalidSqlSnafu {
-                    msg: format!("Partition column {:?} not defined!", x.value),
+                    msg: format!("Partition column {:?} not defined", x.value),
                 })
         })
-        .collect::<Result<Vec<&ColumnDef>>>()
-}
-
-/// Ensure that partition names do not duplicate.
-fn ensure_partition_names_no_duplicate(partitions: &Partitions) -> Result<()> {
-    let partition_names = partitions
-        .entries
-        .iter()
-        .map(|x| &x.name.value)
-        .sorted()
-        .collect::<Vec<&String>>();
-    for w in partition_names.windows(2) {
-        ensure!(
-            w[0] != w[1],
-            error::InvalidSqlSnafu {
-                msg: format!("Duplicate partition names: {}", w[0]),
-            }
-        )
-    }
-    Ok(())
+        .collect::<Result<Vec<&Column>>>()
 }
 
 #[cfg(test)]
@@ -844,22 +1043,42 @@ mod tests {
     use common_catalog::consts::FILE_ENGINE;
     use common_error::ext::ErrorExt;
     use sqlparser::ast::ColumnOption::NotNull;
+    use sqlparser::ast::{BinaryOperator, Expr, ObjectName, Value};
 
     use super::*;
     use crate::dialect::GreptimeDbDialect;
+    use crate::parser::ParseOptions;
+
+    #[test]
+    fn test_parse_create_table_like() {
+        let sql = "CREATE TABLE t1 LIKE t2";
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        assert_eq!(1, stmts.len());
+        match &stmts[0] {
+            Statement::CreateTableLike(c) => {
+                assert_eq!(c.table_name.to_string(), "t1");
+                assert_eq!(c.source_name.to_string(), "t2");
+            }
+            _ => unreachable!(),
+        }
+    }
 
     #[test]
     fn test_validate_external_table_options() {
         let sql = "CREATE EXTERNAL TABLE city (
             host string,
-            ts int64,
+            ts timestamp,
             cpu float64 default 0,
             memory float64,
             TIME INDEX (ts),
             PRIMARY KEY(ts, host)
         ) with(location='/var/data/city.csv',format='csv',foo='bar');";
 
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         assert!(matches!(
             result,
             Err(error::Error::InvalidTableOption { .. })
@@ -897,11 +1116,26 @@ mod tests {
                 expected_engine: "foo",
                 expected_if_not_exist: true,
             },
+            Test {
+                sql: "CREATE EXTERNAL TABLE IF NOT EXISTS city ENGINE=foo with(location='/var/data/city.csv',format='csv','compaction.type'='bar');",
+                expected_table_name: "city",
+                expected_options: HashMap::from([
+                    ("location".to_string(), "/var/data/city.csv".to_string()),
+                    ("format".to_string(), "csv".to_string()),
+                    ("compaction.type".to_string(), "bar".to_string()),
+                ]),
+                expected_engine: "foo",
+                expected_if_not_exist: true,
+            },
         ];
 
         for test in tests {
-            let stmts =
-                ParserContext::create_with_dialect(test.sql, &GreptimeDbDialect {}).unwrap();
+            let stmts = ParserContext::create_with_dialect(
+                test.sql,
+                &GreptimeDbDialect {},
+                ParseOptions::default(),
+            )
+            .unwrap();
             assert_eq!(1, stmts.len());
             match &stmts[0] {
                 Statement::CreateExternalTable(c) => {
@@ -919,11 +1153,12 @@ mod tests {
     fn test_parse_create_external_table_with_schema() {
         let sql = "CREATE EXTERNAL TABLE city (
             host string,
-            ts int64,
+            ts timestamp,
             cpu float32 default 0,
             memory float64,
             TIME INDEX (ts),
-            PRIMARY KEY(ts, host)
+            PRIMARY KEY(ts, host),
+            INVERTED INDEX(host)
         ) with(location='/var/data/city.csv',format='csv');";
 
         let options = HashMap::from([
@@ -931,7 +1166,9 @@ mod tests {
             ("format".to_string(), "csv".to_string()),
         ]);
 
-        let stmts = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).unwrap();
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
         assert_eq!(1, stmts.len());
         match &stmts[0] {
             Statement::CreateExternalTable(c) => {
@@ -939,24 +1176,28 @@ mod tests {
                 assert_eq!(c.options, options.into());
 
                 let columns = &c.columns;
-                assert_column_def(&columns[0], "host", "STRING");
-                assert_column_def(&columns[1], "ts", "BIGINT");
-                assert_column_def(&columns[2], "cpu", "FLOAT");
-                assert_column_def(&columns[3], "memory", "DOUBLE");
+                assert_column_def(&columns[0].column_def, "host", "STRING");
+                assert_column_def(&columns[1].column_def, "ts", "TIMESTAMP");
+                assert_column_def(&columns[2].column_def, "cpu", "FLOAT");
+                assert_column_def(&columns[3].column_def, "memory", "FLOAT64");
 
                 let constraints = &c.constraints;
-                assert_matches!(
+                assert_eq!(
                     &constraints[0],
-                    TableConstraint::Unique {
-                        is_primary: false,
-                        ..
+                    &TableConstraint::TimeIndex {
+                        column: Ident::new("ts"),
                     }
                 );
-                assert_matches!(
+                assert_eq!(
                     &constraints[1],
-                    TableConstraint::Unique {
-                        is_primary: true,
-                        ..
+                    &TableConstraint::PrimaryKey {
+                        columns: vec![Ident::new("ts"), Ident::new("host")]
+                    }
+                );
+                assert_eq!(
+                    &constraints[2],
+                    &TableConstraint::InvertedIndex {
+                        columns: vec![Ident::new("host")]
                     }
                 );
             }
@@ -967,14 +1208,17 @@ mod tests {
     #[test]
     fn test_parse_create_database() {
         let sql = "create database";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         assert!(result
             .unwrap_err()
             .to_string()
             .contains("Unexpected token while parsing SQL statement"));
 
         let sql = "create database prometheus";
-        let stmts = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).unwrap();
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
 
         assert_eq!(1, stmts.len());
         match &stmts[0] {
@@ -986,7 +1230,9 @@ mod tests {
         }
 
         let sql = "create database if not exists prometheus";
-        let stmts = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).unwrap();
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
 
         assert_eq!(1, stmts.len());
         match &stmts[0] {
@@ -996,119 +1242,120 @@ mod tests {
             }
             _ => unreachable!(),
         }
+
+        let sql = "CREATE DATABASE `fOo`";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        let stmts = result.unwrap();
+        match &stmts.last().unwrap() {
+            Statement::CreateDatabase(c) => {
+                assert_eq!(c.name, ObjectName(vec![Ident::with_quote('`', "fOo")]));
+                assert!(!c.if_not_exists);
+            }
+            _ => unreachable!(),
+        }
+
+        let sql = "CREATE DATABASE prometheus with (ttl='1h');";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        let stmts = result.unwrap();
+        match &stmts[0] {
+            Statement::CreateDatabase(c) => {
+                assert_eq!(c.name.to_string(), "prometheus");
+                assert!(!c.if_not_exists);
+                assert_eq!(c.options.get("ttl").unwrap(), "1h");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_flow() {
+        let sql = r"
+CREATE OR REPLACE FLOW IF NOT EXISTS task_1
+SINK TO schema_1.table_1
+EXPIRE AFTER INTERVAL '5 minutes'
+COMMENT 'test comment'
+AS
+SELECT max(c1), min(c2) FROM schema_2.table_2;";
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(1, stmts.len());
+        let create_task = match &stmts[0] {
+            Statement::CreateFlow(c) => c,
+            _ => unreachable!(),
+        };
+
+        let expected = CreateFlow {
+            flow_name: ObjectName(vec![Ident {
+                value: "task_1".to_string(),
+                quote_style: None,
+            }]),
+            sink_table_name: ObjectName(vec![
+                Ident {
+                    value: "schema_1".to_string(),
+                    quote_style: None,
+                },
+                Ident {
+                    value: "table_1".to_string(),
+                    quote_style: None,
+                },
+            ]),
+            or_replace: true,
+            if_not_exists: true,
+            expire_after: Some(300),
+            comment: Some("test comment".to_string()),
+            // ignore query parse result
+            query: create_task.query.clone(),
+        };
+        assert_eq!(create_task, &expected);
+
+        // create flow without `OR REPLACE`, `IF NOT EXISTS`, `EXPIRE AFTER` and `COMMENT`
+        let sql = r"
+CREATE FLOW task_2
+SINK TO schema_1.table_1
+AS
+SELECT max(c1), min(c2) FROM schema_2.table_2;";
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(1, stmts.len());
+        let create_task = match &stmts[0] {
+            Statement::CreateFlow(c) => c,
+            _ => unreachable!(),
+        };
+        assert!(!create_task.or_replace);
+        assert!(!create_task.if_not_exists);
+        assert!(create_task.expire_after.is_none());
+        assert!(create_task.comment.is_none());
     }
 
     #[test]
     fn test_validate_create() {
         let sql = r"
 CREATE TABLE rcx ( a INT, b STRING, c INT, ts timestamp TIME INDEX)
-PARTITION BY RANGE COLUMNS(b, a) (
-  PARTITION r0 VALUES LESS THAN ('hz', 1000),
-  PARTITION r1 VALUES LESS THAN ('sh', 2000),
-  PARTITION r3 VALUES LESS THAN (MAXVALUE, MAXVALUE),
+PARTITION ON COLUMNS(c, a) (
+    a < 10,
+    a > 10 AND a < 20,
+    a > 20 AND c < 100,
+    a > 20 AND c >= 100
 )
 ENGINE=mito";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         let _ = result.unwrap();
 
         let sql = r"
-CREATE TABLE rcx ( a INT, b STRING, c INT )
-PARTITION BY RANGE COLUMNS(b, x) (
-  PARTITION r0 VALUES LESS THAN ('hz', 1000),
-  PARTITION r1 VALUES LESS THAN ('sh', 2000),
-  PARTITION r3 VALUES LESS THAN (MAXVALUE, MAXVALUE),
-)
+CREATE TABLE rcx ( ts TIMESTAMP TIME INDEX, a INT, b STRING, c INT )
+PARTITION ON COLUMNS(x) ()
 ENGINE=mito";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Partition column \"x\" not defined!"));
-
-        let sql = r"
-CREATE TABLE rcx ( a INT, b STRING, c INT )
-PARTITION BY RANGE COLUMNS(b, a) (
-  PARTITION r0 VALUES LESS THAN ('hz', 1000),
-  PARTITION r1 VALUES LESS THAN ('sh', 2000),
-  PARTITION r2 VALUES LESS THAN ('sz', 3000),
-  PARTITION r1 VALUES LESS THAN (MAXVALUE, MAXVALUE),
-)
-ENGINE=mito";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Duplicate partition names: r1"));
-
-        let sql = r"
-CREATE TABLE rcx ( a INT, b STRING, c INT )
-PARTITION BY RANGE COLUMNS(b, a) (
-  PARTITION r0 VALUES LESS THAN ('hz', 1000),
-  PARTITION r1 VALUES LESS THAN ('sh'),
-  PARTITION r3 VALUES LESS THAN (MAXVALUE, MAXVALUE),
-)
-ENGINE=mito";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Partition value list does not match column list"));
-
-        let cases = vec![
-            r"
-CREATE TABLE rcx ( a INT, b STRING, c INT )
-PARTITION BY RANGE COLUMNS(b, a) (
-  PARTITION r0 VALUES LESS THAN ('sh', 1000),
-  PARTITION r1 VALUES LESS THAN ('hz', 2000),
-  PARTITION r3 VALUES LESS THAN (MAXVALUE, MAXVALUE),
-)
-ENGINE=mito",
-            r"
-CREATE TABLE rcx ( a INT, b STRING, c INT )
-PARTITION BY RANGE COLUMNS(b, a) (
-  PARTITION r0 VALUES LESS THAN ('hz', 2000),
-  PARTITION r1 VALUES LESS THAN ('hz', 1000),
-  PARTITION r3 VALUES LESS THAN (MAXVALUE, MAXVALUE),
-)
-ENGINE=mito",
-            r"
-CREATE TABLE rcx ( a INT, b STRING, c INT )
-PARTITION BY RANGE COLUMNS(b, a) (
-  PARTITION r0 VALUES LESS THAN ('hz', 1000),
-  PARTITION r1 VALUES LESS THAN ('hz', 1000),
-  PARTITION r3 VALUES LESS THAN (MAXVALUE, MAXVALUE),
-)
-ENGINE=mito",
-            r"
-CREATE TABLE rcx ( a INT, b STRING, c INT )
-PARTITION BY RANGE COLUMNS(b, a) (
-  PARTITION r0 VALUES LESS THAN ('hz', 1000),
-  PARTITION r3 VALUES LESS THAN (MAXVALUE, 2000),
-  PARTITION r1 VALUES LESS THAN ('sh', 3000),
-)
-ENGINE=mito",
-        ];
-        for sql in cases {
-            let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("VALUES LESS THAN value must be strictly increasing for each partition"));
-        }
-
-        let sql = r"
-CREATE TABLE rcx ( a INT, b STRING, c INT )
-PARTITION BY RANGE COLUMNS(b, a) (
-  PARTITION r0 VALUES LESS THAN ('hz', 1000),
-  PARTITION r1 VALUES LESS THAN ('sh', 2000),
-  PARTITION r3 VALUES LESS THAN (MAXVALUE, 9999),
-)
-ENGINE=mito";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Please provide an extra partition that is bounded by 'MAXVALUE'."));
+            .contains("Partition column \"x\" not defined"));
     }
 
     #[test]
@@ -1123,14 +1370,16 @@ CREATE TABLE monitor (
   TIME INDEX (ts),
   PRIMARY KEY (host),
 )
-PARTITION BY RANGE COLUMNS(idc, host_id) (
-  PARTITION r0 VALUES LESS THAN ('hz', 1000),
-  PARTITION r1 VALUES LESS THAN ('sh', 2000),
-  PARTITION r2 VALUES LESS THAN ('sh', 3000),
-  PARTITION r3 VALUES LESS THAN (MAXVALUE, MAXVALUE),
+PARTITION ON COLUMNS(idc, host_id) (
+  idc <= 'hz' AND host_id < 1000,
+  idc > 'hz' AND idc <= 'sh' AND host_id < 2000,
+  idc > 'sh' AND host_id < 3000,
+  idc > 'sh' AND host_id >= 3000,
 )
 ENGINE=mito";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).unwrap();
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
         assert_eq!(result.len(), 1);
         match &result[0] {
             Statement::CreateTable(c) => {
@@ -1144,44 +1393,117 @@ ENGINE=mito";
                     .collect::<Vec<&String>>();
                 assert_eq!(column_list, vec!["idc", "host_id"]);
 
-                let entries = &partitions.entries;
-                let partition_names = entries
-                    .iter()
-                    .map(|x| &x.name.value)
-                    .collect::<Vec<&String>>();
-                assert_eq!(partition_names, vec!["r0", "r1", "r2", "r3"]);
+                let exprs = &partitions.exprs;
 
                 assert_eq!(
-                    entries[0].value_list,
-                    vec![
-                        SqlValue::SingleQuotedString("hz".to_string()),
-                        SqlValue::Number("1000".to_string(), false)
-                    ]
+                    exprs[0],
+                    Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Identifier("idc".into())),
+                            op: BinaryOperator::LtEq,
+                            right: Box::new(Expr::Value(Value::SingleQuotedString(
+                                "hz".to_string()
+                            )))
+                        }),
+                        op: BinaryOperator::And,
+                        right: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Identifier("host_id".into())),
+                            op: BinaryOperator::Lt,
+                            right: Box::new(Expr::Value(Value::Number("1000".to_string(), false)))
+                        })
+                    }
                 );
                 assert_eq!(
-                    entries[1].value_list,
-                    vec![
-                        SqlValue::SingleQuotedString("sh".to_string()),
-                        SqlValue::Number("2000".to_string(), false)
-                    ]
+                    exprs[1],
+                    Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::BinaryOp {
+                                left: Box::new(Expr::Identifier("idc".into())),
+                                op: BinaryOperator::Gt,
+                                right: Box::new(Expr::Value(Value::SingleQuotedString(
+                                    "hz".to_string()
+                                )))
+                            }),
+                            op: BinaryOperator::And,
+                            right: Box::new(Expr::BinaryOp {
+                                left: Box::new(Expr::Identifier("idc".into())),
+                                op: BinaryOperator::LtEq,
+                                right: Box::new(Expr::Value(Value::SingleQuotedString(
+                                    "sh".to_string()
+                                )))
+                            })
+                        }),
+                        op: BinaryOperator::And,
+                        right: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Identifier("host_id".into())),
+                            op: BinaryOperator::Lt,
+                            right: Box::new(Expr::Value(Value::Number("2000".to_string(), false)))
+                        })
+                    }
                 );
                 assert_eq!(
-                    entries[2].value_list,
-                    vec![
-                        SqlValue::SingleQuotedString("sh".to_string()),
-                        SqlValue::Number("3000".to_string(), false)
-                    ]
+                    exprs[2],
+                    Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Identifier("idc".into())),
+                            op: BinaryOperator::Gt,
+                            right: Box::new(Expr::Value(Value::SingleQuotedString(
+                                "sh".to_string()
+                            )))
+                        }),
+                        op: BinaryOperator::And,
+                        right: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Identifier("host_id".into())),
+                            op: BinaryOperator::Lt,
+                            right: Box::new(Expr::Value(Value::Number("3000".to_string(), false)))
+                        })
+                    }
                 );
                 assert_eq!(
-                    entries[3].value_list,
-                    vec![
-                        SqlValue::Number(MAXVALUE.to_string(), false),
-                        SqlValue::Number(MAXVALUE.to_string(), false)
-                    ]
+                    exprs[3],
+                    Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Identifier("idc".into())),
+                            op: BinaryOperator::Gt,
+                            right: Box::new(Expr::Value(Value::SingleQuotedString(
+                                "sh".to_string()
+                            )))
+                        }),
+                        op: BinaryOperator::And,
+                        right: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Identifier("host_id".into())),
+                            op: BinaryOperator::GtEq,
+                            right: Box::new(Expr::Value(Value::Number("3000".to_string(), false)))
+                        })
+                    }
                 );
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn test_parse_create_table_with_quoted_partitions() {
+        let sql = r"
+CREATE TABLE monitor (
+  `host_id`    INT,
+  idc        STRING,
+  ts         TIMESTAMP,
+  cpu        DOUBLE DEFAULT 0,
+  memory     DOUBLE,
+  TIME INDEX (ts),
+  PRIMARY KEY (host),
+)
+PARTITION ON COLUMNS(IdC, host_id) (
+  idc <= 'hz' AND host_id < 1000,
+  idc > 'hz' AND idc <= 'sh' AND host_id < 2000,
+  idc > 'sh' AND host_id < 3000,
+  idc > 'sh' AND host_id >= 3000,
+)";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(result.len(), 1);
     }
 
     #[test]
@@ -1196,21 +1518,19 @@ CREATE TABLE monitor (
   PRIMARY KEY (host),
 )
 ENGINE=mito";
-        let result1 = ParserContext::create_with_dialect(sql1, &GreptimeDbDialect {}).unwrap();
+        let result1 = ParserContext::create_with_dialect(
+            sql1,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        )
+        .unwrap();
 
         if let Statement::CreateTable(c) = &result1[0] {
             assert_eq!(c.constraints.len(), 2);
             let tc = c.constraints[0].clone();
             match tc {
-                TableConstraint::Unique {
-                    name,
-                    columns,
-                    is_primary,
-                } => {
-                    assert_eq!(name.unwrap().to_string(), "__time_index");
-                    assert_eq!(columns.len(), 1);
-                    assert_eq!(&columns[0].value, "ts");
-                    assert!(!is_primary);
+                TableConstraint::TimeIndex { column } => {
+                    assert_eq!(&column.value, "ts");
                 }
                 _ => panic!("should be time index constraint"),
             };
@@ -1231,7 +1551,12 @@ CREATE TABLE monitor (
   PRIMARY KEY (host),
 )
 ENGINE=mito";
-        let result2 = ParserContext::create_with_dialect(sql2, &GreptimeDbDialect {}).unwrap();
+        let result2 = ParserContext::create_with_dialect(
+            sql2,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(result1, result2);
 
@@ -1248,7 +1573,12 @@ CREATE TABLE monitor (
 )
 ENGINE=mito";
 
-        let result3 = ParserContext::create_with_dialect(sql3, &GreptimeDbDialect {}).unwrap();
+        let result3 = ParserContext::create_with_dialect(
+            sql3,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        )
+        .unwrap();
 
         assert_ne!(result1, result3);
 
@@ -1263,7 +1593,11 @@ CREATE TABLE monitor (
   PRIMARY KEY (host),
 )
 ENGINE=mito";
-        let result1 = ParserContext::create_with_dialect(sql1, &GreptimeDbDialect {});
+        let result1 = ParserContext::create_with_dialect(
+            sql1,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        );
 
         assert!(result1
             .unwrap_err()
@@ -1284,13 +1618,15 @@ CREATE TABLE monitor (
   PRIMARY KEY (host),
 )
 ENGINE=mito";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).unwrap();
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
 
         assert_eq!(result.len(), 1);
         if let Statement::CreateTable(c) = &result[0] {
             let ts = c.columns[2].clone();
-            assert_eq!(ts.name.to_string(), "ts");
-            assert_eq!(ts.options[0].option, NotNull);
+            assert_eq!(ts.name().to_string(), "ts");
+            assert_eq!(ts.options()[0].option, NotNull);
         } else {
             panic!("should be create table statement");
         }
@@ -1307,7 +1643,12 @@ CREATE TABLE monitor (
 )
 ENGINE=mito";
 
-        let result1 = ParserContext::create_with_dialect(sql1, &GreptimeDbDialect {}).unwrap();
+        let result1 = ParserContext::create_with_dialect(
+            sql1,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        )
+        .unwrap();
         assert_eq!(result, result1);
 
         let sql2 = r"
@@ -1322,7 +1663,12 @@ CREATE TABLE monitor (
 )
 ENGINE=mito";
 
-        let result2 = ParserContext::create_with_dialect(sql2, &GreptimeDbDialect {}).unwrap();
+        let result2 = ParserContext::create_with_dialect(
+            sql2,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        )
+        .unwrap();
         assert_eq!(result, result2);
 
         let sql3 = r"
@@ -1337,7 +1683,11 @@ CREATE TABLE monitor (
 )
 ENGINE=mito";
 
-        let result3 = ParserContext::create_with_dialect(sql3, &GreptimeDbDialect {});
+        let result3 = ParserContext::create_with_dialect(
+            sql3,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        );
         assert!(result3.is_err());
 
         let sql4 = r"
@@ -1352,7 +1702,11 @@ CREATE TABLE monitor (
 )
 ENGINE=mito";
 
-        let result4 = ParserContext::create_with_dialect(sql4, &GreptimeDbDialect {});
+        let result4 = ParserContext::create_with_dialect(
+            sql4,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        );
         assert!(result4.is_err());
 
         let sql = r"
@@ -1367,27 +1721,22 @@ CREATE TABLE monitor (
 )
 ENGINE=mito";
 
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).unwrap();
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
 
         if let Statement::CreateTable(c) = &result[0] {
             let tc = c.constraints[0].clone();
             match tc {
-                TableConstraint::Unique {
-                    name,
-                    columns,
-                    is_primary,
-                } => {
-                    assert_eq!(name.unwrap().to_string(), "__time_index");
-                    assert_eq!(columns.len(), 1);
-                    assert_eq!(&columns[0].value, "ts");
-                    assert!(!is_primary);
+                TableConstraint::TimeIndex { column } => {
+                    assert_eq!(&column.value, "ts");
                 }
                 _ => panic!("should be time index constraint"),
             }
             let ts = c.columns[2].clone();
-            assert_eq!(ts.name.to_string(), "ts");
-            assert!(matches!(ts.options[0].option, ColumnOption::Default(..)));
-            assert_eq!(ts.options[1].option, NotNull);
+            assert_eq!(ts.name().to_string(), "ts");
+            assert!(matches!(ts.options()[0].option, ColumnOption::Default(..)));
+            assert_eq!(ts.options()[1].option, NotNull);
         } else {
             unreachable!("should be create table statement");
         }
@@ -1396,46 +1745,62 @@ ENGINE=mito";
     #[test]
     fn test_parse_partitions_with_error_syntax() {
         let sql = r"
-CREATE TABLE rcx ( a INT, b STRING, c INT )
-PARTITION RANGE COLUMNS(b, a) (
-  PARTITION r0 VALUES LESS THAN ('hz', 1000),
-  PARTITION r1 VALUES LESS THAN ('sh', 2000),
-  PARTITION r3 VALUES LESS THAN (MAXVALUE, MAXVALUE),
+CREATE TABLE rcx ( ts TIMESTAMP TIME INDEX, a INT, b STRING, c INT )
+PARTITION COLUMNS(c, a) (
+    a < 10,
+    a > 10 AND a < 20,
+    a > 20 AND c < 100,
+    a > 20 AND c >= 100
 )
 ENGINE=mito";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         assert!(result
             .unwrap_err()
             .output_msg()
-            .contains("sql parser error: Expected BY, found: RANGE"));
+            .contains("sql parser error: Expected ON, found: COLUMNS"));
+    }
 
+    #[test]
+    fn test_parse_partitions_without_rule() {
         let sql = r"
-CREATE TABLE rcx ( a INT, b STRING, c INT )
-PARTITION BY RANGE COLUMNS(b, a) (
-  PARTITION r0 VALUES THAN ('hz', 1000),
-  PARTITION r1 VALUES LESS THAN ('sh', 2000),
-  PARTITION r3 VALUES LESS THAN (MAXVALUE, MAXVALUE),
-)
+CREATE TABLE rcx ( a INT, b STRING, c INT, d TIMESTAMP TIME INDEX )
+PARTITION ON COLUMNS(c, a) ()
 ENGINE=mito";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
-        assert!(result
-            .unwrap_err()
-            .output_msg()
-            .contains("sql parser error: Expected LESS, found: THAN"));
+        ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+            .unwrap();
+    }
 
+    #[test]
+    fn test_parse_partitions_unreferenced_column() {
         let sql = r"
-CREATE TABLE rcx ( a INT, b STRING, c INT )
-PARTITION BY RANGE COLUMNS(b, a) (
-  PARTITION r0 VALUES LESS THAN ('hz', 1000),
-  PARTITION r1 VALUES LESS THAN ('sh', 2000),
-  PARTITION r3 VALUES LESS THAN (MAXVALUE, MAXVALU),
+CREATE TABLE rcx ( ts TIMESTAMP TIME INDEX, a INT, b STRING, c INT )
+PARTITION ON COLUMNS(c, a) (
+    b = 'foo'
 )
 ENGINE=mito";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
-        assert!(result
-            .unwrap_err()
-            .output_msg()
-            .contains("Expected a concrete value, found: MAXVALU"));
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert_eq!(
+            result.unwrap_err().output_msg(),
+            "Invalid SQL, error: Column \"b\" in rule expr is not referenced in PARTITION ON"
+        );
+    }
+
+    #[test]
+    fn test_parse_partitions_not_binary_expr() {
+        let sql = r"
+CREATE TABLE rcx ( ts TIMESTAMP TIME INDEX, a INT, b STRING, c INT )
+PARTITION ON COLUMNS(c, a) (
+    b
+)
+ENGINE=mito";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert_eq!(
+            result.unwrap_err().output_msg(),
+            "Invalid SQL, error: Partition rule expr Identifier(Ident { value: \"b\", quote_style: None }) is not a binary expr"
+        );
     }
 
     fn assert_column_def(column: &ColumnDef, name: &str, data_type: &str) {
@@ -1451,10 +1816,14 @@ ENGINE=mito";
                              cpu float32 default 0,
                              memory float64,
                              TIME INDEX (ts),
-                             PRIMARY KEY(ts, host)) engine=mito
-                             with(regions=1);
+                             PRIMARY KEY(ts, host),
+                             INVERTED INDEX(host)
+                             ) engine=mito
+                             with(ttl='10s');
          ";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).unwrap();
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
         assert_eq!(1, result.len());
         match &result[0] {
             Statement::CreateTable(c) => {
@@ -1463,30 +1832,35 @@ ENGINE=mito";
                 assert_eq!("mito", c.engine);
                 assert_eq!(4, c.columns.len());
                 let columns = &c.columns;
-                assert_column_def(&columns[0], "host", "STRING");
-                assert_column_def(&columns[1], "ts", "TIMESTAMP");
-                assert_column_def(&columns[2], "cpu", "FLOAT");
-                assert_column_def(&columns[3], "memory", "DOUBLE");
+                assert_column_def(&columns[0].column_def, "host", "STRING");
+                assert_column_def(&columns[1].column_def, "ts", "TIMESTAMP");
+                assert_column_def(&columns[2].column_def, "cpu", "FLOAT");
+                assert_column_def(&columns[3].column_def, "memory", "FLOAT64");
 
                 let constraints = &c.constraints;
-                assert_matches!(
+                assert_eq!(
                     &constraints[0],
-                    TableConstraint::Unique {
-                        is_primary: false,
-                        ..
+                    &TableConstraint::TimeIndex {
+                        column: Ident::new("ts"),
                     }
                 );
-                assert_matches!(
+                assert_eq!(
                     &constraints[1],
-                    TableConstraint::Unique {
-                        is_primary: true,
-                        ..
+                    &TableConstraint::PrimaryKey {
+                        columns: vec![Ident::new("ts"), Ident::new("host")]
                     }
                 );
-                let options = &c.options;
-                assert_eq!(1, options.len());
-                assert_eq!("regions", &options[0].name.to_string());
-                assert_eq!("1", &options[0].value.to_string());
+                assert_eq!(
+                    &constraints[2],
+                    &TableConstraint::InvertedIndex {
+                        columns: vec![Ident::new("host")]
+                    }
+                );
+                assert_eq!(1, c.options.len());
+                assert_eq!(
+                    [("ttl", "10s")].into_iter().collect::<HashMap<_, _>>(),
+                    c.options.to_str_map()
+                );
             }
             _ => unreachable!(),
         }
@@ -1500,10 +1874,10 @@ ENGINE=mito";
                              cpu float64 default 0,
                              memory float64,
                              TIME INDEX (ts, host),
-                             PRIMARY KEY(ts, host)) engine=mito
-                             with(regions=1);
+                             PRIMARY KEY(ts, host)) engine=mito;
          ";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         assert!(result.is_err());
         assert_matches!(result, Err(crate::error::Error::InvalidTimeIndex { .. }));
     }
@@ -1517,10 +1891,10 @@ ENGINE=mito";
                              cpu float64 default 0,
                              memory float64,
                              TIME INDEX (ts, host),
-                             PRIMARY KEY(ts, host)) engine=mito
-                             with(regions=1);
+                             PRIMARY KEY(ts, host)) engine=mito;
          ";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         assert!(result.is_err());
         assert_matches!(result, Err(crate::error::Error::InvalidTimeIndex { .. }));
 
@@ -1531,18 +1905,46 @@ ENGINE=mito";
                              t timestamp,
                              memory float64,
                              TIME INDEX (t),
-                             PRIMARY KEY(ts, host)) engine=mito
-                             with(regions=1);
+                             PRIMARY KEY(ts, host)) engine=mito;
          ";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         assert!(result.is_err());
         assert_matches!(result, Err(crate::error::Error::InvalidTimeIndex { .. }));
     }
 
     #[test]
+    fn test_inverted_index_empty_list() {
+        let sql = r"create table demo(
+                             host string,
+                             ts timestamp time index,
+                             cpu float64 default 0,
+                             memory float64,
+                             TIME INDEX (ts),
+                             inverted index()
+                             ) engine=mito;
+         ";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        if let Statement::CreateTable(c) = &result[0] {
+            let tc = &c
+                .constraints
+                .iter()
+                .find(|c| matches!(c, TableConstraint::InvertedIndex { .. }))
+                .unwrap();
+            assert_eq!(*tc, &TableConstraint::InvertedIndex { columns: vec![] });
+        } else {
+            unreachable!("should be create table statement");
+        }
+    }
+
+    #[test]
     fn test_invalid_column_name() {
         let sql = "create table foo(user string, i timestamp time index)";
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         let err = result.unwrap_err().output_msg();
         assert!(err.contains("Cannot use keyword 'user' as column name"));
 
@@ -1550,7 +1952,332 @@ ENGINE=mito";
         let sql = r#"
             create table foo("user" string, i timestamp time index)
         "#;
-        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         let _ = result.unwrap();
+    }
+
+    #[test]
+    fn test_incorrect_default_value_issue_3479() {
+        let sql = r#"CREATE TABLE `ExcePTuRi`(
+non TIMESTAMP(6) TIME INDEX,
+`iUSTO` DOUBLE DEFAULT 0.047318541668048164
+)"#;
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(1, result.len());
+        match &result[0] {
+            Statement::CreateTable(c) => {
+                assert_eq!(
+                    "`iUSTO` DOUBLE DEFAULT 0.047318541668048164",
+                    c.columns[1].to_string()
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_view() {
+        let sql = "CREATE VIEW test AS SELECT * FROM NUMBERS";
+
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        match &result[0] {
+            Statement::CreateView(c) => {
+                assert_eq!(c.to_string(), sql);
+                assert!(!c.or_replace);
+                assert!(!c.if_not_exists);
+                assert_eq!("test", c.name.to_string());
+            }
+            _ => unreachable!(),
+        }
+
+        let sql = "CREATE OR REPLACE VIEW IF NOT EXISTS test AS SELECT * FROM NUMBERS";
+
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        match &result[0] {
+            Statement::CreateView(c) => {
+                assert_eq!(c.to_string(), sql);
+                assert!(c.or_replace);
+                assert!(c.if_not_exists);
+                assert_eq!("test", c.name.to_string());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_view_invalid_query() {
+        let sql = "CREATE VIEW test AS DELETE from demo";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
+        assert_matches!(result, Err(crate::error::Error::Syntax { .. }));
+    }
+
+    #[test]
+    fn test_parse_create_table_fulltext_options() {
+        let sql1 = r"
+CREATE TABLE log (
+    ts TIMESTAMP TIME INDEX,
+    msg TEXT FULLTEXT,
+)";
+        let result1 = ParserContext::create_with_dialect(
+            sql1,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        )
+        .unwrap();
+
+        if let Statement::CreateTable(c) = &result1[0] {
+            c.columns.iter().for_each(|col| {
+                if col.name().value == "msg" {
+                    assert!(col.extensions.fulltext_options.as_ref().unwrap().is_empty());
+                }
+            });
+        } else {
+            panic!("should be create_table statement");
+        }
+
+        let sql2 = r"
+CREATE TABLE log (
+    ts TIMESTAMP TIME INDEX,
+    msg STRING FULLTEXT WITH (analyzer='English', case_sensitive='false')
+)";
+        let result2 = ParserContext::create_with_dialect(
+            sql2,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        )
+        .unwrap();
+
+        if let Statement::CreateTable(c) = &result2[0] {
+            c.columns.iter().for_each(|col| {
+                if col.name().value == "msg" {
+                    let options = col.extensions.fulltext_options.as_ref().unwrap();
+                    assert_eq!(options.len(), 2);
+                    assert_eq!(options.get("analyzer").unwrap(), "English");
+                    assert_eq!(options.get("case_sensitive").unwrap(), "false");
+                }
+            });
+        } else {
+            panic!("should be create_table statement");
+        }
+
+        let sql3 = r"
+CREATE TABLE log (
+    ts TIMESTAMP TIME INDEX,
+    msg1 TINYTEXT FULLTEXT WITH (analyzer='English', case_sensitive='false'),
+    msg2 CHAR(20) FULLTEXT WITH (analyzer='Chinese', case_sensitive='true')
+)";
+        let result3 = ParserContext::create_with_dialect(
+            sql3,
+            &GreptimeDbDialect {},
+            ParseOptions::default(),
+        )
+        .unwrap();
+
+        if let Statement::CreateTable(c) = &result3[0] {
+            c.columns.iter().for_each(|col| {
+                if col.name().value == "msg1" {
+                    let options = col.extensions.fulltext_options.as_ref().unwrap();
+                    assert_eq!(options.len(), 2);
+                    assert_eq!(options.get("analyzer").unwrap(), "English");
+                    assert_eq!(options.get("case_sensitive").unwrap(), "false");
+                } else if col.name().value == "msg2" {
+                    let options = col.extensions.fulltext_options.as_ref().unwrap();
+                    assert_eq!(options.len(), 2);
+                    assert_eq!(options.get("analyzer").unwrap(), "Chinese");
+                    assert_eq!(options.get("case_sensitive").unwrap(), "true");
+                }
+            });
+        } else {
+            panic!("should be create_table statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_create_table_fulltext_options_invalid_type() {
+        let sql = r"
+CREATE TABLE log (
+    ts TIMESTAMP TIME INDEX,
+    msg INT FULLTEXT,
+)";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("FULLTEXT index only supports string type"));
+    }
+
+    #[test]
+    fn test_parse_create_table_fulltext_options_duplicate() {
+        let sql = r"
+CREATE TABLE log (
+    ts TIMESTAMP TIME INDEX,
+    msg STRING FULLTEXT WITH (analyzer='English', analyzer='Chinese') FULLTEXT WITH (case_sensitive='false')
+)";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("duplicated FULLTEXT option"));
+    }
+
+    #[test]
+    fn test_parse_create_table_fulltext_options_invalid_option() {
+        let sql = r"
+CREATE TABLE log (
+    ts TIMESTAMP TIME INDEX,
+    msg STRING FULLTEXT WITH (analyzer='English', invalid_option='Chinese')
+)";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid FULLTEXT option"));
+    }
+
+    #[test]
+    fn test_parse_create_table_skip_options() {
+        let sql = r"
+CREATE TABLE log (
+    ts TIMESTAMP TIME INDEX,
+    msg INT SKIPPING INDEX WITH (granularity='8192', type='bloom'),
+)";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        if let Statement::CreateTable(c) = &result[0] {
+            c.columns.iter().for_each(|col| {
+                if col.name().value == "msg" {
+                    assert!(!col
+                        .extensions
+                        .skipping_index_options
+                        .as_ref()
+                        .unwrap()
+                        .is_empty());
+                }
+            });
+        } else {
+            panic!("should be create_table statement");
+        }
+
+        let sql = r"
+        CREATE TABLE log (
+            ts TIMESTAMP TIME INDEX,
+            msg INT SKIPPING INDEX,
+        )";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        if let Statement::CreateTable(c) = &result[0] {
+            c.columns.iter().for_each(|col| {
+                if col.name().value == "msg" {
+                    assert!(col
+                        .extensions
+                        .skipping_index_options
+                        .as_ref()
+                        .unwrap()
+                        .is_empty());
+                }
+            });
+        } else {
+            panic!("should be create_table statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_create_view_with_columns() {
+        let sql = "CREATE VIEW test () AS SELECT * FROM NUMBERS";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        match &result[0] {
+            Statement::CreateView(c) => {
+                assert_eq!(c.to_string(), "CREATE VIEW test AS SELECT * FROM NUMBERS");
+                assert!(!c.or_replace);
+                assert!(!c.if_not_exists);
+                assert_eq!("test", c.name.to_string());
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            "CREATE VIEW test AS SELECT * FROM NUMBERS",
+            result[0].to_string()
+        );
+
+        let sql = "CREATE VIEW test (n1) AS SELECT * FROM NUMBERS";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        match &result[0] {
+            Statement::CreateView(c) => {
+                assert_eq!(c.to_string(), sql);
+                assert!(!c.or_replace);
+                assert!(!c.if_not_exists);
+                assert_eq!("test", c.name.to_string());
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(sql, result[0].to_string());
+
+        let sql = "CREATE VIEW test (n1, n2) AS SELECT * FROM NUMBERS";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        match &result[0] {
+            Statement::CreateView(c) => {
+                assert_eq!(c.to_string(), sql);
+                assert!(!c.or_replace);
+                assert!(!c.if_not_exists);
+                assert_eq!("test", c.name.to_string());
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(sql, result[0].to_string());
+
+        // Some invalid syntax cases
+        let sql = "CREATE VIEW test (n1 AS select * from demo";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
+
+        let sql = "CREATE VIEW test (n1, AS select * from demo";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
+
+        let sql = "CREATE VIEW test n1,n2) AS select * from demo";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
+
+        let sql = "CREATE VIEW test (1) AS select * from demo";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
+
+        // keyword
+        let sql = "CREATE VIEW test (n1, select) AS select * from demo";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
     }
 }

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,8 +23,13 @@ use api::v1::meta::{
     RangeRequest as PbRangeRequest, RangeResponse as PbRangeResponse, ResponseHeader,
 };
 use common_grpc::channel_manager::ChannelManager;
-use common_meta::kv_backend::ResettableKvBackendRef;
-use common_meta::rpc::store::{BatchGetRequest, RangeRequest};
+use common_meta::datanode::{DatanodeStatKey, DatanodeStatValue};
+use common_meta::kv_backend::{KvBackend, ResettableKvBackendRef, TxnService};
+use common_meta::rpc::store::{
+    BatchDeleteRequest, BatchDeleteResponse, BatchGetRequest, BatchGetResponse, BatchPutRequest,
+    BatchPutResponse, CompareAndPutRequest, CompareAndPutResponse, DeleteRangeRequest,
+    DeleteRangeResponse, PutRequest, PutResponse, RangeRequest, RangeResponse,
+};
 use common_meta::rpc::KeyValue;
 use common_meta::util;
 use common_telemetry::warn;
@@ -32,7 +38,6 @@ use snafu::{ensure, OptionExt, ResultExt};
 
 use crate::error;
 use crate::error::{match_for_io_error, Result};
-use crate::keys::{StatKey, StatValue, DN_STAT_PREFIX};
 use crate::metasrv::ElectionRef;
 
 pub type MetaPeerClientRef = Arc<MetaPeerClient>;
@@ -49,66 +54,27 @@ pub struct MetaPeerClient {
     retry_interval_ms: u64,
 }
 
-impl MetaPeerClient {
-    async fn get_dn_key_value(&self, keys_only: bool) -> Result<Vec<KeyValue>> {
-        let key = format!("{DN_STAT_PREFIX}-").into_bytes();
-        let range_end = util::get_prefix_end_key(&key);
-        self.range(key, range_end, keys_only).await
+#[async_trait::async_trait]
+impl TxnService for MetaPeerClient {
+    type Error = error::Error;
+}
+
+#[async_trait::async_trait]
+impl KvBackend for MetaPeerClient {
+    fn name(&self) -> &str {
+        "MetaPeerClient"
     }
 
-    // Get all datanode stat kvs from leader meta.
-    pub async fn get_all_dn_stat_kvs(&self) -> Result<HashMap<StatKey, StatValue>> {
-        let kvs = self.get_dn_key_value(false).await?;
-        to_stat_kv_map(kvs)
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
-    pub async fn get_node_cnt(&self) -> Result<i32> {
-        let kvs = self.get_dn_key_value(true).await?;
-        kvs.into_iter()
-            .map(|kv| kv.key.try_into())
-            .collect::<Result<HashSet<StatKey>>>()
-            .map(|hash_set| hash_set.len() as i32)
-    }
-
-    // Get datanode stat kvs from leader meta by input keys.
-    pub async fn get_dn_stat_kvs(&self, keys: Vec<StatKey>) -> Result<HashMap<StatKey, StatValue>> {
-        let stat_keys = keys.into_iter().map(|key| key.into()).collect();
-
-        let kvs = self.batch_get(stat_keys).await?;
-
-        to_stat_kv_map(kvs)
-    }
-
-    // Get kv information from the leader's in_mem kv store.
-    pub async fn get(&self, key: Vec<u8>) -> Result<Option<KeyValue>> {
-        let mut kvs = self.range(key, vec![], false).await?;
-        Ok(if kvs.is_empty() {
-            None
-        } else {
-            debug_assert_eq!(kvs.len(), 1);
-            Some(kvs.remove(0))
-        })
-    }
-
-    // Range kv information from the leader's in_mem kv store
-    pub async fn range(
-        &self,
-        key: Vec<u8>,
-        range_end: Vec<u8>,
-        keys_only: bool,
-    ) -> Result<Vec<KeyValue>> {
+    async fn range(&self, req: RangeRequest) -> Result<RangeResponse> {
         if self.is_leader() {
-            let request = RangeRequest {
-                key,
-                range_end,
-                ..Default::default()
-            };
-
             return self
                 .in_memory
-                .range(request)
+                .range(req)
                 .await
-                .map(|resp| resp.kvs)
                 .context(error::KvBackendSnafu);
         }
 
@@ -117,13 +83,13 @@ impl MetaPeerClient {
 
         for _ in 0..max_retry_count {
             match self
-                .remote_range(key.clone(), range_end.clone(), keys_only)
+                .remote_range(req.key.clone(), req.range_end.clone(), req.keys_only)
                 .await
             {
-                Ok(kvs) => return Ok(kvs),
+                Ok(res) => return Ok(res),
                 Err(e) => {
                     if need_retry(&e) {
-                        warn!("Encountered an error that need to retry, err: {:?}", e);
+                        warn!(e; "Encountered an error that need to retry");
                         tokio::time::sleep(Duration::from_millis(retry_interval_ms)).await;
                     } else {
                         return Err(e);
@@ -139,12 +105,146 @@ impl MetaPeerClient {
         .fail()
     }
 
+    // MetaPeerClient does not support mutable methods listed below.
+    async fn put(&self, _req: PutRequest) -> Result<PutResponse> {
+        error::UnsupportedSnafu {
+            operation: "put".to_string(),
+        }
+        .fail()
+    }
+
+    async fn batch_put(&self, _req: BatchPutRequest) -> Result<BatchPutResponse> {
+        error::UnsupportedSnafu {
+            operation: "batch put".to_string(),
+        }
+        .fail()
+    }
+
+    // Get kv information from the leader's in_mem kv store
+    async fn batch_get(&self, req: BatchGetRequest) -> Result<BatchGetResponse> {
+        if self.is_leader() {
+            return self
+                .in_memory
+                .batch_get(req)
+                .await
+                .context(error::KvBackendSnafu);
+        }
+
+        let max_retry_count = self.max_retry_count;
+        let retry_interval_ms = self.retry_interval_ms;
+
+        for _ in 0..max_retry_count {
+            match self.remote_batch_get(req.keys.clone()).await {
+                Ok(res) => return Ok(res),
+                Err(e) => {
+                    if need_retry(&e) {
+                        warn!(e; "Encountered an error that need to retry");
+                        tokio::time::sleep(Duration::from_millis(retry_interval_ms)).await;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        error::ExceededRetryLimitSnafu {
+            func_name: "batch_get",
+            retry_num: max_retry_count,
+        }
+        .fail()
+    }
+
+    async fn delete_range(&self, _req: DeleteRangeRequest) -> Result<DeleteRangeResponse> {
+        error::UnsupportedSnafu {
+            operation: "delete range".to_string(),
+        }
+        .fail()
+    }
+
+    async fn batch_delete(&self, _req: BatchDeleteRequest) -> Result<BatchDeleteResponse> {
+        error::UnsupportedSnafu {
+            operation: "batch delete".to_string(),
+        }
+        .fail()
+    }
+
+    async fn compare_and_put(&self, _req: CompareAndPutRequest) -> Result<CompareAndPutResponse> {
+        error::UnsupportedSnafu {
+            operation: "compare and put".to_string(),
+        }
+        .fail()
+    }
+
+    async fn put_conditionally(
+        &self,
+        _key: Vec<u8>,
+        _value: Vec<u8>,
+        _if_not_exists: bool,
+    ) -> Result<bool> {
+        error::UnsupportedSnafu {
+            operation: "put conditionally".to_string(),
+        }
+        .fail()
+    }
+
+    async fn delete(&self, _key: &[u8], _prev_kv: bool) -> Result<Option<KeyValue>> {
+        error::UnsupportedSnafu {
+            operation: "delete".to_string(),
+        }
+        .fail()
+    }
+}
+
+impl MetaPeerClient {
+    async fn get_dn_key_value(&self, keys_only: bool) -> Result<Vec<KeyValue>> {
+        let key = DatanodeStatKey::prefix_key();
+        let range_end = util::get_prefix_end_key(&key);
+        let range_request = RangeRequest {
+            key,
+            range_end,
+            keys_only,
+            ..Default::default()
+        };
+        self.range(range_request).await.map(|res| res.kvs)
+    }
+
+    // Get all datanode stat kvs from leader meta.
+    pub async fn get_all_dn_stat_kvs(&self) -> Result<HashMap<DatanodeStatKey, DatanodeStatValue>> {
+        let kvs = self.get_dn_key_value(false).await?;
+        to_stat_kv_map(kvs)
+    }
+
+    pub async fn get_node_cnt(&self) -> Result<i32> {
+        let kvs = self.get_dn_key_value(true).await?;
+        kvs.into_iter()
+            .map(|kv| {
+                kv.key
+                    .try_into()
+                    .context(error::InvalidDatanodeStatFormatSnafu {})
+            })
+            .collect::<Result<HashSet<DatanodeStatKey>>>()
+            .map(|hash_set| hash_set.len() as i32)
+    }
+
+    // Get datanode stat kvs from leader meta by input keys.
+    pub async fn get_dn_stat_kvs(
+        &self,
+        keys: Vec<DatanodeStatKey>,
+    ) -> Result<HashMap<DatanodeStatKey, DatanodeStatValue>> {
+        let stat_keys = keys.into_iter().map(|key| key.into()).collect();
+        let batch_get_req = BatchGetRequest { keys: stat_keys };
+
+        let res = self.batch_get(batch_get_req).await?;
+
+        to_stat_kv_map(res.kvs)
+    }
+
     async fn remote_range(
         &self,
         key: Vec<u8>,
         range_end: Vec<u8>,
         keys_only: bool,
-    ) -> Result<Vec<KeyValue>> {
+    ) -> Result<RangeResponse> {
         // Safety: when self.is_leader() == false, election must not empty.
         let election = self.election.as_ref().unwrap();
 
@@ -170,47 +270,13 @@ impl MetaPeerClient {
 
         check_resp_header(&response.header, Context { addr: &leader_addr })?;
 
-        Ok(response.kvs.into_iter().map(KeyValue::new).collect())
+        Ok(RangeResponse {
+            kvs: response.kvs.into_iter().map(KeyValue::new).collect(),
+            more: response.more,
+        })
     }
 
-    // Get kv information from the leader's in_mem kv store
-    pub async fn batch_get(&self, keys: Vec<Vec<u8>>) -> Result<Vec<KeyValue>> {
-        if self.is_leader() {
-            let request = BatchGetRequest { keys };
-
-            return self
-                .in_memory
-                .batch_get(request)
-                .await
-                .map(|resp| resp.kvs)
-                .context(error::KvBackendSnafu);
-        }
-
-        let max_retry_count = self.max_retry_count;
-        let retry_interval_ms = self.retry_interval_ms;
-
-        for _ in 0..max_retry_count {
-            match self.remote_batch_get(keys.clone()).await {
-                Ok(kvs) => return Ok(kvs),
-                Err(e) => {
-                    if need_retry(&e) {
-                        warn!("Encountered an error that need to retry, err: {:?}", e);
-                        tokio::time::sleep(Duration::from_millis(retry_interval_ms)).await;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        error::ExceededRetryLimitSnafu {
-            func_name: "batch_get",
-            retry_num: max_retry_count,
-        }
-        .fail()
-    }
-
-    async fn remote_batch_get(&self, keys: Vec<Vec<u8>>) -> Result<Vec<KeyValue>> {
+    async fn remote_batch_get(&self, keys: Vec<Vec<u8>>) -> Result<BatchGetResponse> {
         // Safety: when self.is_leader() == false, election must not empty.
         let election = self.election.as_ref().unwrap();
 
@@ -234,7 +300,9 @@ impl MetaPeerClient {
 
         check_resp_header(&response.header, Context { addr: &leader_addr })?;
 
-        Ok(response.kvs.into_iter().map(KeyValue::new).collect())
+        Ok(BatchGetResponse {
+            kvs: response.kvs.into_iter().map(KeyValue::new).collect(),
+        })
     }
 
     // Check if the meta node is a leader node.
@@ -245,12 +313,24 @@ impl MetaPeerClient {
             .map(|election| election.is_leader())
             .unwrap_or(true)
     }
+
+    #[cfg(test)]
+    pub(crate) fn memory_backend(&self) -> ResettableKvBackendRef {
+        self.in_memory.clone()
+    }
 }
 
-fn to_stat_kv_map(kvs: Vec<KeyValue>) -> Result<HashMap<StatKey, StatValue>> {
+fn to_stat_kv_map(kvs: Vec<KeyValue>) -> Result<HashMap<DatanodeStatKey, DatanodeStatValue>> {
     let mut map = HashMap::with_capacity(kvs.len());
     for kv in kvs {
-        let _ = map.insert(kv.key.try_into()?, kv.value.try_into()?);
+        let _ = map.insert(
+            kv.key
+                .try_into()
+                .context(error::InvalidDatanodeStatFormatSnafu {})?,
+            kv.value
+                .try_into()
+                .context(error::InvalidDatanodeStatFormatSnafu {})?,
+        );
     }
     Ok(map)
 }
@@ -287,16 +367,15 @@ fn need_retry(error: &error::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use api::v1::meta::{Error, ErrorCode, ResponseHeader};
+    use common_meta::datanode::{DatanodeStatKey, DatanodeStatValue, Stat};
     use common_meta::rpc::KeyValue;
 
     use super::{check_resp_header, to_stat_kv_map, Context};
     use crate::error;
-    use crate::handler::node_stat::Stat;
-    use crate::keys::{StatKey, StatValue};
 
     #[test]
     fn test_to_stat_kv_map() {
-        let stat_key = StatKey {
+        let stat_key = DatanodeStatKey {
             cluster_id: 0,
             node_id: 100,
         };
@@ -307,7 +386,7 @@ mod tests {
             addr: "127.0.0.1:3001".to_string(),
             ..Default::default()
         };
-        let stat_val = StatValue { stats: vec![stat] }.try_into().unwrap();
+        let stat_val = DatanodeStatValue { stats: vec![stat] }.try_into().unwrap();
 
         let kv = KeyValue {
             key: stat_key.into(),

@@ -24,16 +24,17 @@ use datafusion::arrow::array::AsArray;
 use datafusion::arrow::compute::{self, concat_batches, SortOptions};
 use datafusion::arrow::datatypes::{DataType, Float64Type, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::{DFSchema, DFSchemaRef};
+use datafusion::common::stats::Precision;
+use datafusion::common::{ColumnStatistics, DFSchema, DFSchemaRef, Statistics};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNodeCore};
-use datafusion::physical_expr::{PhysicalSortExpr, PhysicalSortRequirement};
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalSortRequirement};
 use datafusion::physical_plan::expressions::{CastExpr as PhyCast, Column as PhyColumn};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
-    RecordBatchStream, SendableRecordBatchStream, Statistics,
+    PlanProperties, RecordBatchStream, SendableRecordBatchStream,
 };
 use datafusion::prelude::{Column, Expr};
 use datatypes::prelude::{ConcreteDataType, DataType as GtDataType};
@@ -43,7 +44,9 @@ use datatypes::vectors::MutableVector;
 use futures::{ready, Stream, StreamExt};
 
 /// `HistogramFold` will fold the conventional (non-native) histogram ([1]) for later
-/// computing. Specifically, it will transform the `le` and `field` column into a complex
+/// computing.
+///
+/// Specifically, it will transform the `le` and `field` column into a complex
 /// type, and samples on other tag columns:
 /// - `le` will become a [ListArray] of [f64]. With each bucket bound parsed
 /// - `field` will become a [ListArray] of [f64]
@@ -94,17 +97,21 @@ impl UserDefinedLogicalNodeCore for HistogramFold {
         )
     }
 
-    fn from_template(&self, _exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
-        Self {
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> DataFusionResult<Self> {
+        Ok(Self {
             le_column: self.le_column.clone(),
             ts_column: self.ts_column.clone(),
-            input: inputs[0].clone(),
+            input: inputs.into_iter().next().unwrap(),
             field_column: self.field_column.clone(),
             quantile: self.quantile,
             // This method cannot return error. Otherwise we should re-calculate
             // the output schema
             output_schema: self.output_schema.clone(),
-        }
+        })
     }
 }
 
@@ -141,16 +148,13 @@ impl HistogramFold {
     ) -> DataFusionResult<()> {
         let check_column = |col| {
             if !input_schema.has_column_with_unqualified_name(col) {
-                return Err(DataFusionError::SchemaError(
+                Err(DataFusionError::SchemaError(
                     datafusion::common::SchemaError::FieldNotFound {
                         field: Box::new(Column::new(None::<String>, col)),
-                        valid_fields: input_schema
-                            .fields()
-                            .iter()
-                            .map(|f| f.qualified_column())
-                            .collect(),
+                        valid_fields: input_schema.columns(),
                     },
-                ));
+                    Box::new(None),
+                ))
             } else {
                 Ok(())
             }
@@ -166,25 +170,29 @@ impl HistogramFold {
         // safety: those fields are checked in `check_schema()`
         let le_column_index = input_schema
             .index_of_column_by_name(None, &self.le_column)
-            .unwrap()
             .unwrap();
         let field_column_index = input_schema
             .index_of_column_by_name(None, &self.field_column)
-            .unwrap()
             .unwrap();
         let ts_column_index = input_schema
             .index_of_column_by_name(None, &self.ts_column)
-            .unwrap()
             .unwrap();
 
+        let output_schema: SchemaRef = Arc::new(self.output_schema.as_ref().into());
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(output_schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            exec_input.properties().execution_mode(),
+        );
         Arc::new(HistogramFoldExec {
             le_column_index,
             field_column_index,
             ts_column_index,
             input: exec_input,
             quantile: self.quantile.into(),
-            output_schema: Arc::new(self.output_schema.as_ref().into()),
+            output_schema,
             metric: ExecutionPlanMetricsSet::new(),
+            properties,
         })
     }
 
@@ -195,15 +203,16 @@ impl HistogramFold {
         input_schema: &DFSchemaRef,
         le_column: &str,
     ) -> DataFusionResult<DFSchemaRef> {
-        let mut fields = input_schema.fields().clone();
+        let fields = input_schema.fields();
         // safety: those fields are checked in `check_schema()`
-        let le_column_idx = input_schema
-            .index_of_column_by_name(None, le_column)?
-            .unwrap();
-        fields.remove(le_column_idx);
-
+        let mut new_fields = Vec::with_capacity(fields.len() - 1);
+        for f in fields {
+            if f.name() != le_column {
+                new_fields.push((None, f.clone()));
+            }
+        }
         Ok(Arc::new(DFSchema::new_with_metadata(
-            fields,
+            new_fields,
             HashMap::new(),
         )?))
     }
@@ -220,6 +229,7 @@ pub struct HistogramFoldExec {
     ts_column_index: usize,
     quantile: f64,
     metric: ExecutionPlanMetricsSet,
+    properties: PlanProperties,
 }
 
 impl ExecutionPlan for HistogramFoldExec {
@@ -227,16 +237,8 @@ impl ExecutionPlan for HistogramFoldExec {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.output_schema.clone()
-    }
-
-    fn output_partitioning(&self) -> Partitioning {
-        self.input.output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.input.output_ordering()
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 
     fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
@@ -276,16 +278,15 @@ impl ExecutionPlan for HistogramFoldExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        // partition on all tag columns, i.e., non-le, non-ts and non-field columns
-        vec![Distribution::HashPartitioned(self.tag_col_exprs())]
+        vec![Distribution::SinglePartition; self.children().len()]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true; self.children().len()]
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     // cannot change schema with this method
@@ -302,6 +303,7 @@ impl ExecutionPlan for HistogramFoldExec {
             quantile: self.quantile,
             output_schema: self.output_schema.clone(),
             field_column_index: self.field_column_index,
+            properties: self.properties.clone(),
         }))
     }
 
@@ -343,13 +345,16 @@ impl ExecutionPlan for HistogramFoldExec {
         Some(self.metric.clone_inner())
     }
 
-    fn statistics(&self) -> Statistics {
-        Statistics {
-            num_rows: None,
-            total_byte_size: None,
-            column_statistics: None,
-            is_exact: false,
-        }
+    fn statistics(&self) -> DataFusionResult<Statistics> {
+        Ok(Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics::new_unknown();
+                // plus one more for the removed column by function `convert_schema`
+                self.schema().all_fields().len() + 1
+            ],
+        })
     }
 }
 
@@ -594,7 +599,7 @@ impl HistogramFoldStream {
         self.output_buffered_rows = 0;
         RecordBatch::try_new(self.output_schema.clone(), columns)
             .map(Some)
-            .map_err(DataFusionError::ArrowError)
+            .map_err(|e| DataFusionError::ArrowError(e, None))
     }
 
     /// Find the first `+Inf` which indicates the end of the bucket group
@@ -695,6 +700,7 @@ mod test {
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::common::ToDFSchema;
     use datafusion::physical_plan::memory::MemoryExec;
+    use datafusion::physical_plan::ExecutionMode;
     use datafusion::prelude::SessionContext;
     use datatypes::arrow_array::StringArray;
 
@@ -759,7 +765,7 @@ mod test {
     #[tokio::test]
     async fn fold_overall() {
         let memory_exec = Arc::new(prepare_test_data());
-        let output_schema = Arc::new(
+        let output_schema: SchemaRef = Arc::new(
             (*HistogramFold::convert_schema(
                 &Arc::new(memory_exec.schema().to_dfschema().unwrap()),
                 "le",
@@ -769,6 +775,11 @@ mod test {
             .clone()
             .into(),
         );
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(output_schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            ExecutionMode::Bounded,
+        );
         let fold_exec = Arc::new(HistogramFoldExec {
             le_column_index: 1,
             field_column_index: 2,
@@ -777,6 +788,7 @@ mod test {
             input: memory_exec,
             output_schema,
             metric: ExecutionPlanMetricsSet::new(),
+            properties,
         });
 
         let session_context = SessionContext::default();

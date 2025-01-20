@@ -16,15 +16,18 @@ use std::assert_matches::assert_matches;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use api::v1::meta::mailbox_message::Payload;
 use api::v1::meta::{HeartbeatResponse, MailboxMessage, RequestHeader};
+use common_meta::ddl::NoopRegionFailureDetectorControl;
 use common_meta::instruction::{
     DowngradeRegionReply, InstructionReply, SimpleReply, UpgradeRegionReply,
 };
 use common_meta::key::table_route::TableRouteValue;
 use common_meta::key::{TableMetadataManager, TableMetadataManagerRef};
 use common_meta::kv_backend::memory::MemoryKvBackend;
+use common_meta::kv_backend::KvBackendRef;
 use common_meta::peer::Peer;
 use common_meta::region_keeper::{MemoryRegionKeeper, MemoryRegionKeeperRef};
 use common_meta::rpc::router::RegionRoute;
@@ -41,16 +44,21 @@ use store_api::storage::RegionId;
 use table::metadata::RawTableInfo;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use super::migration_abort::RegionMigrationAbort;
-use super::upgrade_candidate_region::UpgradeCandidateRegion;
-use super::{Context, ContextFactory, DefaultContextFactory, State, VolatileContext};
+use crate::cache_invalidator::MetasrvCacheInvalidator;
 use crate::error::{self, Error, Result};
 use crate::handler::{HeartbeatMailbox, Pusher, Pushers};
+use crate::metasrv::MetasrvInfo;
+use crate::procedure::region_migration::close_downgraded_region::CloseDowngradedRegion;
 use crate::procedure::region_migration::downgrade_leader_region::DowngradeLeaderRegion;
+use crate::procedure::region_migration::manager::RegionMigrationProcedureTracker;
+use crate::procedure::region_migration::migration_abort::RegionMigrationAbort;
 use crate::procedure::region_migration::migration_end::RegionMigrationEnd;
 use crate::procedure::region_migration::open_candidate_region::OpenCandidateRegion;
 use crate::procedure::region_migration::update_metadata::UpdateMetadata;
-use crate::procedure::region_migration::PersistentContext;
+use crate::procedure::region_migration::upgrade_candidate_region::UpgradeCandidateRegion;
+use crate::procedure::region_migration::{
+    Context, ContextFactory, DefaultContextFactory, PersistentContext, State, VolatileContext,
+};
 use crate::service::mailbox::{Channel, MailboxRef};
 
 pub type MockHeartbeatReceiver = Receiver<std::result::Result<HeartbeatResponse, tonic::Status>>;
@@ -78,7 +86,7 @@ impl MailboxContext {
     ) {
         let pusher_id = channel.pusher_id();
         let pusher = Pusher::new(tx, &RequestHeader::default());
-        let _ = self.pushers.insert(pusher_id, pusher).await;
+        let _ = self.pushers.insert(pusher_id.string_key(), pusher).await;
     }
 
     pub fn mailbox(&self) -> &MailboxRef {
@@ -93,6 +101,14 @@ pub struct TestingEnv {
     opening_region_keeper: MemoryRegionKeeperRef,
     server_addr: String,
     procedure_manager: ProcedureManagerRef,
+    tracker: RegionMigrationProcedureTracker,
+    kv_backend: KvBackendRef,
+}
+
+impl Default for TestingEnv {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TestingEnv {
@@ -116,7 +132,19 @@ impl TestingEnv {
             mailbox_ctx,
             server_addr: "localhost".to_string(),
             procedure_manager,
+            tracker: Default::default(),
+            kv_backend,
         }
+    }
+
+    /// Returns the [KvBackendRef].
+    pub fn kv_backend(&self) -> KvBackendRef {
+        self.kv_backend.clone()
+    }
+
+    /// Returns the [RegionMigrationProcedureTracker].
+    pub(crate) fn tracker(&self) -> RegionMigrationProcedureTracker {
+        self.tracker.clone()
     }
 
     /// Returns a context of region migration procedure.
@@ -127,6 +155,13 @@ impl TestingEnv {
             volatile_ctx: Default::default(),
             mailbox: self.mailbox_ctx.mailbox().clone(),
             server_addr: self.server_addr.to_string(),
+            region_failure_detector_controller: Arc::new(NoopRegionFailureDetectorControl),
+            cache_invalidator: Arc::new(MetasrvCacheInvalidator::new(
+                self.mailbox_ctx.mailbox.clone(),
+                MetasrvInfo {
+                    server_addr: self.server_addr.to_string(),
+                },
+            )),
         }
     }
 
@@ -266,7 +301,7 @@ pub fn send_mock_reply(
     mut rx: MockHeartbeatReceiver,
     msg: impl Fn(u64) -> Result<MailboxMessage> + Send + 'static,
 ) {
-    common_runtime::spawn_bg(async move {
+    common_runtime::spawn_global(async move {
         while let Some(Ok(resp)) = rx.recv().await {
             let reply_id = resp.mailbox_message.unwrap().id;
             mailbox.on_recv(reply_id, msg(reply_id)).await.unwrap();
@@ -277,10 +312,13 @@ pub fn send_mock_reply(
 /// Generates a [PersistentContext].
 pub fn new_persistent_context(from: u64, to: u64, region_id: RegionId) -> PersistentContext {
     PersistentContext {
+        catalog: "greptime".into(),
+        schema: "public".into(),
         from_peer: Peer::empty(from),
         to_peer: Peer::empty(to),
         region_id,
         cluster_id: 0,
+        timeout: Duration::from_secs(10),
     }
 }
 
@@ -295,16 +333,6 @@ pub(crate) struct ProcedureMigrationTestSuite {
 pub(crate) type BeforeTest =
     Arc<dyn Fn(&mut ProcedureMigrationTestSuite) -> BoxFuture<'_, ()> + Send + Sync>;
 
-/// Custom assertion.
-pub(crate) type CustomAssertion = Arc<
-    dyn Fn(
-            &mut ProcedureMigrationTestSuite,
-            Result<(Box<dyn State>, Status)>,
-        ) -> BoxFuture<'_, Result<()>>
-        + Send
-        + Sync,
->;
-
 /// State assertion function.
 pub(crate) type StateAssertion = Arc<dyn Fn(&dyn State) + Send + Sync>;
 
@@ -314,14 +342,11 @@ pub(crate) type StatusAssertion = Arc<dyn Fn(Status) + Send + Sync>;
 /// Error assertion function.
 pub(crate) type ErrorAssertion = Arc<dyn Fn(Error) + Send + Sync>;
 
-// TODO(weny): Remove it.
-#[allow(dead_code)]
 /// The type of assertion.
 #[derive(Clone)]
 pub(crate) enum Assertion {
     Simple(StateAssertion, StatusAssertion),
     Error(ErrorAssertion),
-    Custom(CustomAssertion),
 }
 
 impl Assertion {
@@ -382,9 +407,6 @@ impl ProcedureMigrationTestSuite {
                 let error = result.unwrap_err();
                 error_assert(error);
             }
-            Assertion::Custom(assert_fn) => {
-                assert_fn(self, result).await?;
-            }
         }
 
         Ok(())
@@ -414,12 +436,12 @@ impl ProcedureMigrationTestSuite {
             .env
             .table_metadata_manager
             .table_route_manager()
+            .table_route_storage()
             .get(region_id.table_id())
             .await
             .unwrap()
-            .unwrap()
-            .into_inner();
-        let region_routes = table_route.region_routes();
+            .unwrap();
+        let region_routes = table_route.region_routes().unwrap();
 
         let expected_leader_id = self.context.persistent_ctx.to_peer.id;
         let removed_follower_id = self.context.persistent_ctx.from_peer.id;
@@ -429,7 +451,7 @@ impl ProcedureMigrationTestSuite {
             .find(|route| route.region.id == region_id)
             .unwrap();
 
-        assert!(!region_route.is_leader_downgraded());
+        assert!(!region_route.is_leader_downgrading());
         assert_eq!(
             region_route.leader_peer.as_ref().unwrap().id,
             expected_leader_id
@@ -443,7 +465,7 @@ impl ProcedureMigrationTestSuite {
 
 /// The step of test.
 #[derive(Clone)]
-pub enum Step {
+pub(crate) enum Step {
     Setup((String, BeforeTest)),
     Next((String, Option<BeforeTest>, Assertion)),
 }
@@ -518,7 +540,7 @@ pub(crate) fn assert_no_persist(status: Status) {
 
 /// Asserts the [Status] should be [Status::Done].
 pub(crate) fn assert_done(status: Status) {
-    assert_matches!(status, Status::Done)
+    assert!(status.is_done());
 }
 
 /// Asserts the [State] should be [OpenCandidateRegion].
@@ -547,6 +569,14 @@ pub(crate) fn assert_update_metadata_rollback(next: &dyn State) {
 /// Asserts the [State] should be [RegionMigrationEnd].
 pub(crate) fn assert_region_migration_end(next: &dyn State) {
     let _ = next.as_any().downcast_ref::<RegionMigrationEnd>().unwrap();
+}
+
+/// Asserts the [State] should be [CloseDowngradedRegion].
+pub(crate) fn assert_close_downgraded_region(next: &dyn State) {
+    let _ = next
+        .as_any()
+        .downcast_ref::<CloseDowngradedRegion>()
+        .unwrap();
 }
 
 /// Asserts the [State] should be [RegionMigrationAbort].

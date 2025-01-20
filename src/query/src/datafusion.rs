@@ -23,47 +23,40 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common_base::Plugins;
+use common_catalog::consts::is_readonly_schema;
 use common_error::ext::BoxedError;
 use common_function::function::FunctionRef;
 use common_function::scalars::aggregate::AggregateFunctionMetaRef;
-use common_function::scalars::udf::create_udf;
-use common_query::physical_plan::{DfPhysicalPlanAdapter, PhysicalPlan, PhysicalPlanAdapter};
 use common_query::prelude::ScalarUdf;
-use common_query::Output;
+use common_query::{Output, OutputData, OutputMeta};
 use common_recordbatch::adapter::RecordBatchStreamAdapter;
-use common_recordbatch::{
-    EmptyRecordBatchStream, RecordBatch, RecordBatches, SendableRecordBatchStream,
-};
+use common_recordbatch::{EmptyRecordBatchStream, SendableRecordBatchStream};
 use common_telemetry::tracing;
-use datafusion::common::Column;
 use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionContext;
-use datafusion_common::{ResolvedTableReference, ScalarValue};
-use datafusion_expr::{DmlStatement, Expr as DfExpr, LogicalPlan as DfLogicalPlan, WriteOp};
+use datafusion_common::ResolvedTableReference;
+use datafusion_expr::{DmlStatement, LogicalPlan as DfLogicalPlan, LogicalPlan, WriteOp};
 use datatypes::prelude::VectorRef;
 use datatypes::schema::Schema;
 use futures_util::StreamExt;
 use session::context::QueryContextRef;
 use snafu::{ensure, OptionExt, ResultExt};
-use sql::ast::{BinaryOperator, Expr, Value};
 use table::requests::{DeleteRequest, InsertRequest};
 use table::TableRef;
 
+use crate::analyze::DistAnalyzeExec;
 use crate::dataframe::DataFrame;
 pub use crate::datafusion::planner::DfContextProviderAdapter;
+use crate::dist_plan::MergeScanLogicalPlan;
 use crate::error::{
-    CatalogSnafu, CreateRecordBatchSnafu, CreateSchemaSnafu, DataFusionSnafu,
+    CatalogSnafu, ConvertSchemaSnafu, CreateRecordBatchSnafu, DataFusionSnafu,
     MissingTableMutationHandlerSnafu, MissingTimestampColumnSnafu, QueryExecutionSnafu, Result,
-    TableNotFoundSnafu, UnimplementedSnafu, UnsupportedExprSnafu,
+    TableMutationSnafu, TableNotFoundSnafu, TableReadOnlySnafu, UnsupportedExprSnafu,
 };
 use crate::executor::QueryExecutor;
-use crate::logical_optimizer::LogicalOptimizer;
-use crate::physical_optimizer::PhysicalOptimizer;
-use crate::physical_planner::PhysicalPlanner;
+use crate::metrics::{OnDone, QUERY_STAGE_ELAPSED};
 use crate::physical_wrapper::PhysicalPlanWrapperRef;
-use crate::plan::LogicalPlan;
 use crate::planner::{DfLogicalPlanner, LogicalPlanner};
 use crate::query_engine::{DescribeResult, QueryEngineContext, QueryEngineState};
 use crate::{metrics, QueryEngine};
@@ -84,7 +77,7 @@ impl DatafusionQueryEngine {
         plan: LogicalPlan,
         query_ctx: QueryContextRef,
     ) -> Result<Output> {
-        let mut ctx = QueryEngineContext::new(self.state.session_state(), query_ctx.clone());
+        let mut ctx = self.engine_context(query_ctx.clone());
 
         // `create_physical_plan` will optimize logical plan internally
         let physical_plan = self.create_physical_plan(&mut ctx, &plan).await?;
@@ -96,7 +89,10 @@ impl DatafusionQueryEngine {
             optimized_physical_plan
         };
 
-        Ok(Output::Stream(self.execute_stream(&ctx, &physical_plan)?))
+        Ok(Output::new(
+            OutputData::Stream(self.execute_stream(&ctx, &physical_plan)?),
+            OutputMeta::new_with_plan(physical_plan),
+        ))
     }
 
     #[tracing::instrument(skip_all)]
@@ -112,21 +108,27 @@ impl DatafusionQueryEngine {
             }
         );
 
+        let _timer = QUERY_STAGE_ELAPSED
+            .with_label_values(&[dml.op.name()])
+            .start_timer();
+
         let default_catalog = &query_ctx.current_catalog().to_owned();
-        let default_schema = &query_ctx.current_schema().to_owned();
+        let default_schema = &query_ctx.current_schema();
         let table_name = dml.table_name.resolve(default_catalog, default_schema);
-        let table = self.find_table(&table_name).await?;
+        let table = self.find_table(&table_name, &query_ctx).await?;
 
         let output = self
-            .exec_query_plan(LogicalPlan::DfPlan((*dml.input).clone()), query_ctx.clone())
+            .exec_query_plan((*dml.input).clone(), query_ctx.clone())
             .await?;
-        let mut stream = match output {
-            Output::RecordBatches(batches) => batches.as_stream(),
-            Output::Stream(stream) => stream,
+        let mut stream = match output.data {
+            OutputData::RecordBatches(batches) => batches.as_stream(),
+            OutputData::Stream(stream) => stream,
             _ => unreachable!(),
         };
 
         let mut affected_rows = 0;
+        let mut insert_cost = 0;
+
         while let Some(batch) = stream.next().await {
             let batch = batch.context(CreateRecordBatchSnafu)?;
             let column_vectors = batch
@@ -134,26 +136,33 @@ impl DatafusionQueryEngine {
                 .map_err(BoxedError::new)
                 .context(QueryExecutionSnafu)?;
 
-            let rows = match dml.op {
+            match dml.op {
                 WriteOp::InsertInto => {
-                    self.insert(&table_name, column_vectors, query_ctx.clone())
-                        .await?
+                    let output = self
+                        .insert(&table_name, column_vectors, query_ctx.clone())
+                        .await?;
+                    let (rows, cost) = output.extract_rows_and_cost();
+                    affected_rows += rows;
+                    insert_cost += cost;
                 }
                 WriteOp::Delete => {
-                    self.delete(&table_name, &table, column_vectors, query_ctx.clone())
-                        .await?
+                    affected_rows += self
+                        .delete(&table_name, &table, column_vectors, query_ctx.clone())
+                        .await?;
                 }
                 _ => unreachable!("guarded by the 'ensure!' at the beginning"),
-            };
-            affected_rows += rows;
+            }
         }
-        Ok(Output::AffectedRows(affected_rows))
+        Ok(Output::new(
+            OutputData::AffectedRows(affected_rows),
+            OutputMeta::new_with_cost(insert_cost),
+        ))
     }
 
     #[tracing::instrument(skip_all)]
-    async fn delete<'a>(
+    async fn delete(
         &self,
-        table_name: &ResolvedTableReference<'a>,
+        table_name: &ResolvedTableReference,
         table: &TableRef,
         column_vectors: HashMap<String, VectorRef>,
         query_ctx: QueryContextRef,
@@ -162,6 +171,12 @@ impl DatafusionQueryEngine {
         let schema_name = table_name.schema.to_string();
         let table_name = table_name.table.to_string();
         let table_schema = table.schema();
+
+        ensure!(
+            !is_readonly_schema(&schema_name),
+            TableReadOnlySnafu { table: table_name }
+        );
+
         let ts_column = table_schema
             .timestamp_column()
             .map(|x| &x.name)
@@ -191,19 +206,29 @@ impl DatafusionQueryEngine {
             .context(MissingTableMutationHandlerSnafu)?
             .delete(request, query_ctx)
             .await
+            .context(TableMutationSnafu)
     }
 
     #[tracing::instrument(skip_all)]
-    async fn insert<'a>(
+    async fn insert(
         &self,
-        table_name: &ResolvedTableReference<'a>,
+        table_name: &ResolvedTableReference,
         column_vectors: HashMap<String, VectorRef>,
         query_ctx: QueryContextRef,
-    ) -> Result<usize> {
+    ) -> Result<Output> {
+        let catalog_name = table_name.catalog.to_string();
+        let schema_name = table_name.schema.to_string();
+        let table_name = table_name.table.to_string();
+
+        ensure!(
+            !is_readonly_schema(&schema_name),
+            TableReadOnlySnafu { table: table_name }
+        );
+
         let request = InsertRequest {
-            catalog_name: table_name.catalog.to_string(),
-            schema_name: table_name.schema.to_string(),
-            table_name: table_name.table.to_string(),
+            catalog_name,
+            schema_name,
+            table_name,
             columns_values: column_vectors,
         };
 
@@ -212,19 +237,136 @@ impl DatafusionQueryEngine {
             .context(MissingTableMutationHandlerSnafu)?
             .insert(request, query_ctx)
             .await
+            .context(TableMutationSnafu)
     }
 
-    async fn find_table(&self, table_name: &ResolvedTableReference<'_>) -> Result<TableRef> {
+    async fn find_table(
+        &self,
+        table_name: &ResolvedTableReference,
+        query_context: &QueryContextRef,
+    ) -> Result<TableRef> {
         let catalog_name = table_name.catalog.as_ref();
         let schema_name = table_name.schema.as_ref();
         let table_name = table_name.table.as_ref();
 
         self.state
             .catalog_manager()
-            .table(catalog_name, schema_name, table_name)
+            .table(catalog_name, schema_name, table_name, Some(query_context))
             .await
             .context(CatalogSnafu)?
             .with_context(|| TableNotFoundSnafu { table: table_name })
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn create_physical_plan(
+        &self,
+        ctx: &mut QueryEngineContext,
+        logical_plan: &LogicalPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let _timer = metrics::CREATE_PHYSICAL_ELAPSED.start_timer();
+        let state = ctx.state();
+
+        // special handle EXPLAIN plan
+        if matches!(logical_plan, DfLogicalPlan::Explain(_)) {
+            return state
+                .create_physical_plan(logical_plan)
+                .await
+                .context(error::DatafusionSnafu)
+                .map_err(BoxedError::new)
+                .context(QueryExecutionSnafu);
+        }
+
+        // analyze first
+        let analyzed_plan = state
+            .analyzer()
+            .execute_and_check(logical_plan.clone(), state.config_options(), |_, _| {})
+            .context(error::DatafusionSnafu)
+            .map_err(BoxedError::new)
+            .context(QueryExecutionSnafu)?;
+        // skip optimize for MergeScan
+        let optimized_plan = if let DfLogicalPlan::Extension(ext) = &analyzed_plan
+            && ext.node.name() == MergeScanLogicalPlan::name()
+        {
+            analyzed_plan.clone()
+        } else {
+            state
+                .optimizer()
+                .optimize(analyzed_plan, state, |_, _| {})
+                .context(error::DatafusionSnafu)
+                .map_err(BoxedError::new)
+                .context(QueryExecutionSnafu)?
+        };
+
+        let physical_plan = state
+            .query_planner()
+            .create_physical_plan(&optimized_plan, state)
+            .await
+            .context(error::DatafusionSnafu)
+            .map_err(BoxedError::new)
+            .context(QueryExecutionSnafu)?;
+
+        Ok(physical_plan)
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn optimize(
+        &self,
+        context: &QueryEngineContext,
+        plan: &LogicalPlan,
+    ) -> Result<LogicalPlan> {
+        let _timer = metrics::OPTIMIZE_LOGICAL_ELAPSED.start_timer();
+
+        // Optimized by extension rules
+        let optimized_plan = self
+            .state
+            .optimize_by_extension_rules(plan.clone(), context)
+            .context(error::DatafusionSnafu)
+            .map_err(BoxedError::new)
+            .context(QueryExecutionSnafu)?;
+
+        // Optimized by datafusion optimizer
+        let optimized_plan = self
+            .state
+            .session_state()
+            .optimize(&optimized_plan)
+            .context(error::DatafusionSnafu)
+            .map_err(BoxedError::new)
+            .context(QueryExecutionSnafu)?;
+
+        Ok(optimized_plan)
+    }
+
+    #[tracing::instrument(skip_all)]
+    fn optimize_physical_plan(
+        &self,
+        ctx: &mut QueryEngineContext,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let _timer = metrics::OPTIMIZE_PHYSICAL_ELAPSED.start_timer();
+
+        let state = ctx.state();
+        let config = state.config_options();
+        // skip optimize AnalyzeExec plan
+        let optimized_plan = if let Some(analyze_plan) = plan.as_any().downcast_ref::<AnalyzeExec>()
+        {
+            let mut new_plan = analyze_plan.input().clone();
+            for optimizer in state.physical_optimizers() {
+                new_plan = optimizer
+                    .optimize(new_plan, config)
+                    .context(DataFusionSnafu)?;
+            }
+            Arc::new(DistAnalyzeExec::new(new_plan))
+        } else {
+            let mut new_plan = plan;
+            for optimizer in state.physical_optimizers() {
+                new_plan = optimizer
+                    .optimize(new_plan, config)
+                    .context(DataFusionSnafu)?;
+            }
+            new_plan
+        };
+
+        Ok(optimized_plan)
     }
 }
 
@@ -242,25 +384,42 @@ impl QueryEngine for DatafusionQueryEngine {
         "datafusion"
     }
 
-    async fn describe(&self, plan: LogicalPlan) -> Result<DescribeResult> {
-        let optimised_plan = self.optimize(&plan)?;
-        Ok(DescribeResult {
-            schema: optimised_plan.schema()?,
-            logical_plan: optimised_plan,
-        })
+    async fn describe(
+        &self,
+        plan: LogicalPlan,
+        query_ctx: QueryContextRef,
+    ) -> Result<DescribeResult> {
+        let ctx = self.engine_context(query_ctx);
+        if let Ok(optimised_plan) = self.optimize(&ctx, &plan) {
+            let schema = optimised_plan
+                .schema()
+                .clone()
+                .try_into()
+                .context(ConvertSchemaSnafu)?;
+            Ok(DescribeResult {
+                schema,
+                logical_plan: optimised_plan,
+            })
+        } else {
+            // Table's like those in information_schema cannot be optimized when
+            // it contains parameters. So we fallback to original plans.
+            let schema = plan
+                .schema()
+                .clone()
+                .try_into()
+                .context(ConvertSchemaSnafu)?;
+            Ok(DescribeResult {
+                schema,
+                logical_plan: plan,
+            })
+        }
     }
 
     async fn execute(&self, plan: LogicalPlan, query_ctx: QueryContextRef) -> Result<Output> {
         match plan {
-            LogicalPlan::DfPlan(DfLogicalPlan::Dml(dml)) => {
-                self.exec_dml_statement(dml, query_ctx).await
-            }
+            LogicalPlan::Dml(dml) => self.exec_dml_statement(dml, query_ctx).await,
             _ => self.exec_query_plan(plan, query_ctx).await,
         }
-    }
-
-    fn register_udf(&self, udf: ScalarUdf) {
-        self.state.register_udf(udf);
     }
 
     /// Note in SQL queries, aggregate names are looked up using
@@ -274,8 +433,15 @@ impl QueryEngine for DatafusionQueryEngine {
         self.state.register_aggregate_function(func);
     }
 
+    /// Register a [`ScalarUdf`].
+    fn register_udf(&self, udf: ScalarUdf) {
+        self.state.register_udf(udf);
+    }
+
+    /// Register an UDF function.
+    /// Will override if the function with same name is already registered.
     fn register_function(&self, func: FunctionRef) {
-        self.state.register_udf(create_udf(func));
+        self.state.register_function(func);
     }
 
     fn read_table(&self, table: TableRef) -> Result<DataFrame> {
@@ -287,108 +453,15 @@ impl QueryEngine for DatafusionQueryEngine {
                 .context(QueryExecutionSnafu)?,
         ))
     }
-}
 
-impl LogicalOptimizer for DatafusionQueryEngine {
-    #[tracing::instrument(skip_all)]
-    fn optimize(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
-        let _timer = metrics::METRIC_OPTIMIZE_LOGICAL_ELAPSED.start_timer();
-        match plan {
-            LogicalPlan::DfPlan(df_plan) => {
-                let optimized_plan = self
-                    .state
-                    .session_state()
-                    .optimize(df_plan)
-                    .context(error::DatafusionSnafu)
-                    .map_err(BoxedError::new)
-                    .context(QueryExecutionSnafu)?;
-
-                Ok(LogicalPlan::DfPlan(optimized_plan))
-            }
-        }
+    fn engine_context(&self, query_ctx: QueryContextRef) -> QueryEngineContext {
+        let mut state = self.state.session_state();
+        state.config_mut().set_extension(query_ctx.clone());
+        QueryEngineContext::new(state, query_ctx)
     }
-}
 
-#[async_trait::async_trait]
-impl PhysicalPlanner for DatafusionQueryEngine {
-    #[tracing::instrument(skip_all)]
-    async fn create_physical_plan(
-        &self,
-        ctx: &mut QueryEngineContext,
-        logical_plan: &LogicalPlan,
-    ) -> Result<Arc<dyn PhysicalPlan>> {
-        let _timer = metrics::METRIC_CREATE_PHYSICAL_ELAPSED.start_timer();
-        match logical_plan {
-            LogicalPlan::DfPlan(df_plan) => {
-                let state = ctx.state();
-                let physical_plan = state
-                    .create_physical_plan(df_plan)
-                    .await
-                    .context(error::DatafusionSnafu)
-                    .map_err(BoxedError::new)
-                    .context(QueryExecutionSnafu)?;
-
-                Ok(Arc::new(PhysicalPlanAdapter::new(
-                    Arc::new(
-                        physical_plan
-                            .schema()
-                            .try_into()
-                            .context(error::ConvertSchemaSnafu)
-                            .map_err(BoxedError::new)
-                            .context(QueryExecutionSnafu)?,
-                    ),
-                    physical_plan,
-                )))
-            }
-        }
-    }
-}
-
-impl PhysicalOptimizer for DatafusionQueryEngine {
-    #[tracing::instrument(skip_all)]
-    fn optimize_physical_plan(
-        &self,
-        ctx: &mut QueryEngineContext,
-        plan: Arc<dyn PhysicalPlan>,
-    ) -> Result<Arc<dyn PhysicalPlan>> {
-        let _timer = metrics::METRIC_OPTIMIZE_PHYSICAL_ELAPSED.start_timer();
-
-        let state = ctx.state();
-        let config = state.config_options();
-        let df_plan = plan
-            .as_any()
-            .downcast_ref::<PhysicalPlanAdapter>()
-            .context(error::PhysicalPlanDowncastSnafu)
-            .map_err(BoxedError::new)
-            .context(QueryExecutionSnafu)?
-            .df_plan();
-
-        // skip optimize AnalyzeExec plan
-        let optimized_plan =
-            if let Some(analyze_plan) = df_plan.as_any().downcast_ref::<AnalyzeExec>() {
-                let mut new_plan = analyze_plan.input().clone();
-                for optimizer in state.physical_optimizers() {
-                    new_plan = optimizer
-                        .optimize(new_plan, config)
-                        .context(DataFusionSnafu)?;
-                }
-                Arc::new(analyze_plan.clone())
-                    .with_new_children(vec![new_plan])
-                    .unwrap()
-            } else {
-                let mut new_plan = df_plan;
-                for optimizer in state.physical_optimizers() {
-                    new_plan = optimizer
-                        .optimize(new_plan, config)
-                        .context(DataFusionSnafu)?;
-                }
-                new_plan
-            };
-
-        Ok(Arc::new(PhysicalPlanAdapter::new(
-            plan.schema(),
-            optimized_plan,
-        )))
+    fn engine_state(&self) -> &QueryEngineState {
+        &self.state
     }
 }
 
@@ -397,130 +470,78 @@ impl QueryExecutor for DatafusionQueryEngine {
     fn execute_stream(
         &self,
         ctx: &QueryEngineContext,
-        plan: &Arc<dyn PhysicalPlan>,
+        plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<SendableRecordBatchStream> {
-        let _timer = metrics::METRIC_EXEC_PLAN_ELAPSED.start_timer();
+        let exec_timer = metrics::EXEC_PLAN_ELAPSED.start_timer();
         let task_ctx = ctx.build_task_ctx();
 
-        match plan.output_partitioning().partition_count() {
-            0 => Ok(Box::pin(EmptyRecordBatchStream::new(plan.schema()))),
-            1 => Ok(plan
-                .execute(0, task_ctx)
-                .context(error::ExecutePhysicalPlanSnafu)
-                .map_err(BoxedError::new)
-                .context(QueryExecutionSnafu))?,
-            _ => {
-                // merge into a single partition
-                let plan =
-                    CoalescePartitionsExec::new(Arc::new(DfPhysicalPlanAdapter(plan.clone())));
-                // CoalescePartitionsExec must produce a single partition
-                assert_eq!(1, plan.output_partitioning().partition_count());
+        match plan.properties().output_partitioning().partition_count() {
+            0 => {
+                let schema = Arc::new(
+                    Schema::try_from(plan.schema())
+                        .map_err(BoxedError::new)
+                        .context(QueryExecutionSnafu)?,
+                );
+                Ok(Box::pin(EmptyRecordBatchStream::new(schema)))
+            }
+            1 => {
                 let df_stream = plan
                     .execute(0, task_ctx)
                     .context(error::DatafusionSnafu)
                     .map_err(BoxedError::new)
                     .context(QueryExecutionSnafu)?;
-                let stream = RecordBatchStreamAdapter::try_new(df_stream)
+                let mut stream = RecordBatchStreamAdapter::try_new(df_stream)
                     .context(error::ConvertDfRecordBatchStreamSnafu)
                     .map_err(BoxedError::new)
                     .context(QueryExecutionSnafu)?;
+                stream.set_metrics2(plan.clone());
+                let stream = OnDone::new(Box::pin(stream), move || {
+                    exec_timer.observe_duration();
+                });
+                Ok(Box::pin(stream))
+            }
+            _ => {
+                // merge into a single partition
+                let merged_plan = CoalescePartitionsExec::new(plan.clone());
+                // CoalescePartitionsExec must produce a single partition
+                assert_eq!(
+                    1,
+                    merged_plan
+                        .properties()
+                        .output_partitioning()
+                        .partition_count()
+                );
+                let df_stream = merged_plan
+                    .execute(0, task_ctx)
+                    .context(error::DatafusionSnafu)
+                    .map_err(BoxedError::new)
+                    .context(QueryExecutionSnafu)?;
+                let mut stream = RecordBatchStreamAdapter::try_new(df_stream)
+                    .context(error::ConvertDfRecordBatchStreamSnafu)
+                    .map_err(BoxedError::new)
+                    .context(QueryExecutionSnafu)?;
+                stream.set_metrics2(plan.clone());
+                let stream = OnDone::new(Box::pin(stream), move || {
+                    exec_timer.observe_duration();
+                });
                 Ok(Box::pin(stream))
             }
         }
     }
 }
 
-fn convert_filter_to_df_filter(filter: Expr) -> Result<DfExpr> {
-    match filter {
-        Expr::BinaryOp { left, op, right } => {
-            let left = convert_filter_to_df_filter(*left)?;
-            let right = convert_filter_to_df_filter(*right)?;
-            match op {
-                BinaryOperator::Eq => Ok(left.eq(right)),
-                _ => UnimplementedSnafu {
-                    operation: format!("convert BinaryOperator into datafusion Expr, op: {op}"),
-                }
-                .fail(),
-            }
-        }
-        Expr::Value(value) => match value {
-            Value::SingleQuotedString(v) => Ok(DfExpr::Literal(ScalarValue::Utf8(Some(v)))),
-            _ => UnimplementedSnafu {
-                operation: format!("convert Expr::Value into datafusion Expr, value: {value}"),
-            }
-            .fail(),
-        },
-        Expr::Identifier(ident) => Ok(DfExpr::Column(Column::from_name(ident.value))),
-        _ => UnimplementedSnafu {
-            operation: format!("convert Expr into datafusion Expr, Expr: {filter}"),
-        }
-        .fail(),
-    }
-}
-
-/// Creates a table in memory and executes a show statement on the table.
-pub async fn execute_show_with_filter(
-    record_batch: RecordBatch,
-    filter: Option<Expr>,
-) -> Result<Output> {
-    let table_name = "table_name";
-    let column_schemas = record_batch.schema.column_schemas().to_vec();
-    let context = SessionContext::new();
-    context
-        .register_batch(table_name, record_batch.into_df_record_batch())
-        .context(error::DatafusionSnafu)
-        .map_err(BoxedError::new)
-        .context(QueryExecutionSnafu)?;
-    let mut dataframe = context
-        .sql(&format!("SELECT * FROM {table_name}"))
-        .await
-        .context(error::DatafusionSnafu)
-        .map_err(BoxedError::new)
-        .context(QueryExecutionSnafu)?;
-    if let Some(filter) = filter {
-        let filter = convert_filter_to_df_filter(filter)?;
-        dataframe = dataframe
-            .filter(filter)
-            .context(error::DatafusionSnafu)
-            .map_err(BoxedError::new)
-            .context(QueryExecutionSnafu)?
-    }
-    let df_batches = dataframe
-        .collect()
-        .await
-        .context(error::DatafusionSnafu)
-        .map_err(BoxedError::new)
-        .context(QueryExecutionSnafu)?;
-    let mut batches = Vec::with_capacity(df_batches.len());
-    let schema = Arc::new(Schema::try_new(column_schemas).context(CreateSchemaSnafu)?);
-    for df_batch in df_batches.into_iter() {
-        let batch = RecordBatch::try_from_df_record_batch(schema.clone(), df_batch)
-            .context(CreateRecordBatchSnafu)?;
-        batches.push(batch);
-    }
-    let record_batches = RecordBatches::try_new(schema, batches).context(CreateRecordBatchSnafu)?;
-    Ok(Output::RecordBatches(record_batches))
-}
-
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow::Borrowed;
     use std::sync::Arc;
 
     use catalog::RegisterTableRequest;
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, NUMBERS_TABLE_ID};
-    use common_query::Output;
-    use common_recordbatch::{util, RecordBatch};
+    use common_recordbatch::util;
     use datafusion::prelude::{col, lit};
-    use datatypes::prelude::{ConcreteDataType, MutableVector, ScalarVectorBuilder};
-    use datatypes::schema::{ColumnSchema, Schema};
-    use datatypes::types::StringType;
-    use datatypes::vectors::{Helper, StringVectorBuilder, UInt32Vector, UInt64Vector, VectorRef};
-    use session::context::QueryContext;
-    use sql::dialect::GreptimeDbDialect;
-    use sql::parser::ParserContext;
-    use sql::statements::show::{ShowKind, ShowTables};
-    use sql::statements::statement::Statement;
+    use datatypes::prelude::ConcreteDataType;
+    use datatypes::schema::ColumnSchema;
+    use datatypes::vectors::{Helper, UInt32Vector, UInt64Vector, VectorRef};
+    use session::context::{QueryContext, QueryContextBuilder};
     use table::table::numbers::{NumbersTable, NUMBERS_TABLE_NAME};
 
     use super::*;
@@ -538,7 +559,7 @@ mod tests {
         };
         catalog_manager.register_table_sync(req).unwrap();
 
-        QueryEngineFactory::new(catalog_manager, None, None, false).query_engine()
+        QueryEngineFactory::new(catalog_manager, None, None, None, None, false).query_engine()
     }
 
     #[tokio::test]
@@ -546,20 +567,20 @@ mod tests {
         let engine = create_test_engine().await;
         let sql = "select sum(number) from numbers limit 20";
 
-        let stmt = QueryLanguageParser::parse_sql(sql).unwrap();
+        let stmt = QueryLanguageParser::parse_sql(sql, &QueryContext::arc()).unwrap();
         let plan = engine
             .planner()
-            .plan(stmt, QueryContext::arc())
+            .plan(&stmt, QueryContext::arc())
             .await
             .unwrap();
 
         // TODO(sunng87): do not rely on to_string for compare
         assert_eq!(
             format!("{plan:?}"),
-            r#"DfPlan(Limit: skip=0, fetch=20
+            r#"Limit: skip=0, fetch=20
   Projection: SUM(numbers.number)
     Aggregate: groupBy=[[]], aggr=[[SUM(numbers.number)]]
-      TableScan: numbers)"#
+      TableScan: numbers"#
         );
     }
 
@@ -568,17 +589,17 @@ mod tests {
         let engine = create_test_engine().await;
         let sql = "select sum(number) from numbers limit 20";
 
-        let stmt = QueryLanguageParser::parse_sql(sql).unwrap();
+        let stmt = QueryLanguageParser::parse_sql(sql, &QueryContext::arc()).unwrap();
         let plan = engine
             .planner()
-            .plan(stmt, QueryContext::arc())
+            .plan(&stmt, QueryContext::arc())
             .await
             .unwrap();
 
         let output = engine.execute(plan, QueryContext::arc()).await.unwrap();
 
-        match output {
-            Output::Stream(recordbatch) => {
+        match output.data {
+            OutputData::Stream(recordbatch) => {
                 let numbers = util::collect(recordbatch).await.unwrap();
                 assert_eq!(1, numbers.len());
                 assert_eq!(numbers[0].num_columns(), 1);
@@ -609,12 +630,16 @@ mod tests {
             .as_any()
             .downcast_ref::<DatafusionQueryEngine>()
             .unwrap();
+        let query_ctx = Arc::new(QueryContextBuilder::default().build());
         let table = engine
-            .find_table(&ResolvedTableReference {
-                catalog: Borrowed("greptime"),
-                schema: Borrowed("public"),
-                table: Borrowed("numbers"),
-            })
+            .find_table(
+                &ResolvedTableReference {
+                    catalog: "greptime".into(),
+                    schema: "public".into(),
+                    table: "numbers".into(),
+                },
+                &query_ctx,
+            )
             .await
             .unwrap();
 
@@ -642,18 +667,18 @@ mod tests {
         let engine = create_test_engine().await;
         let sql = "select sum(number) from numbers limit 20";
 
-        let stmt = QueryLanguageParser::parse_sql(sql).unwrap();
+        let stmt = QueryLanguageParser::parse_sql(sql, &QueryContext::arc()).unwrap();
 
         let plan = engine
             .planner()
-            .plan(stmt, QueryContext::arc())
+            .plan(&stmt, QueryContext::arc())
             .await
             .unwrap();
 
         let DescribeResult {
             schema,
             logical_plan,
-        } = engine.describe(plan).await.unwrap();
+        } = engine.describe(plan, QueryContext::arc()).await.unwrap();
 
         assert_eq!(
             schema.column_schemas()[0],
@@ -664,71 +689,5 @@ mod tests {
             )
         );
         assert_eq!("Limit: skip=0, fetch=20\n  Aggregate: groupBy=[[]], aggr=[[SUM(CAST(numbers.number AS UInt64))]]\n    TableScan: numbers projection=[number]", format!("{}", logical_plan.display_indent()));
-    }
-
-    #[tokio::test]
-    async fn test_show_tables() {
-        // No filter
-        let column_schemas = vec![ColumnSchema::new(
-            "Tables",
-            ConcreteDataType::String(StringType),
-            false,
-        )];
-        let schema = Arc::new(Schema::new(column_schemas));
-        let mut builder = StringVectorBuilder::with_capacity(3);
-        builder.push(Some("monitor"));
-        builder.push(Some("system_metrics"));
-        let columns = vec![builder.to_vector()];
-        let record_batch = RecordBatch::new(schema, columns).unwrap();
-        let output = execute_show_with_filter(record_batch, None).await.unwrap();
-        let Output::RecordBatches(record_batches) = output else {
-            unreachable!()
-        };
-        let expected = "\
-+----------------+
-| Tables         |
-+----------------+
-| monitor        |
-| system_metrics |
-+----------------+";
-        assert_eq!(record_batches.pretty_print().unwrap(), expected);
-
-        // Filter
-        let column_schemas = vec![ColumnSchema::new(
-            "Tables",
-            ConcreteDataType::String(StringType),
-            false,
-        )];
-        let schema = Arc::new(Schema::new(column_schemas));
-        let mut builder = StringVectorBuilder::with_capacity(3);
-        builder.push(Some("monitor"));
-        builder.push(Some("system_metrics"));
-        let columns = vec![builder.to_vector()];
-        let record_batch = RecordBatch::new(schema, columns).unwrap();
-        let statement = ParserContext::create_with_dialect(
-            "SHOW TABLES WHERE \"Tables\"='monitor'",
-            &GreptimeDbDialect {},
-        )
-        .unwrap()[0]
-            .clone();
-        let Statement::ShowTables(ShowTables { kind, .. }) = statement else {
-            unreachable!()
-        };
-        let ShowKind::Where(filter) = kind else {
-            unreachable!()
-        };
-        let output = execute_show_with_filter(record_batch, Some(filter))
-            .await
-            .unwrap();
-        let Output::RecordBatches(record_batches) = output else {
-            unreachable!()
-        };
-        let expected = "\
-+---------+
-| Tables  |
-+---------+
-| monitor |
-+---------+";
-        assert_eq!(record_batches.pretty_print().unwrap(), expected);
     }
 }
